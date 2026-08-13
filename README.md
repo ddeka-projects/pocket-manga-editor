@@ -51,7 +51,11 @@ Packaging is deliberately out of scope during this development phase.
 
 ## Review controls
 
-The application keeps a shortcut hint visible below the viewer. Press `?` or `F1` at any time to see the complete help dialog.
+The viewer gives portrait pages most of the window while library controls, page
+details, review actions, and export controls stay together in a scrollable
+sidebar on the right. Essential keycap hints remain pinned at the bottom. Drag
+the divider to resize either side; the chosen split is remembered. Press `?` or
+`F1` at any time to see the complete help dialog.
 
 | Key | Action |
 | --- | --- |
@@ -88,7 +92,9 @@ For chapter-based sources, exported names include both chapter and page numbers,
 
 ## Run tests
 
-The scanner, saved-session, and exporter tests use only Python's standard library:
+The test suite covers scanning, saved sessions, exporting, and the responsive
+desktop layout. Install the development requirements first; the GUI checks use
+PySide6's offscreen platform and do not open a window:
 
 ```powershell
 py -m unittest discover -s tests -v

@@ -6,7 +6,7 @@ from collections import OrderedDict
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, QSize, Qt, QTimer, QUrl
+from PySide6.QtCore import QByteArray, QSettings, QSize, Qt, QTimer, QUrl
 from PySide6.QtGui import (
     QAction,
     QCloseEvent,
@@ -26,8 +26,9 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
-    QSpacerItem,
+    QSplitter,
     QVBoxLayout,
     QWidget,
 )
@@ -171,7 +172,7 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Pocket Manga Editor")
-        self.resize(1180, 860)
+        self.resize(1320, 860)
         self.setMinimumSize(820, 620)
 
         self.settings = QSettings()
@@ -294,148 +295,197 @@ class MainWindow(QMainWindow):
         central_widget = QWidget()
         central_widget.setObjectName("centralWidget")
         self.setCentralWidget(central_widget)
-        root_layout = QVBoxLayout(central_widget)
-        root_layout.setContentsMargins(22, 18, 22, 16)
-        root_layout.setSpacing(12)
+        root_layout = QHBoxLayout(central_widget)
+        root_layout.setContentsMargins(12, 12, 12, 12)
+        root_layout.setSpacing(0)
 
-        library_row = QHBoxLayout()
-        library_row.setSpacing(10)
-        self.folder_button = QPushButton("Choose Working Folder")
-        self.folder_button.clicked.connect(self.choose_working_directory)
-        library_row.addWidget(self.folder_button)
+        self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.main_splitter.setObjectName("mainSplitter")
+        self.main_splitter.setChildrenCollapsible(False)
+        self.main_splitter.setHandleWidth(7)
+        root_layout.addWidget(self.main_splitter)
 
+        self.viewer_panel = QFrame()
+        self.viewer_panel.setObjectName("viewerPanel")
+        viewer_layout = QVBoxLayout(self.viewer_panel)
+        viewer_layout.setContentsMargins(0, 0, 0, 0)
+        viewer_layout.setSpacing(0)
+        self.canvas = ImageCanvas()
+        viewer_layout.addWidget(self.canvas)
+        self.main_splitter.addWidget(self.viewer_panel)
+
+        self.sidebar_panel = QFrame()
+        self.sidebar_panel.setObjectName("sidebarPanel")
+        self.sidebar_panel.setMinimumWidth(350)
+        sidebar_panel_layout = QVBoxLayout(self.sidebar_panel)
+        sidebar_panel_layout.setContentsMargins(14, 2, 4, 2)
+        sidebar_panel_layout.setSpacing(10)
+
+        self.sidebar_scroll = QScrollArea()
+        self.sidebar_scroll.setObjectName("sidebarScroll")
+        self.sidebar_scroll.setWidgetResizable(True)
+        self.sidebar_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.sidebar_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.sidebar_scroll.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        sidebar_panel_layout.addWidget(self.sidebar_scroll, 1)
+
+        self.sidebar_content = QWidget()
+        self.sidebar_content.setObjectName("sidebarContent")
+        self.sidebar_content.setMinimumWidth(320)
+        sidebar_layout = QVBoxLayout(self.sidebar_content)
+        sidebar_layout.setContentsMargins(0, 0, 0, 0)
+        sidebar_layout.setSpacing(10)
+        self.sidebar_scroll.setWidget(self.sidebar_content)
+        self.main_splitter.addWidget(self.sidebar_panel)
+        self.main_splitter.setCollapsible(0, False)
+        self.main_splitter.setCollapsible(1, False)
+        self.main_splitter.setStretchFactor(0, 1)
+        self.main_splitter.setStretchFactor(1, 0)
+
+        library_card, library_layout = _sidebar_card("Library")
         self.folder_label = QLabel("No working folder selected")
         self.folder_label.setObjectName("mutedLabel")
         self.folder_label.setSizePolicy(
             QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
         )
-        self.folder_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        library_row.addWidget(self.folder_label, 1)
+        self.folder_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        library_layout.addWidget(self.folder_label)
 
+        library_buttons = QHBoxLayout()
+        library_buttons.setSpacing(8)
+        self.folder_button = QPushButton("Choose Folder")
+        self.folder_button.clicked.connect(self.choose_working_directory)
+        library_buttons.addWidget(self.folder_button, 1)
         self.rescan_button = QPushButton("Rescan")
         self.rescan_button.clicked.connect(self.rescan)
-        library_row.addWidget(self.rescan_button)
+        library_buttons.addWidget(self.rescan_button)
+        library_layout.addLayout(library_buttons)
 
         self.issues_button = QPushButton("Scan issues")
         self.issues_button.clicked.connect(self.show_scan_issues)
         self.issues_button.hide()
-        library_row.addWidget(self.issues_button)
-        root_layout.addLayout(library_row)
+        library_layout.addWidget(self.issues_button)
 
-        picker_row = QHBoxLayout()
-        picker_row.setSpacing(10)
         manga_label = QLabel("Manga")
         manga_label.setObjectName("fieldLabel")
-        picker_row.addWidget(manga_label)
+        library_layout.addWidget(manga_label)
         self.manga_combo = QComboBox()
-        self.manga_combo.setMinimumWidth(260)
+        self.manga_combo.setMinimumWidth(0)
+        self.manga_combo.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
         self.manga_combo.setSizeAdjustPolicy(
             QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
         )
-        self.manga_combo.setMinimumContentsLength(24)
+        self.manga_combo.setMinimumContentsLength(18)
         self.manga_combo.currentIndexChanged.connect(self._on_manga_changed)
-        picker_row.addWidget(self.manga_combo, 1)
+        library_layout.addWidget(self.manga_combo)
 
         volume_label = QLabel("Volume")
         volume_label.setObjectName("fieldLabel")
-        picker_row.addWidget(volume_label)
+        library_layout.addWidget(volume_label)
         self.volume_combo = QComboBox()
-        self.volume_combo.setMinimumWidth(180)
+        self.volume_combo.setMinimumWidth(0)
+        self.volume_combo.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
         self.volume_combo.currentIndexChanged.connect(self._on_volume_changed)
-        picker_row.addWidget(self.volume_combo)
-        root_layout.addLayout(picker_row)
+        library_layout.addWidget(self.volume_combo)
+        sidebar_layout.addWidget(library_card)
 
-        heading_row = QHBoxLayout()
+        page_card, page_layout = _sidebar_card("Current page")
+        self.progress_label = QLabel("— / —")
+        self.progress_label.setObjectName("progressLabel")
+        page_layout.addWidget(self.progress_label)
         self.heading_label = QLabel("No volume open")
         self.heading_label.setObjectName("headingLabel")
+        self.heading_label.setWordWrap(True)
         self.heading_label.setSizePolicy(
             QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
         )
-        heading_row.addWidget(self.heading_label, 1)
-        self.progress_label = QLabel("— / —")
-        self.progress_label.setObjectName("progressLabel")
-        heading_row.addWidget(self.progress_label)
-        root_layout.addLayout(heading_row)
+        page_layout.addWidget(self.heading_label)
 
-        self.canvas = ImageCanvas()
-        root_layout.addWidget(self.canvas, 1)
-
-        information_row = QHBoxLayout()
         self.page_label = QLabel("No page selected")
         self.page_label.setObjectName("mutedLabel")
+        self.page_label.setWordWrap(True)
         self.page_label.setSizePolicy(
             QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
         )
-        self.page_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        information_row.addWidget(self.page_label, 1)
+        self.page_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        page_layout.addWidget(self.page_label)
 
         self.save_status_label = QLabel("Progress autosaves")
         self.save_status_label.setObjectName("saveStatus")
         self.save_status_label.setProperty("error", False)
-        information_row.addWidget(self.save_status_label)
+        page_layout.addWidget(self.save_status_label)
+        sidebar_layout.addWidget(page_card)
 
+        review_card, review_layout = _sidebar_card("Review")
         self.selection_label = QLabel("0 selected")
         self.selection_label.setObjectName("selectionPill")
-        information_row.addWidget(self.selection_label)
-        root_layout.addLayout(information_row)
+        self.selection_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        review_layout.addWidget(self.selection_label)
 
         controls_row = QHBoxLayout()
-        controls_row.addItem(
-            QSpacerItem(20, 1, QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
-        )
+        controls_row.setSpacing(8)
         self.previous_button = QPushButton("←  Previous")
         self.previous_button.clicked.connect(lambda: self.navigate(-1))
-        controls_row.addWidget(self.previous_button)
+        controls_row.addWidget(self.previous_button, 1)
+        self.next_button = QPushButton("Next  →")
+        self.next_button.clicked.connect(lambda: self.navigate(1))
+        controls_row.addWidget(self.next_button, 1)
+        review_layout.addLayout(controls_row)
 
         self.toggle_button = QPushButton("Select Page")
         self.toggle_button.setObjectName("selectButton")
         self.toggle_button.clicked.connect(self.toggle_current_selection)
-        controls_row.addWidget(self.toggle_button)
-
-        self.next_button = QPushButton("Next  →")
-        self.next_button.clicked.connect(lambda: self.navigate(1))
-        controls_row.addWidget(self.next_button)
+        review_layout.addWidget(self.toggle_button)
 
         self.next_selected_button = QPushButton("Next Selected  ⇥")
         self.next_selected_button.clicked.connect(lambda: self.navigate_selected(1))
-        controls_row.addWidget(self.next_selected_button)
+        review_layout.addWidget(self.next_selected_button)
+        sidebar_layout.addWidget(review_card)
 
-        controls_row.addSpacing(18)
+        self.export_card, export_layout = _sidebar_card("Export")
         self.export_button = QPushButton("Export Selected")
         self.export_button.setObjectName("primaryButton")
         self.export_button.clicked.connect(self.export_selection)
-        controls_row.addWidget(self.export_button)
-
+        export_layout.addWidget(self.export_button)
         self.open_output_button = QPushButton("Open Output")
         self.open_output_button.clicked.connect(self.open_output_directory)
-        controls_row.addWidget(self.open_output_button)
-        controls_row.addItem(
-            QSpacerItem(20, 1, QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
-        )
-        root_layout.addLayout(controls_row)
+        export_layout.addWidget(self.open_output_button)
+        sidebar_layout.addStretch(1)
+        sidebar_panel_layout.addWidget(self.export_card)
 
         self.shortcut_bar = QFrame()
         self.shortcut_bar.setObjectName("shortcutBar")
         shortcut_layout = QGridLayout(self.shortcut_bar)
-        shortcut_layout.setContentsMargins(12, 8, 12, 8)
-        shortcut_layout.setHorizontalSpacing(18)
-        shortcut_layout.setVerticalSpacing(7)
+        shortcut_layout.setContentsMargins(12, 10, 12, 12)
+        shortcut_layout.setHorizontalSpacing(8)
+        shortcut_layout.setVerticalSpacing(8)
+        shortcut_title = QLabel("KEYBOARD")
+        shortcut_title.setObjectName("sectionTitle")
+        shortcut_layout.addWidget(shortcut_title, 0, 0, 1, 2)
         shortcuts = (
-            ("← / →", "Navigate"),
-            ("Space", "Toggle selection"),
+            ("← →", "Navigate"),
+            ("Space", "Toggle"),
             ("Enter", "Select + next"),
-            ("Ctrl+← / Ctrl+→", "Selected pages"),
-            ("Home / End", "First / last"),
-            ("Ctrl+S", "Export"),
-            ("?", "Help"),
+            ("? / F1", "All shortcuts"),
         )
         for index, (keys, description) in enumerate(shortcuts):
             shortcut_layout.addWidget(
-                _shortcut_hint(keys, description), index // 4, index % 4
+                _shortcut_hint(keys, description), 1 + index // 2, index % 2
             )
-        shortcut_layout.setColumnStretch(3, 1)
+        shortcut_layout.setColumnStretch(0, 1)
+        shortcut_layout.setColumnStretch(1, 1)
         self.shortcut_bar.setToolTip("Press ? or F1 to show all keyboard controls.")
-        root_layout.addWidget(self.shortcut_bar)
+        sidebar_panel_layout.addWidget(self.shortcut_bar)
 
         for button in (
             self.folder_button,
@@ -484,6 +534,24 @@ class MainWindow(QMainWindow):
                 background: #17191d;
                 color: #eef1f5;
             }
+            QFrame#viewerPanel {
+                background: #17191d;
+                border: none;
+            }
+            QFrame#sidebarPanel, QScrollArea#sidebarScroll, QWidget#sidebarContent {
+                background: #17191d;
+                border: none;
+            }
+            QSplitter#mainSplitter::handle {
+                background: #2c3037;
+                border-radius: 2px;
+                margin: 12px 2px;
+            }
+            QFrame#sidebarCard, QFrame#shortcutBar {
+                background: #202329;
+                border: 1px solid #2f343c;
+                border-radius: 9px;
+            }
             QMenuBar, QMenu {
                 background: #202329;
                 color: #eef1f5;
@@ -493,13 +561,18 @@ class MainWindow(QMainWindow):
             }
             QLabel#headingLabel {
                 color: #eef1f5;
-                font-size: 18px;
+                font-size: 15px;
                 font-weight: 650;
             }
             QLabel#progressLabel {
                 color: #ffffff;
-                font-size: 17px;
-                font-weight: 650;
+                font-size: 27px;
+                font-weight: 700;
+            }
+            QLabel#sectionTitle {
+                color: #8f98a5;
+                font-size: 11px;
+                font-weight: 750;
             }
             QLabel#mutedLabel {
                 color: #aeb5c0;
@@ -524,11 +597,6 @@ class MainWindow(QMainWindow):
                 color: #ff7777;
                 font-weight: 650;
             }
-            QFrame#shortcutBar {
-                background: #202329;
-                border: none;
-                border-radius: 7px;
-            }
             QLabel#shortcutKey {
                 background: #343943;
                 border: 1px solid #59616e;
@@ -539,6 +607,7 @@ class MainWindow(QMainWindow):
             }
             QLabel#shortcutDescription {
                 color: #aeb5c0;
+                font-size: 12px;
             }
             QFrame#imageCanvas {
                 background: #0e1013;
@@ -597,6 +666,23 @@ class MainWindow(QMainWindow):
                 background: #202329;
                 color: #aeb5c0;
             }
+            QScrollBar:vertical {
+                background: #17191d;
+                border: none;
+                width: 10px;
+                margin: 0;
+            }
+            QScrollBar::handle:vertical {
+                background: #414752;
+                border-radius: 5px;
+                min-height: 28px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: #59616e;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0;
+            }
             """
         )
 
@@ -604,6 +690,33 @@ class MainWindow(QMainWindow):
         geometry = self.settings.value("window/geometry")
         if geometry is not None:
             self.restoreGeometry(geometry)
+
+        splitter_state = self.settings.value("window/main_splitter")
+        restored = False
+        if isinstance(splitter_state, QByteArray):
+            try:
+                restored = self.main_splitter.restoreState(splitter_state)
+            except (TypeError, ValueError):
+                restored = False
+        elif isinstance(splitter_state, (bytes, bytearray)):
+            try:
+                restored = self.main_splitter.restoreState(
+                    QByteArray(bytes(splitter_state))
+                )
+            except (TypeError, ValueError):
+                restored = False
+
+        if not restored:
+            self._set_default_splitter_sizes()
+
+    def _set_default_splitter_sizes(self) -> None:
+        """Give portrait artwork most of the initial window width."""
+
+        total_width = max(self.main_splitter.width(), self.width() - 24)
+        sidebar_width = max(350, min(410, round(total_width * 0.3)))
+        self.main_splitter.setSizes(
+            [max(self.canvas.minimumWidth(), total_width - sidebar_width), sidebar_width]
+        )
 
     def choose_working_directory(self) -> None:
         self._save_session()
@@ -1119,12 +1232,28 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt API name
         self._save_session()
         self.settings.setValue("window/geometry", self.saveGeometry())
+        self.settings.setValue("window/main_splitter", self.main_splitter.saveState())
         self.settings.sync()
         event.accept()
 
 
 def _format_scan_issues(issues: tuple[ScanIssue, ...]) -> str:
     return "\n".join(f"{issue.path}: {issue.message}" for issue in issues)
+
+
+def _sidebar_card(title: str) -> tuple[QFrame, QVBoxLayout]:
+    """Create one visually grouped section in the controls sidebar."""
+
+    card = QFrame()
+    card.setObjectName("sidebarCard")
+    layout = QVBoxLayout(card)
+    layout.setContentsMargins(12, 10, 12, 12)
+    layout.setSpacing(7)
+
+    title_label = QLabel(title.upper())
+    title_label.setObjectName("sectionTitle")
+    layout.addWidget(title_label)
+    return card, layout
 
 
 def _shortcut_hint(keys: str, description: str) -> QWidget:
