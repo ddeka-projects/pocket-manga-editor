@@ -133,6 +133,19 @@ class ScannerTests(RepositoryFixture):
             ],
         )
 
+    def test_chapter_name_suffix_is_optional_and_not_part_of_identity(self) -> None:
+        self.add_page("Series", "Vol. 01 Ch. 000.5", "001.jpg")
+        self.add_page("Series", "Vol. 01 Ch. 001 - Named chapter", "001.jpg")
+
+        volume = scan_working_directory(self.root).mangas[0].volumes[0]
+
+        self.assertEqual([page.chapter_label for page in volume.pages], ["000.5", "001"])
+        self.assertEqual([page.chapter_title for page in volume.pages], ["", "Named chapter"])
+        self.assertEqual(
+            [page.output_filename for page in volume.pages],
+            ["C000.5_P001.jpg", "C001_P001.jpg"],
+        )
+
     def test_equivalent_decimal_chapter_identifiers_are_ambiguous(self) -> None:
         self.add_page("Series", "Vol. 01 Ch. 000.1 - First", "001.jpg")
         self.add_page("Series", "Vol. 01 Ch. 000.10 - Same number", "001.jpg")

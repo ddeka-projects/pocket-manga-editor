@@ -12,7 +12,7 @@ from .models import MangaRef, PageRef, ScanIssue, ScanResult, VolumeRef
 
 CHAPTER_PATTERN = re.compile(
     r"^Vol\.\s+(?P<volume>\d+)\s+Ch\.\s+"
-    r"(?P<chapter>\d+(?:\.\d+)?)\s+-\s+(?P<title>.+?)\s*$",
+    r"(?P<chapter>\d+(?:\.\d+)?)(?:\s+-\s+(?P<title>.+?))?\s*$",
     re.IGNORECASE,
 )
 PAGE_PATTERN = re.compile(r"^(?P<page>\d{3})\.jpg$", re.IGNORECASE)
@@ -29,7 +29,7 @@ def scan_working_directory(working_directory: str | Path) -> ScanResult:
 
         working directory/
           Manga name/
-            Vol. 01 Ch. 001 - Chapter title/
+            Vol. 01 Ch. 001 - Optional chapter title/
               001.jpg
 
     Non-matching folders and files are ignored. Names that appear intended to
@@ -89,7 +89,8 @@ def _scan_manga(manga_path: Path) -> tuple[MangaRef | None, list[ScanIssue]]:
                 ScanIssue(
                     chapter_path,
                     "Chapter folder does not match "
-                    "'Vol. <digits> Ch. <digits or decimal> - Chapter name'.",
+                    "'Vol. <digits> Ch. <digits or decimal>' with an optional "
+                    "' - Chapter name' suffix.",
                 )
             )
 
@@ -110,7 +111,7 @@ def _scan_manga(manga_path: Path) -> tuple[MangaRef | None, list[ScanIssue]]:
 
         chapter_path, match = matches[0]
         chapter_label = match.group("chapter")
-        chapter_title = match.group("title").strip()
+        chapter_title = (match.group("title") or "").strip()
 
         try:
             page_files = sorted(

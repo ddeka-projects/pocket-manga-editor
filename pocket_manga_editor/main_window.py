@@ -684,7 +684,7 @@ class MainWindow(QMainWindow):
             self.heading_label.setText("No manga found")
             self.progress_label.setText("— / —")
             self.page_label.setText(
-                "Expected chapter folders: Vol. 01 Ch. 001 - Chapter name"
+                "Expected chapter folders: Vol. 01 Ch. 001 (chapter name optional)"
             )
             self.canvas.show_message(
                 "No matching manga chapters were found in this working folder.\n\n"
@@ -772,10 +772,14 @@ class MainWindow(QMainWindow):
         self.canvas.set_selected(page.relative_path in self.selected_paths)
         self.heading_label.setText(f"{volume.manga_name}  ·  {volume.display_name}")
         self.progress_label.setText(f"{self.current_index + 1} / {len(volume.pages)}")
-        self.page_label.setText(
-            f"Ch. {page.chapter_label}  ·  Page {page.page_number:03d}  ·  "
-            f"{page.chapter_title}  ·  {page.source_path.name}"
-        )
+        page_details = [
+            f"Ch. {page.chapter_label}",
+            f"Page {page.page_number:03d}",
+        ]
+        if page.chapter_title:
+            page_details.append(page.chapter_title)
+        page_details.append(page.source_path.name)
+        self.page_label.setText("  ·  ".join(page_details))
         self.page_label.setToolTip(str(page.source_path))
         self._refresh_selection_controls()
         QTimer.singleShot(50, self._preload_neighbor_pages)
