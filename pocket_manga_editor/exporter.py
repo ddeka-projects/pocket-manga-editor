@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 import os
@@ -18,7 +19,8 @@ from .storage import atomic_write_json
 
 EXPORT_SCHEMA_VERSION = 1
 OUTPUT_FILENAME_PATTERN = re.compile(
-    r"^C(?P<chapter>\d+(?:\.\d+)?)_P(?P<page>\d{3})\.(?:jpg|png)$"
+    r"^(?:C(?P<chapter>\d+(?:\.\d+)?)_)?"
+    r"P(?P<page>\d{3}(?:\.\d+)?)\.(?:jpg|png)$"
 )
 
 
@@ -38,7 +40,7 @@ class ExportResult:
 
 
 def output_directory_for(volume: VolumeRef) -> Path:
-    return volume.manga_path.resolve() / "Output" / f"Vol.{volume.number:02d}"
+    return volume.manga_path.resolve() / "Output" / volume.storage_name
 
 
 def export_selected_pages(
@@ -84,7 +86,7 @@ def export_selected_pages(
         metadata_directory
         / "exports"
         / volume.manga_name
-        / f"Vol.{volume.number:02d}.json"
+        / f"{volume.storage_name}.json"
     )
     for metadata_path in (
         metadata_directory,
@@ -175,7 +177,7 @@ def export_selected_pages(
         payload = {
             "schema_version": EXPORT_SCHEMA_VERSION,
             "manga": volume.manga_name,
-            "volume": volume.number,
+            "volume": volume.identity,
             "files": {
                 filename: {
                     "source": page.relative_path,
@@ -234,7 +236,7 @@ def _load_manifest(manifest_path: Path, volume: VolumeRef) -> dict[str, dict[str
         not isinstance(payload, dict)
         or payload.get("schema_version") != EXPORT_SCHEMA_VERSION
         or payload.get("manga") != volume.manga_name
-        or payload.get("volume") != volume.number
+        or not _volume_matches(payload.get("volume"), volume)
         or not isinstance(payload.get("files"), dict)
     ):
         raise ExportError("The previous export manifest is invalid or belongs to another volume.")
@@ -270,6 +272,17 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _volume_matches(saved_value: object, volume: VolumeRef) -> bool:
+    """Compare new string identifiers with manifests written by older versions."""
+
+    if isinstance(saved_value, bool):
+        return False
+    try:
+        return Decimal(str(saved_value)) == volume.number
+    except (InvalidOperation, ValueError):
+        return False
 
 
 def _rollback_export(

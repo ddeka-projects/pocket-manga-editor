@@ -9,15 +9,17 @@ from pathlib import Path
 
 @dataclass(frozen=True, slots=True)
 class PageRef:
-    """A source image and the chapter metadata encoded by its folders."""
+    """A source image and the volume/chapter metadata encoded by its folder."""
 
     manga_name: str
     manga_path: Path
-    volume_number: int
-    chapter_number: Decimal
+    volume_number: Decimal
+    volume_label: str
+    chapter_number: Decimal | None
     chapter_label: str
     chapter_title: str
-    page_number: int
+    page_number: Decimal
+    page_label: str
     source_path: Path
     relative_path: str
 
@@ -26,21 +28,36 @@ class PageRef:
         """Return an export name unique within a volume."""
 
         extension = self.source_path.suffix.casefold()
-        return f"C{self.chapter_label}_P{self.page_number:03d}{extension}"
+        if self.chapter_number is None:
+            return f"P{self.page_label}{extension}"
+        return f"C{self.chapter_label}_P{self.page_label}{extension}"
 
 
 @dataclass(frozen=True, slots=True)
 class VolumeRef:
-    """An ordered, virtual volume assembled from chapter directories."""
+    """An ordered volume sourced from chapters or a direct volume folder."""
 
     manga_name: str
     manga_path: Path
-    number: int
+    number: Decimal
+    label: str
     pages: tuple[PageRef, ...]
 
     @property
     def display_name(self) -> str:
-        return f"Vol.{self.number:02d}"
+        return f"Vol. {self.label}"
+
+    @property
+    def storage_name(self) -> str:
+        """Keep generated paths compatible with the original Vol.XX layout."""
+
+        return f"Vol.{self.label}"
+
+    @property
+    def identity(self) -> str:
+        """Return a formatting-independent serialized volume identifier."""
+
+        return format(self.number.normalize(), "f")
 
 
 @dataclass(frozen=True, slots=True)

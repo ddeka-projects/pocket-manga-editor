@@ -15,18 +15,25 @@ Working Directory/
     │   ├── 001.jpg
     │   ├── 002.png
     │   └── 003.jpg
-    └── Vol. 01 Ch. 001 - Another title/
+    ├── Vol. 01 Ch. 001 - Another title/
         ├── 001.jpg
         └── 002.jpg
+    └── Vol. 02.5/
+        ├── 001.jpg
+        ├── 002.png
+        └── 054.18.png
 ```
 
 Folder and page numbers are parsed numerically. The current development version intentionally accepts only these conventions:
 
 - Required chapter folder portion: `Vol. <digits> Ch. <digits or decimal>`
 - Optional suffix: ` - <chapter name>`
-- Page file: `<3 digits>.jpg` or `<3 digits>.png` (extensions are case-insensitive)
+- Direct volume folder: `Vol. <digits or decimal>`
+- Page file: `<3 digits>[.<decimal digits>].jpg` or `.png`, such as `054.png` or `054.18.png` (extensions are case-insensitive)
 
-All matching chapters for one volume appear in the viewer as a single continuous virtual volume. The optional chapter name has no effect on sorting or export. Chapter identifiers are sorted numerically, including decimals: `000.01`, `000.02`, `000.1`, `000.2`, `001`, `067`, `067.5`, `068`. Their original spelling is preserved for display and export filenames. Numerically equivalent identifiers such as `000.1` and `000.10` are reported as an ambiguous duplicate instead of being silently combined.
+All matching chapters for one volume appear in the viewer as a single continuous virtual volume. A direct volume folder is already one volume, so its pages are read directly without a preparation step. The two storage styles can be mixed for different volumes in one manga. If the same numeric volume appears in both styles, that volume is skipped and reported as a scan issue rather than being combined ambiguously.
+
+Volume, chapter, and page identifiers are sorted numerically, including decimals. The optional chapter name has no effect on sorting or export. Original number spelling is preserved for display and generated paths. Numerically equivalent identifiers such as `000.1` and `000.10` are reported as an ambiguous duplicate instead of being silently combined.
 
 ## Development setup
 
@@ -73,7 +80,7 @@ Choosing **Export Selected** copies the current selection to:
 <manga-folder>/Output/Vol.01/
 ```
 
-Exported names include both chapter and page numbers while preserving the source format, such as `C002_P017.jpg` or `C002_P017.png`, so identically numbered pages from different chapters cannot collide. Repeat exports remove only stale files recorded as app-created; unrelated files in the output folder are preserved. If an exported image has been edited since the last export, the app refuses to overwrite or remove it. Selections remain available after export until the user explicitly clears them.
+For chapter-based sources, exported names include both chapter and page numbers, such as `C002_P017.jpg`. Direct-volume pages use names such as `P017.png`. The source image format is preserved. Repeat exports remove only stale files recorded as app-created; unrelated files in the output folder are preserved. If an exported image has been edited since the last export, the app refuses to overwrite or remove it. Selections remain available after export until the user explicitly clears them.
 
 ## Run tests
 

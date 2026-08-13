@@ -164,8 +164,81 @@ class ScannerTests(RepositoryFixture):
         self.assertEqual([page.chapter_label for page in pages], ["001"])
         self.assertIn("Duplicate Vol. 01 Ch. 000.1", result.issues[0].message)
 
+    def test_scans_direct_volume_folders_and_sorts_decimal_volumes(self) -> None:
+        self.add_page("Series", "Vol. 10", "001.jpg")
+        self.add_page("Series", "Vol. 2.5", "002.PNG")
+        self.add_page("Series", "Vol. 2.5", "001.jpg")
+        self.add_page("Series", "Vol. 2.05", "001.jpg")
+        self.add_page("Series", "Vol. 01 Ch. 001", "001.jpg")
+
+        manga = scan_working_directory(self.root).mangas[0]
+
+        self.assertEqual(
+            [volume.label for volume in manga.volumes],
+            ["01", "2.05", "2.5", "10"],
+        )
+        direct_volume = manga.volumes[2]
+        self.assertEqual([page.chapter_number for page in direct_volume.pages], [None, None])
+        self.assertEqual(
+            [page.relative_path for page in direct_volume.pages],
+            ["Vol. 2.5/001.jpg", "Vol. 2.5/002.PNG"],
+        )
+        self.assertEqual(
+            [page.output_filename for page in direct_volume.pages],
+            ["P001.jpg", "P002.png"],
+        )
+
+    def test_skips_a_volume_that_exists_in_both_storage_styles(self) -> None:
+        self.add_page("Series", "Vol. 01", "001.jpg")
+        self.add_page("Series", "Vol. 01 Ch. 001", "001.jpg")
+        self.add_page("Series", "Vol. 02", "001.jpg")
+
+        result = scan_working_directory(self.root)
+
+        self.assertEqual([volume.label for volume in result.mangas[0].volumes], ["02"])
+        self.assertIn("both chapter folders and a direct volume folder", result.issues[0].message)
+
+    def test_sorts_decimal_page_identifiers_numerically(self) -> None:
+        for page_name in ("055.png", "054.2.jpg", "054.19.png", "054.18.png"):
+            self.add_page("Series", "Vol. 01", page_name)
+
+        pages = scan_working_directory(self.root).mangas[0].volumes[0].pages
+
+        self.assertEqual(
+            [page.page_label for page in pages],
+            ["054.18", "054.19", "054.2", "055"],
+        )
+        self.assertEqual(
+            [page.output_filename for page in pages],
+            ["P054.18.png", "P054.19.png", "P054.2.jpg", "P055.png"],
+        )
+
+    def test_equivalent_decimal_page_identifiers_are_ambiguous(self) -> None:
+        self.add_page("Series", "Vol. 01", "054.1.jpg")
+        self.add_page("Series", "Vol. 01", "054.10.png")
+        self.add_page("Series", "Vol. 01", "055.jpg")
+
+        result = scan_working_directory(self.root)
+
+        pages = result.mangas[0].volumes[0].pages
+        self.assertEqual([page.page_label for page in pages], ["055"])
+        self.assertIn("Duplicate page 54.1", result.issues[0].message)
+
 
 class SessionStoreTests(RepositoryFixture):
+    def test_round_trips_a_decimal_direct_volume(self) -> None:
+        self.add_page("Series", "Vol. 01.5", "001.png")
+        volume = scan_working_directory(self.root).mangas[0].volumes[0]
+        store = SessionStore(self.root)
+
+        store.save(volume, 0, {volume.pages[0].relative_path})
+        restored = store.load(volume)
+
+        self.assertEqual(store.path_for(volume).name, "Vol.01.5.json")
+        self.assertEqual(restored.selected_paths, {"Vol. 01.5/001.png"})
+        payload = json.loads(store.path_for(volume).read_text(encoding="utf-8"))
+        self.assertEqual(payload["volume"], "1.5")
+
     def test_round_trips_selection_and_current_page(self) -> None:
         self.add_page("Series", "Vol. 01 Ch. 001 - First", "001.jpg")
         self.add_page("Series", "Vol. 01 Ch. 001 - First", "002.jpg")
@@ -222,6 +295,36 @@ class SessionStoreTests(RepositoryFixture):
 
 
 class ExporterTests(RepositoryFixture):
+    def test_exports_a_decimal_page_with_its_original_identifier(self) -> None:
+        self.add_page(
+            "Series",
+            "Vol. 01 Ch. 067.5",
+            "054.18.png",
+            content=b"decimal-page",
+        )
+        volume = scan_working_directory(self.root).mangas[0].volumes[0]
+        page = volume.pages[0]
+
+        result = export_selected_pages(self.root, volume, {page.relative_path})
+
+        exported = result.output_directory / "C067.5_P054.18.png"
+        self.assertEqual(exported.read_bytes(), b"decimal-page")
+
+    def test_exports_direct_volume_pages_without_a_fictional_chapter(self) -> None:
+        self.add_page("Series", "Vol. 01.5", "001.jpg", content=b"direct-jpg")
+        self.add_page("Series", "Vol. 01.5", "002.png", content=b"direct-png")
+        volume = scan_working_directory(self.root).mangas[0].volumes[0]
+
+        result = export_selected_pages(
+            self.root,
+            volume,
+            {page.relative_path for page in volume.pages},
+        )
+
+        self.assertEqual(result.output_directory.name, "Vol.01.5")
+        self.assertEqual((result.output_directory / "P001.jpg").read_bytes(), b"direct-jpg")
+        self.assertEqual((result.output_directory / "P002.png").read_bytes(), b"direct-png")
+
     def test_exports_png_without_changing_its_format_or_extension(self) -> None:
         self.add_page(
             "Series",

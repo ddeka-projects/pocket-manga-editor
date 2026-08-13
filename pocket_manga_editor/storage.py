@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -31,7 +32,7 @@ class SessionStore:
         self.base_directory = self.working_directory / ".pocket-manga-editor" / "selections"
 
     def path_for(self, volume: VolumeRef) -> Path:
-        return self.base_directory / volume.manga_name / f"Vol.{volume.number:02d}.json"
+        return self.base_directory / volume.manga_name / f"{volume.storage_name}.json"
 
     def load(self, volume: VolumeRef) -> SessionSnapshot:
         path = self.path_for(volume)
@@ -52,7 +53,9 @@ class SessionStore:
                 ("Saved session uses an unsupported format and was ignored.",),
             )
 
-        if payload.get("manga") != volume.manga_name or payload.get("volume") != volume.number:
+        if payload.get("manga") != volume.manga_name or not _volume_matches(
+            payload.get("volume"), volume
+        ):
             return SessionSnapshot(
                 0,
                 frozenset(),
@@ -112,7 +115,7 @@ class SessionStore:
         payload = {
             "schema_version": STATE_SCHEMA_VERSION,
             "manga": volume.manga_name,
-            "volume": volume.number,
+            "volume": volume.identity,
             "current_page": volume.pages[current_index].relative_path,
             "current_index": current_index,
             "selected_pages": valid_selected,
@@ -155,3 +158,14 @@ def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
 def _is_safe_relative_path(value: str) -> bool:
     path = PurePosixPath(value)
     return bool(value) and not path.is_absolute() and ".." not in path.parts
+
+
+def _volume_matches(saved_value: object, volume: VolumeRef) -> bool:
+    """Compare new string identifiers with state written by older versions."""
+
+    if isinstance(saved_value, bool):
+        return False
+    try:
+        return Decimal(str(saved_value)) == volume.number
+    except (InvalidOperation, ValueError):
+        return False

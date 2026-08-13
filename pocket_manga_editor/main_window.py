@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from PySide6.QtCore import QSettings, QSize, Qt, QTimer, QUrl
@@ -32,7 +33,7 @@ from PySide6.QtWidgets import (
 )
 
 from .exporter import ExportError, export_selected_pages, output_directory_for
-from .models import MangaRef, ScanIssue, ScanResult, VolumeRef
+from .models import MangaRef, PageRef, ScanIssue, ScanResult, VolumeRef
 from .scanner import ScanError, scan_working_directory
 from .storage import SessionStore
 
@@ -644,8 +645,10 @@ class MainWindow(QMainWindow):
         preferred_manga = self.current_volume.manga_name if self.current_volume else str(
             self.settings.value("library/last_manga", "")
         )
-        preferred_volume = self.current_volume.number if self.current_volume else _setting_int(
-            self.settings, "library/last_volume", 0
+        preferred_volume = (
+            self.current_volume.number
+            if self.current_volume
+            else _setting_decimal(self.settings, "library/last_volume")
         )
 
         try:
@@ -668,7 +671,9 @@ class MainWindow(QMainWindow):
             f"Found {manga_count} manga and {volume_count} volume(s).", 5000
         )
 
-    def _populate_mangas(self, preferred_manga: str, preferred_volume: int) -> None:
+    def _populate_mangas(
+        self, preferred_manga: str, preferred_volume: Decimal | None
+    ) -> None:
         self.manga_combo.blockSignals(True)
         self.manga_combo.clear()
         for manga in self.scan_result.mangas:
@@ -684,7 +689,8 @@ class MainWindow(QMainWindow):
             self.heading_label.setText("No manga found")
             self.progress_label.setText("— / —")
             self.page_label.setText(
-                "Expected chapter folders: Vol. 01 Ch. 001 (chapter name optional)"
+                "Expected folders: Vol. 01, or Vol. 01 Ch. 001 "
+                "(chapter name optional)"
             )
             self.canvas.show_message(
                 "No matching manga chapters were found in this working folder.\n\n"
@@ -710,13 +716,15 @@ class MainWindow(QMainWindow):
         if not isinstance(manga, MangaRef):
             return
         preferred_volume = (
-            _setting_int(self.settings, "library/last_volume", 0)
+            _setting_decimal(self.settings, "library/last_volume")
             if manga.name == str(self.settings.value("library/last_manga", ""))
-            else 0
+            else None
         )
         self._populate_volumes(manga, preferred_volume)
 
-    def _populate_volumes(self, manga: MangaRef, preferred_volume: int) -> None:
+    def _populate_volumes(
+        self, manga: MangaRef, preferred_volume: Decimal | None
+    ) -> None:
         self.volume_combo.blockSignals(True)
         self.volume_combo.clear()
         for volume in manga.volumes:
@@ -727,7 +735,7 @@ class MainWindow(QMainWindow):
 
         preferred_index = 0
         for index, volume in enumerate(manga.volumes):
-            if volume.number == preferred_volume:
+            if preferred_volume is not None and volume.number == preferred_volume:
                 preferred_index = index
                 break
         self.volume_combo.setCurrentIndex(preferred_index)
@@ -753,7 +761,7 @@ class MainWindow(QMainWindow):
         self._last_output_directory = output_directory_for(volume)
         self._set_save_status(False, "Progress autosaves")
         self.settings.setValue("library/last_manga", volume.manga_name)
-        self.settings.setValue("library/last_volume", volume.number)
+        self.settings.setValue("library/last_volume", volume.identity)
         self._set_review_enabled(True)
         self._show_current_page()
         self.canvas.setFocus(Qt.FocusReason.OtherFocusReason)
@@ -772,12 +780,12 @@ class MainWindow(QMainWindow):
         self.canvas.set_selected(page.relative_path in self.selected_paths)
         self.heading_label.setText(f"{volume.manga_name}  ·  {volume.display_name}")
         self.progress_label.setText(f"{self.current_index + 1} / {len(volume.pages)}")
-        page_details = [
-            f"Ch. {page.chapter_label}",
-            f"Page {page.page_number:03d}",
-        ]
-        if page.chapter_title:
-            page_details.append(page.chapter_title)
+        page_details: list[str] = []
+        if page.chapter_number is not None:
+            page_details.append(f"Ch. {page.chapter_label}")
+            if page.chapter_title:
+                page_details.append(page.chapter_title)
+        page_details.append(f"Page {page.page_label}")
         page_details.append(page.source_path.name)
         self.page_label.setText("  ·  ".join(page_details))
         self.page_label.setToolTip(str(page.source_path))
@@ -892,12 +900,10 @@ class MainWindow(QMainWindow):
         page = volume.pages[self.current_index]
         if page.relative_path in self.selected_paths:
             self.selected_paths.remove(page.relative_path)
-            message = (
-                f"Deselected Ch. {page.chapter_label} page {page.page_number:03d}."
-            )
+            message = f"Deselected {_page_description(page)}."
         else:
             self.selected_paths.add(page.relative_path)
-            message = f"Selected Ch. {page.chapter_label} page {page.page_number:03d}."
+            message = f"Selected {_page_description(page)}."
         self._save_session()
         self._refresh_selection_controls()
         self.statusBar().showMessage(message, 2000)
@@ -1141,8 +1147,16 @@ def _shortcut_hint(keys: str, description: str) -> QWidget:
     return item
 
 
-def _setting_int(settings: QSettings, key: str, default: int) -> int:
+def _setting_decimal(settings: QSettings, key: str) -> Decimal | None:
     try:
-        return int(settings.value(key, default))
-    except (TypeError, ValueError):
-        return default
+        return Decimal(str(settings.value(key, "")))
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def _page_description(page: PageRef) -> str:
+    """Return a concise selection message for chapter or direct-volume pages."""
+
+    if page.chapter_number is None:
+        return f"page {page.page_label}"
+    return f"Ch. {page.chapter_label} page {page.page_label}"
