@@ -77,8 +77,12 @@ Selection changes and the current page are saved automatically as relative paths
 Choosing **Export Selected** copies the current selection to:
 
 ```text
-<manga-folder>/Output/Vol.01/
+<working-directory>/.pocket-manga-editor/output/<manga-name>/Vol.01/
 ```
+
+This keeps selections, export bookkeeping, and exported images together under
+`.pocket-manga-editor`; source manga folders are not given generated `Output`
+subdirectories.
 
 For chapter-based sources, exported names include both chapter and page numbers, such as `C002_P017.jpg`. Direct-volume pages use names such as `P017.png`. The source image format is preserved. Repeat exports remove only stale files recorded as app-created; unrelated files in the output folder are preserved. If an exported image has been edited since the last export, the app refuses to overwrite or remove it. Selections remain available after export until the user explicitly clears them.
 

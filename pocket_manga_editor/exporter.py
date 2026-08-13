@@ -40,7 +40,14 @@ class ExportResult:
 
 
 def output_directory_for(volume: VolumeRef) -> Path:
-    return volume.manga_path.resolve() / "Output" / volume.storage_name
+    working_directory = volume.manga_path.resolve().parent
+    return (
+        working_directory
+        / ".pocket-manga-editor"
+        / "output"
+        / volume.manga_name
+        / volume.storage_name
+    )
 
 
 def export_selected_pages(
@@ -88,22 +95,26 @@ def export_selected_pages(
         / volume.manga_name
         / f"{volume.storage_name}.json"
     )
+    output_root = metadata_directory / "output"
+    output_manga_directory = output_root / volume.manga_name
     for metadata_path in (
         metadata_directory,
         metadata_directory / "exports",
         manifest_path.parent,
+        output_root,
+        output_manga_directory,
     ):
         if metadata_path.exists() and not metadata_path.resolve().is_relative_to(working_path):
             raise ExportError("The app metadata folder points outside the working directory.")
     previous_files = _load_manifest(manifest_path, volume)
     output_directory = output_directory_for(volume)
-    if output_directory.exists() and output_directory.is_symlink():
-        raise ExportError("The output volume folder cannot be a symbolic link.")
-    if output_directory.parent.exists() and output_directory.parent.is_symlink():
-        raise ExportError("The manga Output folder cannot be a symbolic link.")
-    for output_path in (output_directory.parent, output_directory):
-        if output_path.exists() and not output_path.resolve().is_relative_to(manga_path):
-            raise ExportError("The output folder points outside the selected manga folder.")
+    for output_path in (output_root, output_manga_directory, output_directory):
+        if output_path.exists() and output_path.is_symlink():
+            raise ExportError("App-managed output folders cannot be symbolic links.")
+        if output_path.exists() and not output_path.resolve().is_relative_to(
+            metadata_directory.resolve()
+        ):
+            raise ExportError("The output folder points outside the app metadata folder.")
     try:
         output_directory.parent.mkdir(parents=True, exist_ok=True)
     except OSError as exc:

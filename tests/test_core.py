@@ -6,7 +6,11 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from pocket_manga_editor.exporter import ExportConflict, export_selected_pages
+from pocket_manga_editor.exporter import (
+    ExportConflict,
+    export_selected_pages,
+    output_directory_for,
+)
 from pocket_manga_editor.scanner import scan_working_directory
 from pocket_manga_editor.storage import SessionStore
 
@@ -321,9 +325,18 @@ class ExporterTests(RepositoryFixture):
             {page.relative_path for page in volume.pages},
         )
 
+        self.assertEqual(
+            result.output_directory,
+            self.root.resolve()
+            / ".pocket-manga-editor"
+            / "output"
+            / "Series"
+            / "Vol.01.5",
+        )
         self.assertEqual(result.output_directory.name, "Vol.01.5")
         self.assertEqual((result.output_directory / "P001.jpg").read_bytes(), b"direct-jpg")
         self.assertEqual((result.output_directory / "P002.png").read_bytes(), b"direct-png")
+        self.assertFalse((volume.manga_path / "Output").exists())
 
     def test_exports_png_without_changing_its_format_or_extension(self) -> None:
         self.add_page(
@@ -370,7 +383,7 @@ class ExporterTests(RepositoryFixture):
         self.add_page("Series", "Vol. 01 Ch. 001 - First", "001.jpg")
         volume = scan_working_directory(self.root).mangas[0].volumes[0]
         page = volume.pages[0]
-        output = volume.manga_path / "Output" / "Vol.01"
+        output = output_directory_for(volume)
         output.mkdir(parents=True)
         (output / page.output_filename).write_bytes(b"user-owned")
 
@@ -385,7 +398,7 @@ class ExporterTests(RepositoryFixture):
         )
         volume = scan_working_directory(self.root).mangas[0].volumes[0]
         page = volume.pages[0]
-        output = volume.manga_path / "Output" / "Vol.01"
+        output = output_directory_for(volume)
         output.mkdir(parents=True)
         existing = output / page.output_filename
         existing.write_bytes(source.read_bytes())
@@ -429,7 +442,7 @@ class ExporterTests(RepositoryFixture):
         with self.assertRaisesRegex(Exception, "manifest"):
             export_selected_pages(self.root, volume, {page.relative_path})
 
-        self.assertFalse((volume.manga_path / "Output" / "Vol.01").exists())
+        self.assertFalse(output_directory_for(volume).exists())
 
     def test_rejects_a_volume_from_outside_the_working_directory(self) -> None:
         self.add_page("Series", "Vol. 01 Ch. 001 - First", "001.jpg")
