@@ -1,6 +1,6 @@
 # Pocket Manga Editor
 
-Pocket Manga Editor is a development-stage, keyboard-first desktop tool for reviewing manga JPGs and exporting a hand-picked set of pages. It reads chapter folders directly, so it does not need a separate volume-preparation phase and never modifies source images.
+Pocket Manga Editor is a development-stage, keyboard-first desktop tool for reviewing manga JPG and PNG images and exporting a hand-picked set of pages. It reads chapter folders directly, so it does not need a separate volume-preparation phase and never modifies source images.
 
 The original `manga_image_saver.ipynb` is retained as a proof of concept. The desktop application is implemented separately in the `pocket_manga_editor` Python package.
 
@@ -13,7 +13,7 @@ Working Directory/
 └── Manga Name/
     ├── Vol. 01 Ch. 000.01/
     │   ├── 001.jpg
-    │   ├── 002.jpg
+    │   ├── 002.png
     │   └── 003.jpg
     └── Vol. 01 Ch. 001 - Another title/
         ├── 001.jpg
@@ -24,7 +24,7 @@ Folder and page numbers are parsed numerically. The current development version 
 
 - Required chapter folder portion: `Vol. <digits> Ch. <digits or decimal>`
 - Optional suffix: ` - <chapter name>`
-- Page file: `<3 digits>.jpg` (the `.jpg` extension is case-insensitive)
+- Page file: `<3 digits>.jpg` or `<3 digits>.png` (extensions are case-insensitive)
 
 All matching chapters for one volume appear in the viewer as a single continuous virtual volume. The optional chapter name has no effect on sorting or export. Chapter identifiers are sorted numerically, including decimals: `000.01`, `000.02`, `000.1`, `000.2`, `001`, `067`, `067.5`, `068`. Their original spelling is preserved for display and export filenames. Numerically equivalent identifiers such as `000.1` and `000.10` are reported as an ambiguous duplicate instead of being silently combined.
 
@@ -73,7 +73,7 @@ Choosing **Export Selected** copies the current selection to:
 <manga-folder>/Output/Vol.01/
 ```
 
-Exported names include both chapter and page numbers, such as `C002_P017.jpg`, so page `001.jpg` from different chapters cannot collide. Repeat exports remove only stale files recorded as app-created; unrelated files in the output folder are preserved. If an exported JPG has been edited since the last export, the app refuses to overwrite or remove it. Selections remain available after export until the user explicitly clears them.
+Exported names include both chapter and page numbers while preserving the source format, such as `C002_P017.jpg` or `C002_P017.png`, so identically numbered pages from different chapters cannot collide. Repeat exports remove only stale files recorded as app-created; unrelated files in the output folder are preserved. If an exported image has been edited since the last export, the app refuses to overwrite or remove it. Selections remain available after export until the user explicitly clears them.
 
 ## Run tests
 

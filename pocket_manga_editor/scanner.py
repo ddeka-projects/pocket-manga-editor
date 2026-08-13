@@ -1,4 +1,4 @@
-"""Discover manga, chapters, volumes, and JPG pages from a working folder."""
+"""Discover manga, chapters, volumes, and supported image pages from a working folder."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ CHAPTER_PATTERN = re.compile(
     r"(?P<chapter>\d+(?:\.\d+)?)(?:\s+-\s+(?P<title>.+?))?\s*$",
     re.IGNORECASE,
 )
-PAGE_PATTERN = re.compile(r"^(?P<page>\d{3})\.jpg$", re.IGNORECASE)
+PAGE_PATTERN = re.compile(r"^(?P<page>\d{3})\.(?:jpg|png)$", re.IGNORECASE)
 
 
 class ScanError(RuntimeError):
@@ -31,6 +31,7 @@ def scan_working_directory(working_directory: str | Path) -> ScanResult:
           Manga name/
             Vol. 01 Ch. 001 - Optional chapter title/
               001.jpg
+              002.png
 
     Non-matching folders and files are ignored. Names that appear intended to
     follow the chapter convention, but do not, are returned as scan issues.
@@ -127,11 +128,12 @@ def _scan_manga(manga_path: Path) -> tuple[MangaRef | None, list[ScanIssue]]:
             page_match = PAGE_PATTERN.fullmatch(page_path.name)
             if page_match:
                 page_groups[int(page_match.group("page"))].append(page_path)
-            elif page_path.suffix.casefold() in {".jpg", ".jpeg"}:
+            elif page_path.suffix.casefold() in {".jpg", ".jpeg", ".png"}:
                 issues.append(
                     ScanIssue(
                         page_path,
-                        "Image file does not match the supported '###.jpg' page name.",
+                        "Image file does not match a supported '###.jpg' or "
+                        "'###.png' page name.",
                     )
                 )
 
@@ -164,7 +166,12 @@ def _scan_manga(manga_path: Path) -> tuple[MangaRef | None, list[ScanIssue]]:
             chapter_page_count += 1
 
         if chapter_page_count == 0:
-            issues.append(ScanIssue(chapter_path, "Chapter contains no matching ###.jpg pages."))
+            issues.append(
+                ScanIssue(
+                    chapter_path,
+                    "Chapter contains no matching ###.jpg or ###.png pages.",
+                )
+            )
 
     volumes: list[VolumeRef] = []
     for volume_number, pages in sorted(pages_by_volume.items()):

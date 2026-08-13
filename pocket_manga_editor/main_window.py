@@ -1098,7 +1098,7 @@ class MainWindow(QMainWindow):
             "<tr><td><b>? / F1</b></td><td>Show this help</td></tr>"
             "</table>"
             "<p>Selections and the current position are saved automatically. "
-            "Source JPG files are copied only when you export.</p>",
+            "Source JPG and PNG files are copied only when you export.</p>",
         )
 
     def show_about(self) -> None:

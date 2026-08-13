@@ -25,7 +25,8 @@ class PageRef:
     def output_filename(self) -> str:
         """Return an export name unique within a volume."""
 
-        return f"C{self.chapter_label}_P{self.page_number:03d}.jpg"
+        extension = self.source_path.suffix.casefold()
+        return f"C{self.chapter_label}_P{self.page_number:03d}{extension}"
 
 
 @dataclass(frozen=True, slots=True)

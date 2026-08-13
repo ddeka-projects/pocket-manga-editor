@@ -39,6 +39,7 @@ class ScannerTests(RepositoryFixture):
         self.add_page("Series", "Vol. 01 Ch. 002 - Second", "002.jpg")
         self.add_page("Series", "Vol. 01 Ch. 001 - First", "010.jpg")
         self.add_page("Series", "Vol. 01 Ch. 001 - First", "002.JPG")
+        self.add_page("Series", "Vol. 01 Ch. 001 - First", "003.PNG")
         self.add_page("Series", "Vol. 01 Ch. 001 - First", "thumbnail.png")
 
         result = scan_working_directory(self.root)
@@ -50,13 +51,19 @@ class ScannerTests(RepositoryFixture):
             [page.relative_path for page in manga.volumes[0].pages],
             [
                 "Vol. 01 Ch. 001 - First/002.JPG",
+                "Vol. 01 Ch. 001 - First/003.PNG",
                 "Vol. 01 Ch. 001 - First/010.jpg",
                 "Vol. 01 Ch. 002 - Second/002.jpg",
             ],
         )
         self.assertEqual(
             [page.output_filename for page in manga.volumes[0].pages],
-            ["C001_P002.jpg", "C001_P010.jpg", "C002_P002.jpg"],
+            [
+                "C001_P002.jpg",
+                "C001_P003.png",
+                "C001_P010.jpg",
+                "C002_P002.jpg",
+            ],
         )
 
     def test_reports_malformed_and_ambiguous_chapters_without_crashing(self) -> None:
@@ -215,6 +222,21 @@ class SessionStoreTests(RepositoryFixture):
 
 
 class ExporterTests(RepositoryFixture):
+    def test_exports_png_without_changing_its_format_or_extension(self) -> None:
+        self.add_page(
+            "Series",
+            "Vol. 01 Ch. 001",
+            "007.PNG",
+            content=b"png-source-bytes",
+        )
+        volume = scan_working_directory(self.root).mangas[0].volumes[0]
+        page = volume.pages[0]
+
+        result = export_selected_pages(self.root, volume, {page.relative_path})
+
+        exported = result.output_directory / "C001_P007.png"
+        self.assertEqual(exported.read_bytes(), b"png-source-bytes")
+
     def test_repeat_export_updates_only_managed_files(self) -> None:
         self.add_page(
             "Series", "Vol. 01 Ch. 001 - First", "001.jpg", content=b"chapter-one"
