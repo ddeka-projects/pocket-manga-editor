@@ -35,11 +35,11 @@ class RepositoryFixture(unittest.TestCase):
 
 class ScannerTests(RepositoryFixture):
     def test_scans_a_numeric_virtual_volume_in_order(self) -> None:
-        self.add_page("Series", "Vol.02 Ch.010 - Later", "010.jpg")
-        self.add_page("Series", "Vol.01 Ch.002 - Second", "002.jpg")
-        self.add_page("Series", "Vol.01 Ch.001 - First", "010.jpg")
-        self.add_page("Series", "Vol.01 Ch.001 - First", "002.JPG")
-        self.add_page("Series", "Vol.01 Ch.001 - First", "thumbnail.png")
+        self.add_page("Series", "Vol. 02 Ch. 010 - Later", "010.jpg")
+        self.add_page("Series", "Vol. 01 Ch. 002 - Second", "002.jpg")
+        self.add_page("Series", "Vol. 01 Ch. 001 - First", "010.jpg")
+        self.add_page("Series", "Vol. 01 Ch. 001 - First", "002.JPG")
+        self.add_page("Series", "Vol. 01 Ch. 001 - First", "thumbnail.png")
 
         result = scan_working_directory(self.root)
 
@@ -49,9 +49,9 @@ class ScannerTests(RepositoryFixture):
         self.assertEqual(
             [page.relative_path for page in manga.volumes[0].pages],
             [
-                "Vol.01 Ch.001 - First/002.JPG",
-                "Vol.01 Ch.001 - First/010.jpg",
-                "Vol.01 Ch.002 - Second/002.jpg",
+                "Vol. 01 Ch. 001 - First/002.JPG",
+                "Vol. 01 Ch. 001 - First/010.jpg",
+                "Vol. 01 Ch. 002 - Second/002.jpg",
             ],
         )
         self.assertEqual(
@@ -60,10 +60,10 @@ class ScannerTests(RepositoryFixture):
         )
 
     def test_reports_malformed_and_ambiguous_chapters_without_crashing(self) -> None:
-        self.add_page("Series", "Vol.1 Ch.001 - Bad volume", "001.jpg")
-        self.add_page("Series", "Vol.01 Ch.001 - Duplicate A", "001.jpg")
-        self.add_page("Series", "Vol.01 Ch.001 - Duplicate B", "001.jpg")
-        self.add_page("Series", "Vol.01 Ch.002 - Valid", "001.jpg")
+        self.add_page("Series", "Vol.01 Ch. 001 - Missing space", "001.jpg")
+        self.add_page("Series", "Vol. 01 Ch. 001 - Duplicate A", "001.jpg")
+        self.add_page("Series", "Vol. 01 Ch. 001 - Duplicate B", "001.jpg")
+        self.add_page("Series", "Vol. 01 Ch. 002 - Valid", "001.jpg")
 
         result = scan_working_directory(self.root)
 
@@ -72,22 +72,83 @@ class ScannerTests(RepositoryFixture):
         self.assertEqual([page.chapter_number for page in pages], [2])
         messages = " ".join(issue.message for issue in result.issues)
         self.assertIn("does not match", messages)
-        self.assertIn("Duplicate Vol.01 Ch.001", messages)
+        self.assertIn("Duplicate Vol. 01 Ch. 001", messages)
 
     def test_reports_a_misnamed_jpg_even_when_the_chapter_has_valid_pages(self) -> None:
-        self.add_page("Series", "Vol.01 Ch.001 - First", "001.jpg")
-        self.add_page("Series", "Vol.01 Ch.001 - First", "02.jpg")
+        self.add_page("Series", "Vol. 01 Ch. 001 - First", "001.jpg")
+        self.add_page("Series", "Vol. 01 Ch. 001 - First", "02.jpg")
 
         result = scan_working_directory(self.root)
 
         self.assertEqual(len(result.mangas[0].volumes[0].pages), 1)
         self.assertIn("does not match", result.issues[0].message)
 
+    def test_sorts_decimal_chapter_identifiers_numerically(self) -> None:
+        chapter_labels = (
+            "068",
+            "067.5",
+            "001",
+            "000.2",
+            "067",
+            "000.03",
+            "000.1",
+            "000.02",
+            "000.01",
+        )
+        for label in chapter_labels:
+            self.add_page(
+                "Series",
+                f"Vol. 1 Ch. {label} - Chapter {label}",
+                "001.jpg",
+            )
+
+        volume = scan_working_directory(self.root).mangas[0].volumes[0]
+
+        self.assertEqual(
+            [page.chapter_label for page in volume.pages],
+            [
+                "000.01",
+                "000.02",
+                "000.03",
+                "000.1",
+                "000.2",
+                "001",
+                "067",
+                "067.5",
+                "068",
+            ],
+        )
+        self.assertEqual(
+            [page.output_filename for page in volume.pages],
+            [
+                "C000.01_P001.jpg",
+                "C000.02_P001.jpg",
+                "C000.03_P001.jpg",
+                "C000.1_P001.jpg",
+                "C000.2_P001.jpg",
+                "C001_P001.jpg",
+                "C067_P001.jpg",
+                "C067.5_P001.jpg",
+                "C068_P001.jpg",
+            ],
+        )
+
+    def test_equivalent_decimal_chapter_identifiers_are_ambiguous(self) -> None:
+        self.add_page("Series", "Vol. 01 Ch. 000.1 - First", "001.jpg")
+        self.add_page("Series", "Vol. 01 Ch. 000.10 - Same number", "001.jpg")
+        self.add_page("Series", "Vol. 01 Ch. 001 - Valid", "001.jpg")
+
+        result = scan_working_directory(self.root)
+
+        pages = result.mangas[0].volumes[0].pages
+        self.assertEqual([page.chapter_label for page in pages], ["001"])
+        self.assertIn("Duplicate Vol. 01 Ch. 000.1", result.issues[0].message)
+
 
 class SessionStoreTests(RepositoryFixture):
     def test_round_trips_selection_and_current_page(self) -> None:
-        self.add_page("Series", "Vol.01 Ch.001 - First", "001.jpg")
-        self.add_page("Series", "Vol.01 Ch.001 - First", "002.jpg")
+        self.add_page("Series", "Vol. 01 Ch. 001 - First", "001.jpg")
+        self.add_page("Series", "Vol. 01 Ch. 001 - First", "002.jpg")
         volume = scan_working_directory(self.root).mangas[0].volumes[0]
         store = SessionStore(self.root)
 
@@ -102,7 +163,7 @@ class SessionStoreTests(RepositoryFixture):
         self.assertEqual(payload["selected_pages"], [volume.pages[1].relative_path])
 
     def test_ignores_unsafe_and_stale_saved_paths(self) -> None:
-        self.add_page("Series", "Vol.01 Ch.001 - First", "001.jpg")
+        self.add_page("Series", "Vol. 01 Ch. 001 - First", "001.jpg")
         volume = scan_working_directory(self.root).mangas[0].volumes[0]
         store = SessionStore(self.root)
         path = store.path_for(volume)
@@ -127,7 +188,7 @@ class SessionStoreTests(RepositoryFixture):
         self.assertEqual(len(restored.warnings), 2)
 
     def test_invalid_utf8_state_is_ignored_with_a_warning(self) -> None:
-        self.add_page("Series", "Vol.01 Ch.001 - First", "001.jpg")
+        self.add_page("Series", "Vol. 01 Ch. 001 - First", "001.jpg")
         volume = scan_working_directory(self.root).mangas[0].volumes[0]
         store = SessionStore(self.root)
         path = store.path_for(volume)
@@ -143,10 +204,10 @@ class SessionStoreTests(RepositoryFixture):
 class ExporterTests(RepositoryFixture):
     def test_repeat_export_updates_only_managed_files(self) -> None:
         self.add_page(
-            "Series", "Vol.01 Ch.001 - First", "001.jpg", content=b"chapter-one"
+            "Series", "Vol. 01 Ch. 001 - First", "001.jpg", content=b"chapter-one"
         )
         self.add_page(
-            "Series", "Vol.01 Ch.002 - Second", "001.jpg", content=b"chapter-two"
+            "Series", "Vol. 01 Ch. 002 - Second", "001.jpg", content=b"chapter-two"
         )
         volume = scan_working_directory(self.root).mangas[0].volumes[0]
         first, second = volume.pages
@@ -168,7 +229,7 @@ class ExporterTests(RepositoryFixture):
         self.assertEqual(unknown_file.read_text(encoding="utf-8"), "leave me alone")
 
     def test_refuses_to_overwrite_an_untracked_collision(self) -> None:
-        self.add_page("Series", "Vol.01 Ch.001 - First", "001.jpg")
+        self.add_page("Series", "Vol. 01 Ch. 001 - First", "001.jpg")
         volume = scan_working_directory(self.root).mangas[0].volumes[0]
         page = volume.pages[0]
         output = volume.manga_path / "Output" / "Vol.01"
@@ -182,7 +243,7 @@ class ExporterTests(RepositoryFixture):
 
     def test_adopts_identical_output_left_by_an_interrupted_first_export(self) -> None:
         source = self.add_page(
-            "Series", "Vol.01 Ch.001 - First", "001.jpg", b"same-content"
+            "Series", "Vol. 01 Ch. 001 - First", "001.jpg", b"same-content"
         )
         volume = scan_working_directory(self.root).mangas[0].volumes[0]
         page = volume.pages[0]
@@ -197,8 +258,8 @@ class ExporterTests(RepositoryFixture):
         self.assertEqual(existing.read_bytes(), b"same-content")
 
     def test_refuses_to_overwrite_or_remove_an_edited_managed_file(self) -> None:
-        self.add_page("Series", "Vol.01 Ch.001 - First", "001.jpg", b"source-one")
-        self.add_page("Series", "Vol.01 Ch.001 - First", "002.jpg", b"source-two")
+        self.add_page("Series", "Vol. 01 Ch. 001 - First", "001.jpg", b"source-one")
+        self.add_page("Series", "Vol. 01 Ch. 001 - First", "002.jpg", b"source-two")
         volume = scan_working_directory(self.root).mangas[0].volumes[0]
         first, second = volume.pages
         result = export_selected_pages(
@@ -214,7 +275,7 @@ class ExporterTests(RepositoryFixture):
         self.assertTrue((result.output_directory / second.output_filename).exists())
 
     def test_invalid_utf8_manifest_aborts_without_touching_output(self) -> None:
-        self.add_page("Series", "Vol.01 Ch.001 - First", "001.jpg")
+        self.add_page("Series", "Vol. 01 Ch. 001 - First", "001.jpg")
         volume = scan_working_directory(self.root).mangas[0].volumes[0]
         page = volume.pages[0]
         manifest = (
@@ -233,7 +294,7 @@ class ExporterTests(RepositoryFixture):
         self.assertFalse((volume.manga_path / "Output" / "Vol.01").exists())
 
     def test_rejects_a_volume_from_outside_the_working_directory(self) -> None:
-        self.add_page("Series", "Vol.01 Ch.001 - First", "001.jpg")
+        self.add_page("Series", "Vol. 01 Ch. 001 - First", "001.jpg")
         volume = scan_working_directory(self.root).mangas[0].volumes[0]
         other_root = self.root / "another-root"
         other_root.mkdir()
@@ -242,9 +303,9 @@ class ExporterTests(RepositoryFixture):
             export_selected_pages(other_root, volume, {volume.pages[0].relative_path})
 
     def test_manifest_failure_rolls_the_output_back_for_a_clean_retry(self) -> None:
-        self.add_page("Series", "Vol.01 Ch.001 - First", "001.jpg", b"old-one")
+        self.add_page("Series", "Vol. 01 Ch. 001 - First", "001.jpg", b"old-one")
         second_source = self.add_page(
-            "Series", "Vol.01 Ch.001 - First", "002.jpg", b"old-two"
+            "Series", "Vol. 01 Ch. 001 - First", "002.jpg", b"old-two"
         )
         volume = scan_working_directory(self.root).mangas[0].volumes[0]
         first, second = volume.pages

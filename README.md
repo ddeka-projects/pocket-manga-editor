@@ -11,21 +11,21 @@ Choose a working directory containing one or more manga folders:
 ```text
 Working Directory/
 └── Manga Name/
-    ├── Vol.01 Ch.001 - Chapter title/
+    ├── Vol. 01 Ch. 000.01 - Chapter title/
     │   ├── 001.jpg
     │   ├── 002.jpg
     │   └── 003.jpg
-    └── Vol.01 Ch.002 - Another title/
+    └── Vol. 01 Ch. 001 - Another title/
         ├── 001.jpg
         └── 002.jpg
 ```
 
 Folder and page numbers are parsed numerically. The current development version intentionally accepts only these conventions:
 
-- Chapter folder: `Vol.<2 digits> Ch.<3 digits> - <chapter name>`
+- Chapter folder: `Vol. <digits> Ch. <digits or decimal> - <chapter name>`
 - Page file: `<3 digits>.jpg` (the `.jpg` extension is case-insensitive)
 
-All matching chapters for one volume appear in the viewer as a single continuous virtual volume.
+All matching chapters for one volume appear in the viewer as a single continuous virtual volume. Chapter identifiers are sorted numerically, including decimals: `000.01`, `000.02`, `000.1`, `000.2`, `001`, `067`, `067.5`, `068`. Their original spelling is preserved for display and export filenames. Numerically equivalent identifiers such as `000.1` and `000.10` are reported as an ambiguous duplicate instead of being silently combined.
 
 ## Development setup
 

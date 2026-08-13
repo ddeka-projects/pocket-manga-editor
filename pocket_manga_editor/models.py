@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 
 
@@ -13,7 +14,8 @@ class PageRef:
     manga_name: str
     manga_path: Path
     volume_number: int
-    chapter_number: int
+    chapter_number: Decimal
+    chapter_label: str
     chapter_title: str
     page_number: int
     source_path: Path
@@ -23,7 +25,7 @@ class PageRef:
     def output_filename(self) -> str:
         """Return an export name unique within a volume."""
 
-        return f"C{self.chapter_number:03d}_P{self.page_number:03d}.jpg"
+        return f"C{self.chapter_label}_P{self.page_number:03d}.jpg"
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,4 +63,3 @@ class ScanIssue:
 class ScanResult:
     mangas: tuple[MangaRef, ...]
     issues: tuple[ScanIssue, ...]
-

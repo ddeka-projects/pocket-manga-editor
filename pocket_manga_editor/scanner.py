@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from decimal import Decimal
 from pathlib import Path
 import re
 
@@ -10,7 +11,8 @@ from .models import MangaRef, PageRef, ScanIssue, ScanResult, VolumeRef
 
 
 CHAPTER_PATTERN = re.compile(
-    r"^Vol\.(?P<volume>\d{2})\s+Ch\.(?P<chapter>\d{3})\s+-\s+(?P<title>.+?)\s*$",
+    r"^Vol\.\s+(?P<volume>\d+)\s+Ch\.\s+"
+    r"(?P<chapter>\d+(?:\.\d+)?)\s+-\s+(?P<title>.+?)\s*$",
     re.IGNORECASE,
 )
 PAGE_PATTERN = re.compile(r"^(?P<page>\d{3})\.jpg$", re.IGNORECASE)
@@ -27,7 +29,7 @@ def scan_working_directory(working_directory: str | Path) -> ScanResult:
 
         working directory/
           Manga name/
-            Vol.01 Ch.001 - Chapter title/
+            Vol. 01 Ch. 001 - Chapter title/
               001.jpg
 
     Non-matching folders and files are ignored. Names that appear intended to
@@ -74,17 +76,20 @@ def _scan_manga(manga_path: Path) -> tuple[MangaRef | None, list[ScanIssue]]:
     except OSError as exc:
         return None, [ScanIssue(manga_path, f"Could not read manga folder: {exc}")]
 
-    chapter_groups: dict[tuple[int, int], list[tuple[Path, re.Match[str]]]] = defaultdict(list)
+    chapter_groups: dict[
+        tuple[int, Decimal], list[tuple[Path, re.Match[str]]]
+    ] = defaultdict(list)
     for chapter_path in child_directories:
         match = CHAPTER_PATTERN.fullmatch(chapter_path.name)
         if match:
-            key = (int(match.group("volume")), int(match.group("chapter")))
+            key = (int(match.group("volume")), Decimal(match.group("chapter")))
             chapter_groups[key].append((chapter_path, match))
         elif chapter_path.name.casefold().startswith("vol."):
             issues.append(
                 ScanIssue(
                     chapter_path,
-                    "Chapter folder does not match 'Vol.## Ch.### - Chapter name'.",
+                    "Chapter folder does not match "
+                    "'Vol. <digits> Ch. <digits or decimal> - Chapter name'.",
                 )
             )
 
@@ -93,16 +98,18 @@ def _scan_manga(manga_path: Path) -> tuple[MangaRef | None, list[ScanIssue]]:
     for (volume_number, chapter_number), matches in sorted(chapter_groups.items()):
         if len(matches) > 1:
             joined_names = ", ".join(path.name for path, _ in matches)
+            chapter_label = matches[0][1].group("chapter")
             issues.append(
                 ScanIssue(
                     manga_path,
-                    f"Duplicate Vol.{volume_number:02d} Ch.{chapter_number:03d} "
+                    f"Duplicate Vol. {volume_number:02d} Ch. {chapter_label} "
                     f"folders were skipped: {joined_names}",
                 )
             )
             continue
 
         chapter_path, match = matches[0]
+        chapter_label = match.group("chapter")
         chapter_title = match.group("title").strip()
 
         try:
@@ -146,6 +153,7 @@ def _scan_manga(manga_path: Path) -> tuple[MangaRef | None, list[ScanIssue]]:
                     manga_path=manga_path,
                     volume_number=volume_number,
                     chapter_number=chapter_number,
+                    chapter_label=chapter_label,
                     chapter_title=chapter_title,
                     page_number=page_number,
                     source_path=source_path,

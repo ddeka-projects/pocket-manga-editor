@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -412,17 +413,28 @@ class MainWindow(QMainWindow):
         )
         root_layout.addLayout(controls_row)
 
-        self.shortcut_hint = QLabel(
-            "← / →  Navigate    ·    Space  Toggle selection    ·    "
-            "Enter  Select + next    ·    "
-            "Ctrl+← / →  Selected pages    ·    Home / End  First / last    ·    "
-            "Ctrl+S  Export    ·    ?  Help"
+        self.shortcut_bar = QFrame()
+        self.shortcut_bar.setObjectName("shortcutBar")
+        shortcut_layout = QGridLayout(self.shortcut_bar)
+        shortcut_layout.setContentsMargins(12, 8, 12, 8)
+        shortcut_layout.setHorizontalSpacing(18)
+        shortcut_layout.setVerticalSpacing(7)
+        shortcuts = (
+            ("← / →", "Navigate"),
+            ("Space", "Toggle selection"),
+            ("Enter", "Select + next"),
+            ("Ctrl+← / Ctrl+→", "Selected pages"),
+            ("Home / End", "First / last"),
+            ("Ctrl+S", "Export"),
+            ("?", "Help"),
         )
-        self.shortcut_hint.setObjectName("shortcutHint")
-        self.shortcut_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.shortcut_hint.setWordWrap(True)
-        self.shortcut_hint.setToolTip("Press ? or F1 to show all keyboard controls.")
-        root_layout.addWidget(self.shortcut_hint)
+        for index, (keys, description) in enumerate(shortcuts):
+            shortcut_layout.addWidget(
+                _shortcut_hint(keys, description), index // 4, index % 4
+            )
+        shortcut_layout.setColumnStretch(3, 1)
+        self.shortcut_bar.setToolTip("Press ? or F1 to show all keyboard controls.")
+        root_layout.addWidget(self.shortcut_bar)
 
         for button in (
             self.folder_button,
@@ -479,6 +491,7 @@ class MainWindow(QMainWindow):
                 background: #343943;
             }
             QLabel#headingLabel {
+                color: #eef1f5;
                 font-size: 18px;
                 font-weight: 650;
             }
@@ -510,11 +523,21 @@ class MainWindow(QMainWindow):
                 color: #ff7777;
                 font-weight: 650;
             }
-            QLabel#shortcutHint {
+            QFrame#shortcutBar {
                 background: #202329;
+                border: none;
                 border-radius: 7px;
+            }
+            QLabel#shortcutKey {
+                background: #343943;
+                border: 1px solid #59616e;
+                border-radius: 4px;
+                color: #f5f7fa;
+                font-weight: 700;
+                padding: 3px 7px;
+            }
+            QLabel#shortcutDescription {
                 color: #aeb5c0;
-                padding: 8px 12px;
             }
             QFrame#imageCanvas {
                 background: #0e1013;
@@ -660,7 +683,9 @@ class MainWindow(QMainWindow):
             self.volume_combo.setEnabled(False)
             self.heading_label.setText("No manga found")
             self.progress_label.setText("— / —")
-            self.page_label.setText("Expected chapter folders: Vol.01 Ch.001 - Chapter name")
+            self.page_label.setText(
+                "Expected chapter folders: Vol. 01 Ch. 001 - Chapter name"
+            )
             self.canvas.show_message(
                 "No matching manga chapters were found in this working folder.\n\n"
                 "Use Rescan after adding chapter folders."
@@ -748,7 +773,7 @@ class MainWindow(QMainWindow):
         self.heading_label.setText(f"{volume.manga_name}  ·  {volume.display_name}")
         self.progress_label.setText(f"{self.current_index + 1} / {len(volume.pages)}")
         self.page_label.setText(
-            f"Ch.{page.chapter_number:03d}  ·  Page {page.page_number:03d}  ·  "
+            f"Ch. {page.chapter_label}  ·  Page {page.page_number:03d}  ·  "
             f"{page.chapter_title}  ·  {page.source_path.name}"
         )
         self.page_label.setToolTip(str(page.source_path))
@@ -863,10 +888,12 @@ class MainWindow(QMainWindow):
         page = volume.pages[self.current_index]
         if page.relative_path in self.selected_paths:
             self.selected_paths.remove(page.relative_path)
-            message = f"Deselected Ch.{page.chapter_number:03d} page {page.page_number:03d}."
+            message = (
+                f"Deselected Ch. {page.chapter_label} page {page.page_number:03d}."
+            )
         else:
             self.selected_paths.add(page.relative_path)
-            message = f"Selected Ch.{page.chapter_number:03d} page {page.page_number:03d}."
+            message = f"Selected Ch. {page.chapter_label} page {page.page_number:03d}."
         self._save_session()
         self._refresh_selection_controls()
         self.statusBar().showMessage(message, 2000)
@@ -1088,6 +1115,26 @@ class MainWindow(QMainWindow):
 
 def _format_scan_issues(issues: tuple[ScanIssue, ...]) -> str:
     return "\n".join(f"{issue.path}: {issue.message}" for issue in issues)
+
+
+def _shortcut_hint(keys: str, description: str) -> QWidget:
+    """Build one keycap-and-description item for the persistent help bar."""
+
+    item = QWidget()
+    layout = QHBoxLayout(item)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(7)
+
+    key_label = QLabel(keys)
+    key_label.setObjectName("shortcutKey")
+    key_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    layout.addWidget(key_label)
+
+    description_label = QLabel(description)
+    description_label.setObjectName("shortcutDescription")
+    layout.addWidget(description_label)
+    layout.addStretch(1)
+    return item
 
 
 def _setting_int(settings: QSettings, key: str, default: int) -> int:

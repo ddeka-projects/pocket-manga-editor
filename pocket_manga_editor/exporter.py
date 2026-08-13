@@ -17,7 +17,9 @@ from .storage import atomic_write_json
 
 
 EXPORT_SCHEMA_VERSION = 1
-OUTPUT_FILENAME_PATTERN = re.compile(r"^C(?P<chapter>\d{3})_P(?P<page>\d{3})\.jpg$")
+OUTPUT_FILENAME_PATTERN = re.compile(
+    r"^C(?P<chapter>\d+(?:\.\d+)?)_P(?P<page>\d{3})\.jpg$"
+)
 
 
 class ExportError(RuntimeError):
