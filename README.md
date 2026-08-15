@@ -1,6 +1,6 @@
 # Pocket Manga Editor
 
-Pocket Manga Editor is a development-stage, keyboard-first desktop tool for reviewing manga JPG and PNG images and exporting a hand-picked set of pages. It reads chapter folders directly, so it does not need a separate volume-preparation phase and never modifies source images.
+Pocket Manga Editor is a development-stage, keyboard-first desktop tool for reviewing manga JPG and PNG images and exporting a hand-picked set of pages. It reads chapter folders directly, so it does not need a separate volume-preparation phase. Reviewing and exporting do not modify source images; the explicitly confirmed **Complete Manga** operation permanently deletes the completed source folder.
 
 The original `manga_image_saver.ipynb` is retained as a proof of concept. The desktop application is implemented separately in the `pocket_manga_editor` Python package.
 
@@ -90,11 +90,36 @@ subdirectories.
 
 For chapter-based sources, exported names include both chapter and page numbers, such as `C002_P017.jpg`. Direct-volume pages use names such as `P017.png`. The source image format is preserved. Repeat exports remove only stale files recorded as app-created; unrelated files in the output folder are preserved. If an exported image has been edited since the last export, the app refuses to overwrite or remove it. Selections remain available after export until the user explicitly clears them.
 
+## Completing a manga
+
+After all desired volumes have been exported, **Complete Manga** moves that
+manga's entire output folder to:
+
+```text
+<working-directory>/.pocket-manga-editor/completed/<manga-name>/
+```
+
+Completion then permanently deletes the source manga folder along with its
+saved selections and export bookkeeping. The app always asks for destructive
+confirmation, and shows an additional warning when the current source and
+output volume folders do not match. Completion is refused when there are no
+exported pages or when a folder with the same manga name already exists in
+`completed`.
+
+Each successful batch is appended to
+`.pocket-manga-editor/completed/completion-log.json`, including its timestamp,
+source and output volumes, and exported page names. The completed manga folder
+can be moved elsewhere while the log remains in place. This allows a later
+batch of newly released volumes for the same ongoing manga to be completed and
+recorded separately. Completion is journaled, and an interrupted batch is
+automatically rolled back or cleaned up before the next library scan.
+
 ## Run tests
 
-The test suite covers scanning, saved sessions, exporting, and the responsive
-desktop layout. Install the development requirements first; the GUI checks use
-PySide6's offscreen platform and do not open a window:
+The test suite covers scanning, saved sessions, exporting, completion and crash
+recovery, cross-process mutation locking, and the responsive desktop layout.
+Install the development requirements first; the GUI checks use PySide6's
+offscreen platform and do not open a window:
 
 ```powershell
 py -m unittest discover -s tests -v

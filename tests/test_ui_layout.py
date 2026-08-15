@@ -6,14 +6,18 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
 from PySide6.QtCore import QByteArray, QEvent, QSettings, Qt  # noqa: E402
-from PySide6.QtGui import QImage  # noqa: E402
+from PySide6.QtGui import QCloseEvent, QImage  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
-from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtWidgets import QApplication, QMessageBox  # noqa: E402
 
+from pocket_manga_editor.completion import CompletionBusyError  # noqa: E402
+from pocket_manga_editor.exporter import export_selected_pages  # noqa: E402
+from pocket_manga_editor.library_lock import LibraryBusyError  # noqa: E402
 from pocket_manga_editor.main_window import MainWindow  # noqa: E402
 
 
@@ -31,6 +35,7 @@ class PortraitLayoutTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         root = Path(self.temporary.name)
+        self.root = root
         QSettings.setPath(
             QSettings.Format.IniFormat,
             QSettings.Scope.UserScope,
@@ -142,6 +147,207 @@ class PortraitLayoutTests(unittest.TestCase):
                 self.assertEqual(len(sizes), 2)
                 self.assertGreater(min(sizes), 0)
                 self.assertGreater(sizes[0], sizes[1])
+
+    def test_busy_save_keeps_outgoing_volume_snapshot_when_switching(self) -> None:
+        second_volume = self.root / "Example Manga" / "Vol. 02"
+        second_volume.mkdir()
+        image = QImage(600, 1000, QImage.Format.Format_RGB32)
+        image.fill(Qt.GlobalColor.white)
+        self.assertTrue(image.save(str(second_volume / "001.png")))
+        self.window.rescan()
+
+        manga = self.window.scan_result.mangas[0]
+        first, second = manga.volumes
+        self.assertEqual(self.window.current_volume, first)
+        self.window.current_index = 1
+        self.window.selected_paths = {first.pages[1].relative_path}
+        store = self.window.session_store
+        self.assertIsNotNone(store)
+        assert store is not None
+
+        with patch.object(
+            store,
+            "save",
+            side_effect=LibraryBusyError("Another mutation is in progress."),
+        ):
+            self.window._load_volume(second)
+
+        self.assertEqual(self.window.current_volume, second)
+        self.assertTrue(self.window._pending_session_saves)
+        self.window._save_session()
+
+        restored = store.load(first)
+        self.assertEqual(restored.current_index, 1)
+        self.assertEqual(
+            restored.selected_paths,
+            frozenset({first.pages[1].relative_path}),
+        )
+
+    def test_busy_save_defers_close_until_snapshot_is_persisted(self) -> None:
+        self._show_window()
+        volume = self.window.current_volume
+        store = self.window.session_store
+        self.assertIsNotNone(volume)
+        self.assertIsNotNone(store)
+        assert volume is not None
+        assert store is not None
+        self.window.current_index = 1
+        self.window.selected_paths = {volume.pages[1].relative_path}
+
+        event = QCloseEvent()
+        with patch.object(
+            store,
+            "save",
+            side_effect=LibraryBusyError("Another mutation is in progress."),
+        ):
+            self.window.closeEvent(event)
+
+        self.assertFalse(event.isAccepted())
+        self.assertTrue(self.window._close_requested)
+        self.assertTrue(self.window._pending_session_saves)
+
+        self.window._session_save_timer.stop()
+        self.window._flush_pending_session_saves()
+        restored = store.load(volume)
+        self.assertEqual(restored.current_index, 1)
+        self.assertEqual(
+            restored.selected_paths,
+            frozenset({volume.pages[1].relative_path}),
+        )
+
+        self.app.processEvents()
+        self.assertFalse(self.window.isVisible())
+
+    def test_completion_detaches_deleted_manga_before_rescan_and_close(self) -> None:
+        volume = self.window.current_volume
+        self.assertIsNotNone(volume)
+        assert volume is not None
+        selected = {volume.pages[0].relative_path}
+        export_selected_pages(self.root, volume, selected)
+        self.window._session_save_timer.start(1000)
+
+        with (
+            patch.object(
+                QMessageBox,
+                "warning",
+                return_value=QMessageBox.StandardButton.Yes,
+            ),
+            patch.object(QMessageBox, "information"),
+        ):
+            self.window.complete_current_manga()
+
+        metadata = self.root / ".pocket-manga-editor"
+        self.assertFalse((self.root / "Example Manga").exists())
+        self.assertTrue(
+            (
+                metadata
+                / "completed"
+                / "Example Manga"
+                / "Vol.01"
+                / "C001_P001.png"
+            ).is_file()
+        )
+        self.assertTrue((metadata / "completed" / "completion-log.json").is_file())
+        self.assertFalse((metadata / "selections" / "Example Manga").exists())
+        self.assertFalse((metadata / "exports" / "Example Manga").exists())
+        self.assertIsNone(self.window.current_volume)
+
+        self.window.close()
+        self.app.processEvents()
+        self.window._save_session()
+        self.assertFalse((metadata / "selections" / "Example Manga").exists())
+
+    def test_busy_completion_keeps_pending_save_retry_active(self) -> None:
+        volume = self.window.current_volume
+        store = self.window.session_store
+        self.assertIsNotNone(volume)
+        self.assertIsNotNone(store)
+        assert volume is not None
+        assert store is not None
+        selected = {volume.pages[0].relative_path}
+        self.window.selected_paths = selected
+        export_selected_pages(self.root, volume, selected)
+
+        with (
+            patch.object(
+                store,
+                "save",
+                side_effect=LibraryBusyError("Another mutation is in progress."),
+            ),
+            patch(
+                "pocket_manga_editor.main_window.complete_manga",
+                side_effect=CompletionBusyError(
+                    "Another library mutation is already in progress."
+                ),
+            ),
+            patch.object(
+                QMessageBox,
+                "warning",
+                return_value=QMessageBox.StandardButton.Yes,
+            ),
+        ):
+            self.window.complete_current_manga()
+
+        self.assertTrue(self.window._pending_session_saves)
+        self.assertTrue(self.window._session_save_timer.isActive())
+
+    def test_completion_cancel_at_volume_warning_preserves_everything(self) -> None:
+        wrong_output = (
+            self.root
+            / ".pocket-manga-editor"
+            / "output"
+            / "Example Manga"
+            / "Vol.02"
+            / "P001.png"
+        )
+        wrong_output.parent.mkdir(parents=True)
+        wrong_output.write_bytes(b"output")
+
+        with patch.object(
+            QMessageBox,
+            "warning",
+            return_value=QMessageBox.StandardButton.Cancel,
+        ) as warning:
+            self.window.complete_current_manga()
+
+        self.assertEqual(warning.call_count, 1)
+        self.assertTrue((self.root / "Example Manga").is_dir())
+        self.assertEqual(wrong_output.read_bytes(), b"output")
+        self.assertFalse(
+            (
+                self.root
+                / ".pocket-manga-editor"
+                / "completed"
+                / "completion-log.json"
+            ).exists()
+        )
+
+    def test_completion_cancel_at_final_warning_preserves_everything(self) -> None:
+        volume = self.window.current_volume
+        self.assertIsNotNone(volume)
+        assert volume is not None
+        output = export_selected_pages(
+            self.root, volume, {volume.pages[0].relative_path}
+        ).output_directory
+
+        with patch.object(
+            QMessageBox,
+            "warning",
+            return_value=QMessageBox.StandardButton.Cancel,
+        ) as warning:
+            self.window.complete_current_manga()
+
+        self.assertEqual(warning.call_count, 1)
+        self.assertTrue((self.root / "Example Manga").is_dir())
+        self.assertTrue(output.is_dir())
+        self.assertFalse(
+            (
+                self.root
+                / ".pocket-manga-editor"
+                / "completed"
+                / "completion-log.json"
+            ).exists()
+        )
 
     def _assert_pinned_widget_is_visible(self, widget: object) -> None:
         self.assertTrue(widget.isVisible())

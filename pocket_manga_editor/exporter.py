@@ -13,6 +13,7 @@ import re
 import shutil
 import tempfile
 
+from .library_lock import LibraryLockError, library_mutation_lock
 from .models import PageRef, VolumeRef
 from .storage import atomic_write_json
 
@@ -55,6 +56,22 @@ def export_selected_pages(
     volume: VolumeRef,
     selected_paths: set[str] | frozenset[str],
 ) -> ExportResult:
+    """Export a selected snapshot while excluding other library mutations."""
+
+    try:
+        with library_mutation_lock(working_directory) as working_path:
+            return _export_selected_pages_locked(
+                working_path, volume, selected_paths
+            )
+    except LibraryLockError as exc:
+        raise ExportError(str(exc)) from exc
+
+
+def _export_selected_pages_locked(
+    working_path: Path,
+    volume: VolumeRef,
+    selected_paths: set[str] | frozenset[str],
+) -> ExportResult:
     """Export the selected snapshot without touching source images.
 
     A manifest records files created by this app. On a later export, stale
@@ -62,8 +79,13 @@ def export_selected_pages(
     preserved. An untracked filename collision aborts instead of overwriting.
     """
 
-    working_path = Path(working_directory).expanduser().resolve()
-    manga_path = volume.manga_path.resolve()
+    raw_manga_path = Path(volume.manga_path)
+    if raw_manga_path.is_symlink() or not raw_manga_path.is_dir():
+        raise ExportError("The source manga no longer exists or is not a safe folder.")
+    try:
+        manga_path = raw_manga_path.resolve(strict=True)
+    except OSError as exc:
+        raise ExportError(f"The source manga could not be resolved: {exc}") from exc
     if manga_path.parent != working_path:
         raise ExportError("The selected manga is not directly inside the working directory.")
     if volume.manga_name != manga_path.name:

@@ -11,6 +11,7 @@ from pathlib import Path, PurePosixPath
 import tempfile
 from typing import Any
 
+from .library_lock import library_mutation_lock
 from .models import VolumeRef
 
 
@@ -107,6 +108,33 @@ class SessionStore:
     ) -> None:
         if not volume.pages:
             return
+
+        with library_mutation_lock(self.working_directory) as root:
+            self._save_locked(root, volume, current_index, selected_paths)
+
+    def _save_locked(
+        self,
+        root: Path,
+        volume: VolumeRef,
+        current_index: int,
+        selected_paths: set[str] | frozenset[str],
+    ) -> None:
+        """Save after verifying the live source while holding the library lock."""
+
+        manga_path = Path(volume.manga_path)
+        if manga_path.is_symlink() or not manga_path.is_dir():
+            raise OSError("The source manga no longer exists or is not a safe folder.")
+        try:
+            resolved_manga = manga_path.resolve(strict=True)
+        except OSError as exc:
+            raise OSError(f"The source manga could not be resolved: {exc}") from exc
+        if (
+            resolved_manga.parent != root
+            or resolved_manga.name != volume.manga_name
+        ):
+            raise OSError(
+                "The source manga is not directly inside the working directory."
+            )
 
         current_index = min(max(current_index, 0), len(volume.pages) - 1)
         valid_selected = [

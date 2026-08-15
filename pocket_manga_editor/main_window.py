@@ -33,7 +33,18 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .completion import (
+    CompletionBusyError,
+    CompletionError,
+    CompletionPreview,
+    CompletionRecoveryError,
+    CompletionRecoveryResult,
+    analyze_completion,
+    complete_manga,
+    recover_interrupted_completions,
+)
 from .exporter import ExportError, export_selected_pages, output_directory_for
+from .library_lock import LibraryBusyError
 from .models import MangaRef, PageRef, ScanIssue, ScanResult, VolumeRef
 from .scanner import ScanError, scan_working_directory
 from .storage import SessionStore
@@ -183,6 +194,11 @@ class MainWindow(QMainWindow):
         self.current_index = 0
         self.selected_paths: set[str] = set()
         self._last_output_directory: Path | None = None
+        self._pending_session_saves: OrderedDict[
+            tuple[str, str, str],
+            tuple[SessionStore, VolumeRef, int, frozenset[str]],
+        ] = OrderedDict()
+        self._close_requested = False
         self._session_save_timer = QTimer(self)
         self._session_save_timer.setSingleShot(True)
         self._session_save_timer.timeout.connect(self._save_session)
@@ -204,7 +220,8 @@ class MainWindow(QMainWindow):
         else:
             self.canvas.show_message(
                 "Choose the folder that contains your manga folders.\n\n"
-                "Source images will be reviewed in place and will not be modified."
+                "Reviewing and exporting do not modify source images. The explicitly "
+                "confirmed Complete Manga operation permanently deletes its source folder."
             )
             QTimer.singleShot(0, self.choose_working_directory)
 
@@ -258,6 +275,10 @@ class MainWindow(QMainWindow):
         self.export_action.setAutoRepeat(False)
         self.export_action.triggered.connect(self.export_selection)
 
+        self.complete_action = QAction("Complete Manga…", self)
+        self.complete_action.setAutoRepeat(False)
+        self.complete_action.triggered.connect(self.complete_current_manga)
+
         self.clear_action = QAction("Clear Selections…", self)
         self.clear_action.triggered.connect(self.clear_selections)
 
@@ -285,6 +306,7 @@ class MainWindow(QMainWindow):
             self.first_action,
             self.last_action,
             self.export_action,
+            self.complete_action,
             self.clear_action,
             self.help_action,
         ):
@@ -460,6 +482,14 @@ class MainWindow(QMainWindow):
         self.open_output_button = QPushButton("Open Output")
         self.open_output_button.clicked.connect(self.open_output_directory)
         export_layout.addWidget(self.open_output_button)
+        self.complete_button = QPushButton("Complete Manga…")
+        self.complete_button.setObjectName("dangerButton")
+        self.complete_button.setToolTip(
+            "Move this manga's exported pages to Completed, then permanently "
+            "delete its source folder and saved review data."
+        )
+        self.complete_button.clicked.connect(self.complete_current_manga)
+        export_layout.addWidget(self.complete_button)
         sidebar_layout.addStretch(1)
         sidebar_panel_layout.addWidget(self.export_card)
 
@@ -497,6 +527,7 @@ class MainWindow(QMainWindow):
             self.next_selected_button,
             self.export_button,
             self.open_output_button,
+            self.complete_button,
         ):
             button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
@@ -508,6 +539,7 @@ class MainWindow(QMainWindow):
         file_menu.addAction(self.rescan_action)
         file_menu.addSeparator()
         file_menu.addAction(self.export_action)
+        file_menu.addAction(self.complete_action)
         file_menu.addSeparator()
         file_menu.addAction(self.quit_action)
 
@@ -662,6 +694,21 @@ class MainWindow(QMainWindow):
                 background: #273348;
                 border-color: #35425a;
             }
+            QPushButton#dangerButton {
+                background: #3a2428;
+                border-color: #704047;
+                color: #ffdce1;
+                font-weight: 650;
+            }
+            QPushButton#dangerButton:hover {
+                background: #522d34;
+                border-color: #9a535e;
+            }
+            QPushButton#dangerButton:disabled {
+                background: #282428;
+                border-color: #3b3439;
+                color: #7f7479;
+            }
             QStatusBar {
                 background: #202329;
                 color: #aeb5c0;
@@ -751,10 +798,63 @@ class MainWindow(QMainWindow):
         self.rescan()
 
     def rescan(self) -> None:
+        self._rescan()
+
+    def _rescan(
+        self, *, show_recovery_dialog: bool = True
+    ) -> tuple[bool, CompletionRecoveryResult | None]:
         if self.working_directory is None:
-            return
+            return False, None
 
         self._save_session()
+        try:
+            recovery = recover_interrupted_completions(self.working_directory)
+        except CompletionBusyError as exc:
+            self._session_save_timer.stop()
+            self.current_volume = None
+            self.current_index = 0
+            self.selected_paths.clear()
+            self._last_output_directory = None
+            self.canvas.clear_cache()
+            self.scan_result = ScanResult((), ())
+            self._clear_review_display(
+                "The library is busy in another Pocket Manga Editor window."
+            )
+            self._update_scan_issues()
+            QMessageBox.warning(
+                self,
+                "Library busy",
+                f"{exc}\n\nNo scan was started while another window was changing "
+                "the library. Try Rescan again shortly.",
+            )
+            self.statusBar().showMessage("Library busy; try Rescan again shortly.", 8000)
+            return False, None
+        except CompletionError as exc:
+            # A recovery failure means source/output paths may be between their
+            # active and staged locations. Never scan or autosave against that
+            # uncertain filesystem state.
+            self._session_save_timer.stop()
+            self.current_volume = None
+            self.current_index = 0
+            self.selected_paths.clear()
+            self._last_output_directory = None
+            self.canvas.clear_cache()
+            self.scan_result = ScanResult((), ())
+            self._clear_review_display(
+                "An interrupted manga completion could not be recovered safely."
+            )
+            self._update_scan_issues()
+            QMessageBox.critical(
+                self,
+                "Completion recovery failed",
+                f"{exc}\n\nThe library was not scanned because files may be in "
+                "transition. Close other Pocket Manga Editor windows, then use "
+                "Rescan. If the problem remains, inspect the '.pme-completion-' "
+                "recovery folder reported by the error.",
+            )
+            self.statusBar().showMessage(f"Completion recovery failed: {exc}", 15000)
+            return False, None
+
         preferred_manga = self.current_volume.manga_name if self.current_volume else str(
             self.settings.value("library/last_manga", "")
         )
@@ -774,7 +874,7 @@ class MainWindow(QMainWindow):
             self._update_scan_issues()
             QMessageBox.critical(self, "Could not scan working folder", str(exc))
             self.statusBar().showMessage(str(exc), 8000)
-            return
+            return False, recovery
 
         self._update_scan_issues()
         self._populate_mangas(preferred_manga, preferred_volume)
@@ -783,6 +883,25 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"Found {manga_count} manga and {volume_count} volume(s).", 5000
         )
+        if show_recovery_dialog and (recovery.recovered_count or recovery.warnings):
+            recovery_lines: list[str] = []
+            if recovery.rolled_back_count:
+                recovery_lines.append(
+                    f"Restored {recovery.rolled_back_count} interrupted completion(s)."
+                )
+            if recovery.cleaned_count:
+                recovery_lines.append(
+                    f"Finished cleanup for {recovery.cleaned_count} committed "
+                    "completion(s)."
+                )
+            recovery_lines.extend(recovery.warnings)
+            QMessageBox.warning(
+                self,
+                "Interrupted completion recovered",
+                "\n".join(recovery_lines)
+                + "\n\nReview the restored library before continuing.",
+            )
+        return True, recovery
 
     def _populate_mangas(
         self, preferred_manga: str, preferred_volume: Decimal | None
@@ -1112,25 +1231,235 @@ class MainWindow(QMainWindow):
                 f"Open this folder manually:\n\n{self._last_output_directory}",
             )
 
+    def complete_current_manga(self) -> None:
+        """Finalize one manga after explicit destructive confirmation."""
+
+        manga = self.manga_combo.currentData()
+        if not isinstance(manga, MangaRef) or self.working_directory is None:
+            return
+
+        # Flush any pending review change so all of this manga's state can be
+        # removed as one completion batch.
+        self._save_session()
+        try:
+            preview = analyze_completion(self.working_directory, manga)
+        except CompletionError as exc:
+            QMessageBox.warning(self, "Cannot complete manga", str(exc))
+            self.statusBar().showMessage(f"Cannot complete manga: {exc}", 10000)
+            return
+
+        allow_volume_mismatch = False
+        manga_scan_issues = _scan_issues_for_manga(
+            self.scan_result.issues, manga.path
+        )
+        if preview.has_volume_mismatch or manga_scan_issues:
+            warning_details: list[str] = []
+            if preview.has_volume_mismatch:
+                warning_details.append(_completion_mismatch_text(preview))
+            if manga_scan_issues:
+                warning_details.append(
+                    "Source items skipped during scanning:\n"
+                    + _format_scan_issues(manga_scan_issues)
+                )
+            answer = QMessageBox.warning(
+                self,
+                "Review source and output differences",
+                f"The current source and output for {manga.name} require review "
+                "before completion.\n\n"
+                + "\n\n".join(warning_details)
+                + "\n\n"
+                "Completing anyway will permanently delete the entire source manga, "
+                "including missing, malformed, or skipped source items.\n\n"
+                "Continue to the final confirmation?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            allow_volume_mismatch = preview.has_volume_mismatch
+
+        history_text = _completion_history_text(preview)
+        output_names = ", ".join(volume.name for volume in preview.output_volumes)
+        answer = QMessageBox.warning(
+            self,
+            "Permanently complete manga",
+            f"Complete {manga.name}?\n\n"
+            f"Current output: {preview.total_image_count} page(s) in {output_names}."
+            f"{history_text}\n\n"
+            "Only pages already in Output will be kept; current selections are not "
+            "exported automatically. The current output will be moved into the "
+            "Completed folder. Saved selections and export bookkeeping for this "
+            "manga will be removed.\n\n"
+            f"The source folder will be permanently deleted:\n{preview.source_directory}\n\n"
+            "This cannot be undone through Pocket Manga Editor.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        self._session_save_timer.stop()
+        try:
+            result = complete_manga(
+                self.working_directory,
+                manga,
+                preview,
+                allow_volume_mismatch=allow_volume_mismatch,
+            )
+        except CompletionBusyError as exc:
+            self._flush_pending_session_saves()
+            QMessageBox.warning(
+                self,
+                "Library busy",
+                f"{exc}\n\nNo files were changed by this completion attempt. "
+                "Try again after the other library operation finishes.",
+            )
+            self.statusBar().showMessage("Library busy; completion was not started.", 8000)
+            return
+        except CompletionRecoveryError as exc:
+            self._discard_pending_session_saves(manga)
+            rescanned, recovery = self._detach_completed_manga_and_rescan(
+                show_recovery_dialog=False
+            )
+            if not rescanned:
+                return
+            recovery_text = _completion_recovery_result_text(recovery)
+            QMessageBox.critical(
+                self,
+                "Completion needs attention",
+                f"{exc}\n\nThe library was rescanned because some files may have "
+                f"moved.{recovery_text}\n\nReview the source, output, completed folder, and any "
+                "'.pme-completion-' recovery folder before trying again.",
+            )
+            self.statusBar().showMessage(
+                "Completion could not be rolled back completely; review the library.",
+                15000,
+            )
+            return
+        except CompletionError as exc:
+            self._flush_pending_session_saves()
+            QMessageBox.critical(self, "Completion failed", str(exc))
+            self.statusBar().showMessage(f"Completion failed: {exc}", 10000)
+            return
+
+        self._discard_pending_session_saves(manga)
+        rescanned, recovery = self._detach_completed_manga_and_rescan(
+            show_recovery_dialog=False
+        )
+
+        cleanup_text = ""
+        if result.cleanup_warnings:
+            cleanup_text = (
+                "\n\nThe completion was committed, but some temporary cleanup "
+                "needs attention:\n• "
+                + "\n• ".join(result.cleanup_warnings)
+            )
+        if not rescanned:
+            cleanup_text += (
+                "\n\nThe completion is committed, but the follow-up library scan "
+                "failed. Close other app windows and use Rescan before continuing."
+            )
+        recovery_text = _completion_recovery_result_text(recovery)
+        message = (
+            f"Completed {manga.name}.\n\n"
+            f"Moved {result.total_image_count} page(s) to:\n"
+            f"{result.completed_directory}\n\n"
+            "The source manga and its saved review data were removed. A completion "
+            f"entry was added to the log.{cleanup_text}{recovery_text}"
+        )
+        has_warning = bool(result.cleanup_warnings) or not rescanned
+        if has_warning:
+            QMessageBox.warning(self, "Manga completed with a warning", message)
+        else:
+            QMessageBox.information(self, "Manga completed", message)
+        status_text = (
+            f"Completed {manga.name}, but the library needs attention."
+            if has_warning
+            else f"Completed {manga.name} with {result.total_image_count} page(s)."
+        )
+        self.statusBar().showMessage(status_text, 15000 if has_warning else 8000)
+
+    def _detach_completed_manga_and_rescan(
+        self, *, show_recovery_dialog: bool
+    ) -> tuple[bool, CompletionRecoveryResult | None]:
+        """Prevent pending saves from recreating state after destructive moves."""
+
+        self._session_save_timer.stop()
+        self.current_volume = None
+        self.current_index = 0
+        self.selected_paths.clear()
+        self._last_output_directory = None
+        self.canvas.clear_cache()
+        self.settings.remove("library/last_manga")
+        self.settings.remove("library/last_volume")
+        return self._rescan(show_recovery_dialog=show_recovery_dialog)
+
     def _schedule_session_save(self) -> None:
         self._set_save_status(False, "Saving progress…")
         self._session_save_timer.start(300)
 
     def _save_session(self) -> None:
         self._session_save_timer.stop()
-        if self.current_volume is None or self.session_store is None:
-            return
-        try:
-            self.session_store.save(
-                self.current_volume, self.current_index, self.selected_paths
+        if self.current_volume is not None and self.session_store is not None:
+            store = self.session_store
+            volume = self.current_volume
+            key = (
+                str(store.working_directory.resolve()),
+                volume.manga_name,
+                volume.identity,
             )
-        except OSError as exc:
+            self._pending_session_saves[key] = (
+                store,
+                volume,
+                self.current_index,
+                frozenset(self.selected_paths),
+            )
+        self._flush_pending_session_saves()
+
+    def _flush_pending_session_saves(self) -> None:
+        """Persist queued immutable snapshots without retargeting a busy retry."""
+
+        last_error: OSError | None = None
+        while self._pending_session_saves:
+            key = next(iter(self._pending_session_saves))
+            store, volume, current_index, selected_paths = self._pending_session_saves[
+                key
+            ]
+            try:
+                store.save(volume, current_index, selected_paths)
+            except LibraryBusyError as exc:
+                self._set_save_status(False, "Waiting to save…")
+                self.save_status_label.setToolTip(str(exc))
+                self._session_save_timer.start(750)
+                return
+            except OSError as exc:
+                last_error = exc
+                self._pending_session_saves.pop(key)
+            else:
+                self._pending_session_saves.pop(key)
+
+        if last_error is not None:
             self._set_save_status(True, "⚠ Progress not saved")
-            self.save_status_label.setToolTip(str(exc))
-            self.statusBar().showMessage(f"Could not save review progress: {exc}", 10000)
+            self.save_status_label.setToolTip(str(last_error))
+            self.statusBar().showMessage(
+                f"Could not save review progress: {last_error}", 10000
+            )
         else:
             self._set_save_status(False, "✓ Progress saved")
             self.save_status_label.setToolTip("")
+
+        if self._close_requested:
+            self._close_requested = False
+            QTimer.singleShot(0, self.close)
+
+    def _discard_pending_session_saves(self, manga: MangaRef) -> None:
+        """Drop snapshots whose source was just permanently completed."""
+
+        for key, (_store, volume, _index, _selected) in tuple(
+            self._pending_session_saves.items()
+        ):
+            if volume.manga_path == manga.path:
+                self._pending_session_saves.pop(key)
 
     def _set_save_status(self, error: bool, text: str) -> None:
         self.save_status_label.setText(text)
@@ -1148,6 +1477,7 @@ class MainWindow(QMainWindow):
             self.select_next_action,
             self.first_action,
             self.last_action,
+            self.complete_action,
         ):
             action.setEnabled(enabled)
 
@@ -1155,6 +1485,7 @@ class MainWindow(QMainWindow):
         self.next_button.setEnabled(enabled)
         self.next_selected_button.setEnabled(enabled and bool(self.selected_paths))
         self.toggle_button.setEnabled(enabled)
+        self.complete_button.setEnabled(enabled)
         has_selection = enabled and bool(self.selected_paths)
         self.export_action.setEnabled(has_selection)
         self.export_button.setEnabled(has_selection)
@@ -1217,7 +1548,8 @@ class MainWindow(QMainWindow):
             "<tr><td><b>? / F1</b></td><td>Show this help</td></tr>"
             "</table>"
             "<p>Selections and the current position are saved automatically. "
-            "Source JPG and PNG files are copied only when you export.</p>",
+            "Source JPG and PNG files are copied only when you export. Complete Manga "
+            "permanently deletes the source folder after destructive confirmation.</p>",
         )
 
     def show_about(self) -> None:
@@ -1231,10 +1563,80 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt API name
         self._save_session()
+        if self._pending_session_saves:
+            self._close_requested = True
+            self.statusBar().showMessage(
+                "Waiting to save review progress before closing…"
+            )
+            event.ignore()
+            return
+
+        self._close_requested = False
         self.settings.setValue("window/geometry", self.saveGeometry())
         self.settings.setValue("window/main_splitter", self.main_splitter.saveState())
         self.settings.sync()
         event.accept()
+
+
+def _completion_mismatch_text(preview: CompletionPreview) -> str:
+    """Describe the current-batch volume difference for a warning dialog."""
+
+    source_text = ", ".join(preview.source_volumes) or "none"
+    output_text = ", ".join(volume.name for volume in preview.output_volumes) or "none"
+    details = [f"Source volumes: {source_text}", f"Output volumes: {output_text}"]
+    if preview.missing_volumes:
+        details.append("Missing from output: " + ", ".join(preview.missing_volumes))
+    if preview.unexpected_volumes:
+        details.append(
+            "Only in output: " + ", ".join(preview.unexpected_volumes)
+        )
+    return "\n".join(details)
+
+
+def _scan_issues_for_manga(
+    issues: tuple[ScanIssue, ...], manga_path: Path
+) -> tuple[ScanIssue, ...]:
+    """Return scan problems whose contents will be deleted by completion."""
+
+    return tuple(
+        issue
+        for issue in issues
+        if issue.path == manga_path or issue.path.is_relative_to(manga_path)
+    )
+
+
+def _completion_history_text(preview: CompletionPreview) -> str:
+    """Summarize recent batches without treating them as current requirements."""
+
+    if not preview.previous_completions:
+        return ""
+
+    recent = preview.previous_completions[-3:]
+    lines: list[str] = []
+    for completion in recent:
+        date = completion.completed_at.split("T", 1)[0]
+        volumes = ", ".join(completion.output_volumes) or "no volume folders"
+        lines.append(f"• {date}: {volumes} ({completion.image_count} page(s))")
+    older_count = len(preview.previous_completions) - len(recent)
+    if older_count:
+        lines.insert(0, f"• {older_count} earlier completion batch(es)")
+    return "\n\nPrevious completion history:\n" + "\n".join(lines)
+
+
+def _completion_recovery_result_text(
+    recovery: CompletionRecoveryResult | None,
+) -> str:
+    """Summarize a suppressed recovery dialog inside the caller's final message."""
+
+    if recovery is None or not (recovery.recovered_count or recovery.warnings):
+        return ""
+    details: list[str] = []
+    if recovery.rolled_back_count:
+        details.append(f"restored {recovery.rolled_back_count} interrupted batch(es)")
+    if recovery.cleaned_count:
+        details.append(f"finished cleanup for {recovery.cleaned_count} batch(es)")
+    details.extend(recovery.warnings)
+    return "\n\nAutomatic recovery: " + "; ".join(details) + "."
 
 
 def _format_scan_issues(issues: tuple[ScanIssue, ...]) -> str:
