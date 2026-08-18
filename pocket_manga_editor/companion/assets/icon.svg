@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Pocket Manga">
+  <defs>
+    <linearGradient id="background" x1="96" y1="48" x2="424" y2="472" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#16251a"/>
+      <stop offset="1" stop-color="#050706"/>
+    </linearGradient>
+    <linearGradient id="page" x1="190" y1="137" x2="343" y2="385" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#255a32"/>
+      <stop offset="1" stop-color="#15351e"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" fill="url(#background)"/>
+  <path d="M154 152c0-21 17-38 38-38h129c21 0 38 17 38 38v218c0 21-17 38-38 38H192c-21 0-38-17-38-38V152Z" fill="#0a0d0b" stroke="#2b7a40" stroke-width="15" transform="rotate(-7 256 261)"/>
+  <path d="M172 145c0-22 18-40 40-40h124c22 0 40 18 40 40v222c0 22-18 40-40 40H212c-22 0-40-18-40-40V145Z" fill="url(#page)" stroke="#45e06f" stroke-width="16"/>
+  <path d="M216 176h114M216 218h114M216 260h76" fill="none" stroke="#8cffaa" stroke-linecap="round" stroke-width="15" opacity=".52"/>
+  <path d="m226 326 34 34 72-86" fill="none" stroke="#8cffaa" stroke-linecap="round" stroke-linejoin="round" stroke-width="24"/>
+</svg>

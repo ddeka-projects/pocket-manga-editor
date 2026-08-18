@@ -1,0 +1,33 @@
+{
+  "id": "/",
+  "name": "Pocket Manga Companion",
+  "short_name": "Pocket Manga",
+  "description": "Read and select manga pages from Pocket Manga Editor on your local network.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#050706",
+  "theme_color": "#050706",
+  "categories": ["books", "utilities"],
+  "icons": [
+    {
+      "src": "/assets/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/assets/icon-180.png",
+      "sizes": "180x180",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/assets/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

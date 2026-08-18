@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+import time
 
 from PySide6.QtCore import QByteArray, QSettings, QSize, Qt, QTimer, QUrl
 from PySide6.QtGui import (
@@ -17,7 +18,9 @@ from PySide6.QtGui import (
     QResizeEvent,
 )
 from PySide6.QtWidgets import (
+    QApplication,
     QComboBox,
+    QDialog,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -29,10 +32,19 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSplitter,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
 
+from .companion import (
+    CompanionCoordinator,
+    CompanionHTTPService,
+    CompanionState,
+    MobileContext,
+)
+from .companion.state import CompanionStateError, DesktopMutationBlocked
+from .companion_ui import CompanionConnectionDialog, CompanionStatusPanel
 from .completion import (
     CompletionBusyError,
     CompletionError,
@@ -180,13 +192,24 @@ class ImageCanvas(QFrame):
 class MainWindow(QMainWindow):
     """Main application window and review-session coordinator."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        companion_coordinator: CompanionCoordinator | None = None,
+        companion_server: CompanionHTTPService | None = None,
+    ) -> None:
         super().__init__()
         self.setWindowTitle("Pocket Manga Editor")
         self.resize(1320, 860)
         self.setMinimumSize(820, 620)
 
         self.settings = QSettings()
+        self.companion_coordinator = companion_coordinator
+        self.companion_server = companion_server
+        self._pairing_code: str | None = None
+        self._pairing_expires_at: float | None = None
+        self._companion_ui_active = False
+        self._pending_mobile_context: MobileContext | None = None
         self.working_directory: Path | None = None
         self.scan_result = ScanResult((), ())
         self.session_store: SessionStore | None = None
@@ -202,6 +225,9 @@ class MainWindow(QMainWindow):
         self._session_save_timer = QTimer(self)
         self._session_save_timer.setSingleShot(True)
         self._session_save_timer.timeout.connect(self._save_session)
+        self._companion_status_timer = QTimer(self)
+        self._companion_status_timer.setInterval(750)
+        self._companion_status_timer.timeout.connect(self._refresh_companion_status)
 
         self._create_actions()
         self._build_interface()
@@ -213,6 +239,8 @@ class MainWindow(QMainWindow):
         self.rescan_button.setEnabled(False)
         self.manga_combo.setEnabled(False)
         self.volume_combo.setEnabled(False)
+        self._refresh_companion_status()
+        self._companion_status_timer.start()
 
         saved_directory = str(self.settings.value("library/working_directory", ""))
         if saved_directory and Path(saved_directory).is_dir():
@@ -233,6 +261,9 @@ class MainWindow(QMainWindow):
         self.rescan_action = QAction("Rescan", self)
         self.rescan_action.setShortcut(QKeySequence("F5"))
         self.rescan_action.triggered.connect(self.rescan)
+
+        self.companion_action = QAction("Start Companion Mode…", self)
+        self.companion_action.triggered.connect(self.start_companion_mode)
 
         self.previous_action = QAction("Previous Page", self)
         self.previous_action.setShortcut(QKeySequence(Qt.Key.Key_Left))
@@ -297,6 +328,7 @@ class MainWindow(QMainWindow):
         for action in (
             self.choose_folder_action,
             self.rescan_action,
+            self.companion_action,
             self.previous_action,
             self.next_action,
             self.previous_selected_action,
@@ -332,8 +364,25 @@ class MainWindow(QMainWindow):
         viewer_layout = QVBoxLayout(self.viewer_panel)
         viewer_layout.setContentsMargins(0, 0, 0, 0)
         viewer_layout.setSpacing(0)
+        self.viewer_stack = QStackedWidget()
+        self.viewer_stack.setObjectName("viewerStack")
         self.canvas = ImageCanvas()
-        viewer_layout.addWidget(self.canvas)
+        self.viewer_stack.addWidget(self.canvas)
+        self.companion_status_panel = CompanionStatusPanel()
+        self.companion_status_panel.pair_requested.connect(self.start_pairing)
+        self.companion_status_panel.copy_url_requested.connect(self.copy_companion_url)
+        self.companion_status_panel.disconnect_requested.connect(
+            self.disconnect_companion_client
+        )
+        self.companion_status_panel.forget_requested.connect(
+            self.forget_companion_device
+        )
+        self.companion_status_panel.retry_server_requested.connect(
+            self.retry_companion_server
+        )
+        self.companion_status_panel.end_requested.connect(self.end_companion_mode)
+        self.viewer_stack.addWidget(self.companion_status_panel)
+        viewer_layout.addWidget(self.viewer_stack)
         self.main_splitter.addWidget(self.viewer_panel)
 
         self.sidebar_panel = QFrame()
@@ -418,6 +467,41 @@ class MainWindow(QMainWindow):
         self.volume_combo.currentIndexChanged.connect(self._on_volume_changed)
         library_layout.addWidget(self.volume_combo)
         sidebar_layout.addWidget(library_card)
+
+        companion_card, companion_layout = _sidebar_card("Mobile Companion")
+        companion_description = QLabel(
+            "Review and select pages from one paired phone on this local network."
+        )
+        companion_description.setObjectName("mutedLabel")
+        companion_description.setWordWrap(True)
+        companion_layout.addWidget(companion_description)
+        self.companion_server_label = QLabel("Companion server unavailable")
+        self.companion_server_label.setObjectName("saveStatus")
+        self.companion_server_label.setWordWrap(True)
+        companion_layout.addWidget(self.companion_server_label)
+        self.companion_url_label = QLabel("")
+        self.companion_url_label.setObjectName("mutedLabel")
+        self.companion_url_label.setWordWrap(True)
+        self.companion_url_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        companion_layout.addWidget(self.companion_url_label)
+        self.companion_button = QPushButton("Start Companion Mode…")
+        self.companion_button.setObjectName("primaryButton")
+        self.companion_button.clicked.connect(self.start_companion_mode)
+        companion_layout.addWidget(self.companion_button)
+        companion_buttons = QHBoxLayout()
+        companion_buttons.setSpacing(8)
+        self.companion_pair_button = QPushButton("Pair Phone")
+        self.companion_pair_button.clicked.connect(self.manage_companion_device)
+        companion_buttons.addWidget(self.companion_pair_button, 1)
+        self.companion_settings_button = QPushButton("Connection…")
+        self.companion_settings_button.clicked.connect(
+            self.configure_companion_connection
+        )
+        companion_buttons.addWidget(self.companion_settings_button, 1)
+        companion_layout.addLayout(companion_buttons)
+        sidebar_layout.addWidget(companion_card)
 
         page_card, page_layout = _sidebar_card("Current page")
         self.progress_label = QLabel("— / —")
@@ -521,6 +605,9 @@ class MainWindow(QMainWindow):
             self.folder_button,
             self.rescan_button,
             self.issues_button,
+            self.companion_button,
+            self.companion_pair_button,
+            self.companion_settings_button,
             self.previous_button,
             self.toggle_button,
             self.next_button,
@@ -537,6 +624,7 @@ class MainWindow(QMainWindow):
         file_menu = self.menuBar().addMenu("&File")
         file_menu.addAction(self.choose_folder_action)
         file_menu.addAction(self.rescan_action)
+        file_menu.addAction(self.companion_action)
         file_menu.addSeparator()
         file_menu.addAction(self.export_action)
         file_menu.addAction(self.complete_action)
@@ -569,6 +657,37 @@ class MainWindow(QMainWindow):
             QFrame#viewerPanel {
                 background: #17191d;
                 border: none;
+            }
+            QFrame#companionStatusPanel {
+                background: #0e1013;
+                border: 1px solid #2c3037;
+                border-radius: 10px;
+            }
+            QFrame#companionStatusCard {
+                background: #202329;
+                border: 1px solid #3c444e;
+                border-radius: 12px;
+            }
+            QLabel#companionEyebrow {
+                color: #52da91;
+                font-size: 11px;
+                font-weight: 800;
+            }
+            QLabel#companionTitle {
+                color: #ffffff;
+                font-size: 25px;
+                font-weight: 750;
+            }
+            QLabel#companionDetail {
+                color: #f0f3f6;
+                font-weight: 650;
+            }
+            QLabel#companionError {
+                background: #4a2025;
+                border: 1px solid #8a3c45;
+                border-radius: 6px;
+                color: #ffb6bd;
+                padding: 9px;
             }
             QFrame#sidebarPanel, QScrollArea#sidebarScroll, QWidget#sidebarContent {
                 background: #17191d;
@@ -765,7 +884,504 @@ class MainWindow(QMainWindow):
             [max(self.canvas.minimumWidth(), total_width - sidebar_width), sidebar_width]
         )
 
+    def _desktop_mutation_allowed(self, *, notify: bool = True) -> bool:
+        """Enforce ownership independently of whether a widget is disabled."""
+
+        coordinator = self.companion_coordinator
+        if coordinator is None:
+            return True
+        try:
+            coordinator.require_desktop_mutation()
+        except DesktopMutationBlocked as exc:
+            if notify:
+                self.statusBar().showMessage(str(exc), 5000)
+            return False
+        return True
+
+    def start_companion_mode(self) -> None:
+        """Flush desktop state and transfer review ownership to the HTTP service."""
+
+        coordinator = self.companion_coordinator
+        server = self.companion_server
+        if coordinator is None or server is None:
+            QMessageBox.warning(
+                self,
+                "Companion unavailable",
+                "The Companion service was not initialized for this application run.",
+            )
+            return
+        state = coordinator.status().state
+        if state is CompanionState.COMPANION_ACTIVE:
+            self.viewer_stack.setCurrentWidget(self.companion_status_panel)
+            return
+        if state is not CompanionState.DESKTOP_ACTIVE:
+            QMessageBox.warning(
+                self,
+                "Companion needs attention",
+                "Companion Mode is in a transition or error state. Use the status "
+                "panel to finish or recover the handoff before trying again.",
+            )
+            self._set_companion_ui(True)
+            return
+        if (
+            self.working_directory is None
+            or not self.scan_result.mangas
+            or not server.running
+        ):
+            detail = server.error or (
+                "Choose a working folder containing at least one readable manga."
+                if not self.scan_result.mangas
+                else "Start or retry the Companion server first."
+            )
+            QMessageBox.warning(self, "Cannot start Companion Mode", detail)
+            return
+
+        answer = QMessageBox.question(
+            self,
+            "Start Companion Mode",
+            "Transfer review control to one paired phone?\n\n"
+            "Desktop navigation, selections, export, completion, rescan, and "
+            "working-folder changes will be locked until Companion Mode ends.\n\n"
+            f"Mobile address:\n{server.url}"
+            + (
+                "\n\nOnly a PC-local address was detected. Configure this PC's "
+                "reserved LAN address under Connection… before opening it on the phone."
+                if not server.status().lan_address_available
+                else ""
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        if not self._save_session() or self._pending_session_saves:
+            QMessageBox.warning(
+                self,
+                "Progress has not finished saving",
+                "Companion Mode was not started because desktop progress could not "
+                "be saved safely. Wait for the current library operation and try again.",
+            )
+            return
+        rescanned, _recovery = self._rescan(require_save_success=True)
+        if not rescanned or not self.scan_result.mangas:
+            QMessageBox.warning(
+                self,
+                "Cannot start Companion Mode",
+                "The library could not be refreshed into a non-empty snapshot.",
+            )
+            return
+
+        try:
+            coordinator.enter_companion(self.working_directory, self.scan_result)
+        except Exception as exc:  # The coordinator has already failed closed.
+            self._set_companion_ui(True)
+            self._refresh_companion_status()
+            QMessageBox.critical(
+                self,
+                "Companion handoff failed",
+                f"Desktop and mobile writes remain blocked until recovery.\n\n{exc}",
+            )
+            return
+
+        self._session_save_timer.stop()
+        self._set_companion_ui(True)
+        self._refresh_companion_status()
+        if not coordinator.status().paired:
+            self.start_pairing()
+        self.statusBar().showMessage(
+            "Companion Mode active; review ownership is on the phone.", 8000
+        )
+
+    def end_companion_mode(self) -> None:
+        """Drain mobile writes, reload SessionStore, then restore desktop ownership."""
+
+        coordinator = self.companion_coordinator
+        if coordinator is None:
+            return
+        state = coordinator.status().state
+        if state is CompanionState.COMPANION_ERROR:
+            answer = QMessageBox.warning(
+                self,
+                "Recover desktop ownership",
+                "Companion Mode reported an error. Mobile writes are blocked. "
+                "Recover desktop mode and rescan the library now?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            try:
+                self._pending_mobile_context = coordinator.begin_recovery()
+            except CompanionStateError as exc:
+                QMessageBox.critical(self, "Recovery failed", str(exc))
+                return
+            self._remember_mobile_context(self._pending_mobile_context)
+            self.current_volume = None
+            self.current_index = 0
+            self.selected_paths.clear()
+            rescanned, _recovery = self._rescan()
+            if rescanned:
+                try:
+                    coordinator.finish_recovery()
+                except CompanionStateError as exc:
+                    QMessageBox.critical(self, "Recovery failed", str(exc))
+                    self._set_companion_ui(True)
+                    self._refresh_companion_status()
+                    return
+                self._pending_mobile_context = None
+                self._set_companion_ui(False)
+                self._set_review_enabled(self.current_volume is not None)
+            else:
+                self._set_companion_ui(True)
+            self._refresh_companion_status()
+            return
+        if state is CompanionState.EXITING_COMPANION:
+            self._reload_desktop_after_companion()
+            return
+        if state is not CompanionState.COMPANION_ACTIVE:
+            return
+
+        answer = QMessageBox.question(
+            self,
+            "End Companion Mode",
+            "Return review control to this desktop?\n\nThe final confirmed phone "
+            "position and selections will be reloaded from saved progress.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self._pending_mobile_context = coordinator.begin_exit()
+        except Exception as exc:
+            self._set_companion_ui(True)
+            self._refresh_companion_status()
+            QMessageBox.critical(
+                self,
+                "Could not end Companion Mode",
+                f"Mobile and desktop writes remain blocked.\n\n{exc}",
+            )
+            return
+        self._reload_desktop_after_companion()
+
+    def _reload_desktop_after_companion(self) -> None:
+        coordinator = self.companion_coordinator
+        if coordinator is None:
+            return
+        self._remember_mobile_context(self._pending_mobile_context)
+
+        self._session_save_timer.stop()
+        self.current_volume = None
+        self.current_index = 0
+        self.selected_paths.clear()
+        self._last_output_directory = None
+        self.canvas.clear_cache()
+        rescanned, _recovery = self._rescan()
+        if not rescanned:
+            QMessageBox.critical(
+                self,
+                "Desktop reload failed",
+                "Mobile writes are stopped, but desktop controls remain locked because "
+                "the library could not be reloaded. Correct the reported problem and "
+                "choose End Companion Mode again.",
+            )
+            self._set_companion_ui(True)
+            self._refresh_companion_status()
+            return
+        try:
+            coordinator.finish_exit()
+        except CompanionStateError as exc:
+            coordinator.fail(str(exc))
+            QMessageBox.critical(self, "Companion exit failed", str(exc))
+            self._set_companion_ui(True)
+            self._refresh_companion_status()
+            return
+        self._pending_mobile_context = None
+        self._set_companion_ui(False)
+        self._set_review_enabled(self.current_volume is not None)
+        self._refresh_companion_status()
+        self.statusBar().showMessage(
+            "Companion Mode ended; desktop progress was reloaded.", 6000
+        )
+
+    def _remember_mobile_context(self, context: MobileContext | None) -> None:
+        """Make the last confirmed phone volume the next desktop resume target."""
+
+        if context is not None:
+            self.settings.setValue("library/last_manga", context.manga_name)
+            for manga in self.scan_result.mangas:
+                if manga.name != context.manga_name:
+                    continue
+                for volume in manga.volumes:
+                    if volume.display_name == context.volume_name:
+                        self.settings.setValue("library/last_volume", volume.identity)
+                        return
+                self.settings.remove("library/last_volume")
+                return
+
+    def start_pairing(self) -> None:
+        coordinator = self.companion_coordinator
+        server = self.companion_server
+        if coordinator is None or server is None or not server.running:
+            QMessageBox.warning(
+                self, "Pairing unavailable", "The Companion server is not running."
+            )
+            return
+        try:
+            offer = coordinator.start_pairing()
+        except Exception as exc:
+            QMessageBox.critical(self, "Could not open pairing", str(exc))
+            return
+        self._pairing_code = offer.code
+        self._pairing_expires_at = offer.expires_at
+        self._refresh_companion_status()
+        QMessageBox.information(
+            self,
+            "Pair your phone",
+            f"On the same trusted network, open:\n\n{server.url}\n\n"
+            f"Enter this one-time code:  {offer.code}\n\n"
+            "The code expires in five minutes. The phone will be remembered until "
+            "you choose Forget Paired Device."
+            + (
+                "\n\nThe displayed address is PC-only. Configure this PC's reserved "
+                "LAN address under Connection… before opening it on the phone."
+                if not server.status().lan_address_available
+                else ""
+            ),
+        )
+
+    def manage_companion_device(self) -> None:
+        coordinator = self.companion_coordinator
+        if coordinator is not None and coordinator.status().paired:
+            self.forget_companion_device()
+        else:
+            self.start_pairing()
+
+    def copy_companion_url(self) -> None:
+        server = self.companion_server
+        if server is None:
+            return
+        QApplication.clipboard().setText(server.url)
+        self.statusBar().showMessage("Companion URL copied.", 2500)
+
+    def disconnect_companion_client(self) -> None:
+        coordinator = self.companion_coordinator
+        if coordinator is None:
+            return
+        coordinator.disconnect_client()
+        self._refresh_companion_status()
+        self.statusBar().showMessage(
+            "Mobile controller disconnected; Companion Mode remains active.", 5000
+        )
+
+    def forget_companion_device(self) -> None:
+        coordinator = self.companion_coordinator
+        if coordinator is None or not coordinator.status().paired:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Forget paired device",
+            "Forget the paired phone and disconnect its current controller lease?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            coordinator.forget_device()
+        except OSError as exc:
+            QMessageBox.critical(self, "Could not forget device", str(exc))
+            return
+        self._pairing_code = None
+        self._pairing_expires_at = None
+        self._refresh_companion_status()
+
+    def configure_companion_connection(self) -> None:
+        server = self.companion_server
+        if server is None or not self._desktop_mutation_allowed():
+            return
+        configured_host = str(self.settings.value("companion/public_host", ""))
+        dialog = CompanionConnectionDialog(
+            public_host=configured_host,
+            port=server.status().port,
+            parent=self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        public_host, port = dialog.values()
+        try:
+            status = server.restart(port=port, public_host=public_host or "")
+        except ValueError as exc:
+            QMessageBox.warning(self, "Invalid Companion address", str(exc))
+            return
+        self.settings.setValue("companion/public_host", public_host or "")
+        self.settings.setValue("companion/port", port)
+        self.settings.sync()
+        self._refresh_companion_status()
+        if not status.running:
+            QMessageBox.warning(
+                self,
+                "Companion server unavailable",
+                status.error or "The Companion server could not be started.",
+            )
+
+    def retry_companion_server(self) -> None:
+        server = self.companion_server
+        if server is None:
+            return
+        status = server.start()
+        self._refresh_companion_status()
+        if not status.running:
+            QMessageBox.warning(
+                self,
+                "Companion server unavailable",
+                status.error or "The Companion server could not be started.",
+            )
+
+    def _set_companion_ui(self, active: bool) -> None:
+        self._companion_ui_active = active
+        self.viewer_stack.setCurrentWidget(
+            self.companion_status_panel if active else self.canvas
+        )
+        self.choose_folder_action.setEnabled(not active)
+        self.folder_button.setEnabled(not active)
+        self.rescan_action.setEnabled(not active and self.working_directory is not None)
+        self.rescan_button.setEnabled(not active and self.working_directory is not None)
+        self.manga_combo.setEnabled(not active and bool(self.scan_result.mangas))
+        self.volume_combo.setEnabled(not active and self.current_volume is not None)
+        self.issues_button.setEnabled(not active)
+        self._set_review_enabled(not active and self.current_volume is not None)
+
+    def _refresh_companion_status(self) -> None:
+        coordinator = self.companion_coordinator
+        server = self.companion_server
+        if coordinator is None or server is None:
+            self.companion_server_label.setText("Companion server unavailable")
+            self.companion_url_label.setText("")
+            self.companion_button.setEnabled(False)
+            self.companion_pair_button.setEnabled(False)
+            self.companion_settings_button.setEnabled(False)
+            self.companion_action.setEnabled(False)
+            self.companion_status_panel.update_status(
+                url=None,
+                paired=False,
+                pairing_code=None,
+                pairing_expires_text=None,
+                client_name=None,
+                context=None,
+                selected_count=None,
+                server_error="The Companion service is unavailable.",
+                server_retry_available=False,
+            )
+            return
+
+        service_status = server.status()
+        status = coordinator.status()
+        if self._pairing_expires_at is not None and time.time() >= self._pairing_expires_at:
+            self._pairing_code = None
+            self._pairing_expires_at = None
+        expiry_text = (
+            time.strftime("%H:%M", time.localtime(self._pairing_expires_at))
+            if self._pairing_expires_at is not None
+            else None
+        )
+        context_text = None
+        if status.mobile_context is not None:
+            context_text = (
+                f"{status.mobile_context.manga_name} · "
+                f"{status.mobile_context.volume_name} · "
+                f"Page {status.mobile_context.page_label}"
+            )
+        client_text = (
+            "Connected phone"
+            if status.active_client
+            else ("Phone reconnecting" if status.active_client_id else None)
+        )
+        displayed_url = service_status.url if service_status.running else None
+        if displayed_url and not service_status.lan_address_available:
+            displayed_url += "\nPC only · configure a reserved LAN address"
+        self.companion_status_panel.update_status(
+            url=displayed_url,
+            paired=status.paired,
+            pairing_code=self._pairing_code if status.pairing_open else None,
+            pairing_expires_text=expiry_text,
+            client_name=client_text,
+            context=context_text,
+            selected_count=(
+                status.mobile_context.selected_count
+                if status.mobile_context is not None
+                else None
+            ),
+            server_error=service_status.error or status.last_error,
+            server_retry_available=bool(
+                service_status.error or not service_status.running
+            ),
+        )
+        self.companion_server_label.setText(
+            (
+                f"● Listening on port {service_status.port}"
+                if service_status.lan_address_available
+                else f"● Listening on port {service_status.port} · LAN address needed"
+            )
+            if service_status.running
+            else "⚠ Companion server unavailable"
+        )
+        self.companion_url_label.setText(
+            displayed_url if service_status.running else (service_status.error or "")
+        )
+        desktop_active = status.state is CompanionState.DESKTOP_ACTIVE
+        if status.state is CompanionState.COMPANION_ACTIVE:
+            self.companion_status_panel.update_mode(
+                "Review ownership is on your phone",
+                "Desktop review, export, completion, rescan, and folder changes "
+                "stay locked until Companion Mode ends.",
+            )
+        elif status.state is CompanionState.EXITING_COMPANION:
+            self.companion_status_panel.update_mode(
+                "Returning ownership to the desktop",
+                "Phone writes are stopped while saved progress is rescanned and "
+                "reloaded. Desktop controls remain locked until that succeeds.",
+            )
+        elif status.state is CompanionState.COMPANION_ERROR:
+            self.companion_status_panel.update_mode(
+                "Companion Mode needs recovery",
+                "Both phone and desktop writes are blocked. Resolve the reported "
+                "problem, then recover desktop mode safely.",
+            )
+        has_library = self.working_directory is not None and bool(self.scan_result.mangas)
+        can_start = desktop_active and service_status.running and has_library
+        self.companion_action.setEnabled(can_start)
+        self.companion_button.setEnabled(can_start)
+        self.companion_button.setText(
+            "Start Companion Mode…"
+            if desktop_active
+            else (
+                "Companion Mode Active"
+                if status.state is CompanionState.COMPANION_ACTIVE
+                else "Companion Needs Attention"
+            )
+        )
+        self.companion_pair_button.setEnabled(service_status.running)
+        self.companion_pair_button.setText(
+            "Forget Phone" if status.paired else "Pair Phone"
+        )
+        self.companion_settings_button.setEnabled(desktop_active)
+        if status.state is not CompanionState.DESKTOP_ACTIVE:
+            self._set_companion_ui(True)
+        self.companion_status_panel.end_button.setText(
+            "End Companion Mode"
+            if status.state is CompanionState.COMPANION_ACTIVE
+            else (
+                "Retry Desktop Reload"
+                if status.state is CompanionState.EXITING_COMPANION
+                else "Recover Desktop Mode"
+            )
+        )
+
     def choose_working_directory(self) -> None:
+        if not self._desktop_mutation_allowed():
+            return
         self._save_session()
         self.settings.sync()
         initial_directory = str(self.working_directory or Path.home())
@@ -778,6 +1394,8 @@ class MainWindow(QMainWindow):
             self._set_working_directory(Path(chosen))
 
     def _set_working_directory(self, path: Path) -> None:
+        if not self._desktop_mutation_allowed():
+            return
         # The previous library was saved before this method was called. Clear
         # its in-memory volume before attaching a store rooted in the new
         # library, otherwise the old session could be written into the new one.
@@ -798,15 +1416,25 @@ class MainWindow(QMainWindow):
         self.rescan()
 
     def rescan(self) -> None:
+        if not self._desktop_mutation_allowed():
+            return
         self._rescan()
 
     def _rescan(
-        self, *, show_recovery_dialog: bool = True
+        self,
+        *,
+        show_recovery_dialog: bool = True,
+        require_save_success: bool = False,
     ) -> tuple[bool, CompletionRecoveryResult | None]:
         if self.working_directory is None:
             return False, None
 
-        self._save_session()
+        save_succeeded = self._save_session()
+        if require_save_success and not save_succeeded:
+            self.statusBar().showMessage(
+                "Library scan stopped because review progress was not saved.", 10000
+            )
+            return False, None
         try:
             recovery = recover_interrupted_completions(self.working_directory)
         except CompletionBusyError as exc:
@@ -901,6 +1529,7 @@ class MainWindow(QMainWindow):
                 "\n".join(recovery_lines)
                 + "\n\nReview the restored library before continuing.",
             )
+        self._refresh_companion_status()
         return True, recovery
 
     def _populate_mangas(
@@ -944,6 +1573,8 @@ class MainWindow(QMainWindow):
         self._populate_volumes(manga, preferred_volume)
 
     def _on_manga_changed(self, _index: int) -> None:
+        if not self._desktop_mutation_allowed(notify=False):
+            return
         manga = self.manga_combo.currentData()
         if not isinstance(manga, MangaRef):
             return
@@ -976,6 +1607,8 @@ class MainWindow(QMainWindow):
         self._load_volume(self.volume_combo.currentData())
 
     def _on_volume_changed(self, _index: int) -> None:
+        if not self._desktop_mutation_allowed(notify=False):
+            return
         self._load_volume(self.volume_combo.currentData())
 
     def _load_volume(self, volume: object) -> None:
@@ -1048,6 +1681,7 @@ class MainWindow(QMainWindow):
         page = volume.pages[self.current_index]
         is_selected = page.relative_path in self.selected_paths
         selected_count = len(self.selected_paths)
+        desktop_enabled = self._desktop_mutation_allowed(notify=False)
         self.canvas.set_selected(is_selected)
         self.toggle_button.setText("Deselect Page" if is_selected else "Select Page")
         self.selection_label.setText(
@@ -1056,14 +1690,16 @@ class MainWindow(QMainWindow):
         self.export_button.setText(
             f"Export {selected_count} Selected" if selected_count else "Export Selected"
         )
-        self.export_button.setEnabled(selected_count > 0)
-        self.export_action.setEnabled(selected_count > 0)
-        self.clear_action.setEnabled(selected_count > 0)
-        self.previous_selected_action.setEnabled(selected_count > 0)
-        self.next_selected_action.setEnabled(selected_count > 0)
-        self.next_selected_button.setEnabled(selected_count > 0)
+        self.export_button.setEnabled(desktop_enabled and selected_count > 0)
+        self.export_action.setEnabled(desktop_enabled and selected_count > 0)
+        self.clear_action.setEnabled(desktop_enabled and selected_count > 0)
+        self.previous_selected_action.setEnabled(desktop_enabled and selected_count > 0)
+        self.next_selected_action.setEnabled(desktop_enabled and selected_count > 0)
+        self.next_selected_button.setEnabled(desktop_enabled and selected_count > 0)
 
     def navigate(self, offset: int) -> None:
+        if not self._desktop_mutation_allowed():
+            return
         if self.current_volume is None:
             return
         target = self.current_index + offset
@@ -1078,6 +1714,8 @@ class MainWindow(QMainWindow):
         self._show_current_page()
 
     def go_to_index(self, index: int) -> None:
+        if not self._desktop_mutation_allowed():
+            return
         if self.current_volume is None:
             return
         target = min(max(index, 0), len(self.current_volume.pages) - 1)
@@ -1091,11 +1729,16 @@ class MainWindow(QMainWindow):
         self._show_current_page()
 
     def go_to_last_page(self) -> None:
+        if not self._desktop_mutation_allowed():
+            return
         if self.current_volume is not None:
             self.go_to_index(len(self.current_volume.pages) - 1)
 
     def navigate_selected(self, direction: int) -> None:
         """Jump among selected pages, wrapping at either end."""
+
+        if not self._desktop_mutation_allowed():
+            return
 
         volume = self.current_volume
         if volume is None or not self.selected_paths:
@@ -1126,6 +1769,8 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Wrapped to the {edge} selected page.", 2500)
 
     def toggle_current_selection(self) -> None:
+        if not self._desktop_mutation_allowed():
+            return
         volume = self.current_volume
         if volume is None:
             return
@@ -1141,6 +1786,8 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(message, 2000)
 
     def select_current_and_advance(self) -> None:
+        if not self._desktop_mutation_allowed():
+            return
         volume = self.current_volume
         if volume is None:
             return
@@ -1156,6 +1803,8 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Selected the final page of this volume.", 3000)
 
     def clear_selections(self) -> None:
+        if not self._desktop_mutation_allowed():
+            return
         if not self.selected_paths or self.current_volume is None:
             return
         answer = QMessageBox.question(
@@ -1174,6 +1823,8 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Selections cleared.", 3000)
 
     def export_selection(self) -> None:
+        if not self._desktop_mutation_allowed():
+            return
         volume = self.current_volume
         if volume is None or not self.selected_paths or self.working_directory is None:
             return
@@ -1221,6 +1872,8 @@ class MainWindow(QMainWindow):
         self.canvas.setFocus(Qt.FocusReason.OtherFocusReason)
 
     def open_output_directory(self) -> None:
+        if not self._desktop_mutation_allowed():
+            return
         if self._last_output_directory is None or not self._last_output_directory.is_dir():
             return
         opened = QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._last_output_directory)))
@@ -1233,6 +1886,9 @@ class MainWindow(QMainWindow):
 
     def complete_current_manga(self) -> None:
         """Finalize one manga after explicit destructive confirmation."""
+
+        if not self._desktop_mutation_allowed():
+            return
 
         manga = self.manga_combo.currentData()
         if not isinstance(manga, MangaRef) or self.working_directory is None:
@@ -1395,11 +2051,16 @@ class MainWindow(QMainWindow):
         return self._rescan(show_recovery_dialog=show_recovery_dialog)
 
     def _schedule_session_save(self) -> None:
+        if not self._desktop_mutation_allowed(notify=False):
+            self._session_save_timer.stop()
+            return
         self._set_save_status(False, "Saving progress…")
         self._session_save_timer.start(300)
 
-    def _save_session(self) -> None:
+    def _save_session(self) -> bool:
         self._session_save_timer.stop()
+        if not self._desktop_mutation_allowed(notify=False):
+            return not self._pending_session_saves
         if self.current_volume is not None and self.session_store is not None:
             store = self.session_store
             volume = self.current_volume
@@ -1414,9 +2075,9 @@ class MainWindow(QMainWindow):
                 self.current_index,
                 frozenset(self.selected_paths),
             )
-        self._flush_pending_session_saves()
+        return self._flush_pending_session_saves()
 
-    def _flush_pending_session_saves(self) -> None:
+    def _flush_pending_session_saves(self) -> bool:
         """Persist queued immutable snapshots without retargeting a busy retry."""
 
         last_error: OSError | None = None
@@ -1431,7 +2092,7 @@ class MainWindow(QMainWindow):
                 self._set_save_status(False, "Waiting to save…")
                 self.save_status_label.setToolTip(str(exc))
                 self._session_save_timer.start(750)
-                return
+                return False
             except OSError as exc:
                 last_error = exc
                 self._pending_session_saves.pop(key)
@@ -1451,6 +2112,7 @@ class MainWindow(QMainWindow):
         if self._close_requested:
             self._close_requested = False
             QTimer.singleShot(0, self.close)
+        return last_error is None
 
     def _discard_pending_session_saves(self, manga: MangaRef) -> None:
         """Drop snapshots whose source was just permanently completed."""
@@ -1468,6 +2130,7 @@ class MainWindow(QMainWindow):
         self.save_status_label.style().polish(self.save_status_label)
 
     def _set_review_enabled(self, enabled: bool) -> None:
+        enabled = enabled and self._desktop_mutation_allowed(notify=False)
         for action in (
             self.previous_action,
             self.next_action,
@@ -1549,7 +2212,10 @@ class MainWindow(QMainWindow):
             "</table>"
             "<p>Selections and the current position are saved automatically. "
             "Source JPG and PNG files are copied only when you export. Complete Manga "
-            "permanently deletes the source folder after destructive confirmation.</p>",
+            "permanently deletes the source folder after destructive confirmation.</p>"
+            "<p>Companion Mode transfers review ownership to one paired phone on "
+            "the same trusted network. Desktop mutation controls remain locked until "
+            "Companion Mode ends.</p>",
         )
 
     def show_about(self) -> None:
@@ -1557,11 +2223,67 @@ class MainWindow(QMainWindow):
             self,
             "About Pocket Manga Editor",
             "<h3>Pocket Manga Editor</h3>"
-            "<p>A keyboard-first tool for reviewing manga folders and exporting selected pages.</p>"
+            "<p>A keyboard-first tool for reviewing manga folders, selecting from a "
+            "local-network phone companion, and exporting selected pages.</p>"
             "<p>Development version 0.1.0</p>",
         )
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt API name
+        coordinator = self.companion_coordinator
+        if coordinator is not None:
+            state = coordinator.status().state
+            try:
+                if state is CompanionState.COMPANION_ACTIVE:
+                    context = coordinator.begin_exit()
+                    self._remember_mobile_context(context)
+                    self.current_volume = None
+                    self.current_index = 0
+                    self.selected_paths.clear()
+                    coordinator.finish_exit()
+                elif state is CompanionState.EXITING_COMPANION:
+                    self._remember_mobile_context(
+                        self._pending_mobile_context
+                        or coordinator.status().mobile_context
+                    )
+                    self.current_volume = None
+                    self.current_index = 0
+                    self.selected_paths.clear()
+                    coordinator.finish_exit()
+                elif state is CompanionState.COMPANION_ERROR:
+                    answer = QMessageBox.warning(
+                        self,
+                        "Companion recovery required",
+                        "Companion writes are blocked after an error. Recover desktop "
+                        "ownership and close the application?",
+                        QMessageBox.StandardButton.Yes
+                        | QMessageBox.StandardButton.Cancel,
+                        QMessageBox.StandardButton.Cancel,
+                    )
+                    if answer != QMessageBox.StandardButton.Yes:
+                        event.ignore()
+                        return
+                    context = coordinator.begin_recovery()
+                    self._remember_mobile_context(context)
+                    self.current_volume = None
+                    self.current_index = 0
+                    self.selected_paths.clear()
+                    rescanned, _recovery = self._rescan(
+                        show_recovery_dialog=False
+                    )
+                    if not rescanned:
+                        event.ignore()
+                        return
+                    coordinator.finish_recovery()
+            except Exception as exc:
+                QMessageBox.critical(
+                    self,
+                    "Could not close safely",
+                    "Companion review state could not be drained, so the window will "
+                    f"remain open.\n\n{exc}",
+                )
+                event.ignore()
+                return
+
         self._save_session()
         if self._pending_session_saves:
             self._close_requested = True

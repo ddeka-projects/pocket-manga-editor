@@ -2,7 +2,7 @@
 
 Pocket Manga Editor is a development-stage, keyboard-first desktop tool for reviewing manga JPG and PNG images and exporting a hand-picked set of pages. It reads chapter folders directly, so it does not need a separate volume-preparation phase. Reviewing and exporting do not modify source images; the explicitly confirmed **Complete Manga** operation permanently deletes the completed source folder.
 
-The original `manga_image_saver.ipynb` is retained as a proof of concept. The desktop application is implemented separately in the `pocket_manga_editor` Python package.
+The desktop application is implemented in the `pocket_manga_editor` Python package.
 
 ## Expected folders
 
@@ -46,6 +46,14 @@ py -m venv .venv
 ```
 
 The package entry point also works: `.venv\Scripts\python -m pocket_manga_editor`.
+
+On macOS:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python run.py
+```
 
 Packaging is deliberately out of scope during this development phase.
 
@@ -114,10 +122,43 @@ batch of newly released volumes for the same ongoing manga to be completed and
 recorded separately. Completion is journaled, and an interrupted batch is
 automatically rolled back or cleaned up before the next library scan.
 
+## Mobile Companion Mode
+
+Companion Mode serves a private mobile reader from the desktop application over
+the local network. One paired phone can browse the complete scanned library,
+read pages, change selections, and update the saved current page. Export,
+completion, deletion, folder changes, and rescanning remain desktop-only.
+
+To set it up:
+
+1. Reserve a stable IP address for the PC in the router's DHCP settings.
+2. In the sidebar's **Mobile Companion** card, open **Connection…** and enter
+   that address and a fixed port. The default port is `8765`.
+3. Allow the Python application through the Windows or macOS firewall if the OS
+   prompts on the first server start.
+4. Choose **Pair Phone**, open the displayed `http://<reserved-ip>:<port>/`
+   address on the iPhone, and enter the one-time code.
+5. In Safari, use **Share → Add to Home Screen** for the stable standalone app.
+6. Choose **Start Companion Mode** on the PC whenever the phone should own
+   review progress. Choose **End Companion Mode** to reload the confirmed mobile
+   selections and position on the desktop.
+
+Only one Pocket Manga Editor desktop process and one mobile controller are
+allowed. Pairing is remembered until **Forget Phone** is used. A disconnected
+phone does not end Companion Mode; use **Disconnect Mobile Client** to release a
+stale lease or **End Companion Mode** to return ownership to the PC.
+
+Companion traffic uses unencrypted HTTP and is intended only for a trusted home
+LAN. It is not an internet-access or cloud feature. The PC must remain awake,
+the desktop application must remain running, and the phone must be able to reach
+the reserved PC address. See [Companion Mode setup and troubleshooting](docs/companion-mode.md)
+for architecture, security boundaries, and common connection failures.
+
 ## Run tests
 
 The test suite covers scanning, saved sessions, exporting, completion and crash
-recovery, cross-process mutation locking, and the responsive desktop layout.
+recovery, singleton and cross-process mutation locking, Companion authorization,
+API/media security, mobile asset contracts, and the responsive desktop layout.
 Install the development requirements first; the GUI checks use PySide6's
 offscreen platform and do not open a window:
 

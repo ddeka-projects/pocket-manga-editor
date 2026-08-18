@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+from types import SimpleNamespace
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -16,9 +17,53 @@ from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication, QMessageBox  # noqa: E402
 
 from pocket_manga_editor.completion import CompletionBusyError  # noqa: E402
+from pocket_manga_editor.companion import (  # noqa: E402
+    CompanionCoordinator,
+    CompanionState,
+)
 from pocket_manga_editor.exporter import export_selected_pages  # noqa: E402
 from pocket_manga_editor.library_lock import LibraryBusyError  # noqa: E402
 from pocket_manga_editor.main_window import MainWindow  # noqa: E402
+
+
+class FakeCompanionServer:
+    def __init__(self) -> None:
+        self.running = True
+        self.error = None
+        self.url = "http://192.168.1.20:8765/"
+        self.port = 8765
+        self.public_host = "192.168.1.20"
+
+    def status(self) -> SimpleNamespace:
+        return SimpleNamespace(
+            running=self.running,
+            host="0.0.0.0",
+            port=self.port,
+            public_host=self.public_host,
+            url=self.url,
+            error=self.error,
+            lan_address_available=True,
+        )
+
+    def start(self) -> SimpleNamespace:
+        self.running = True
+        self.error = None
+        return self.status()
+
+    def restart(
+        self,
+        *,
+        host: str | None = None,
+        port: int | None = None,
+        public_host: str | None = None,
+    ) -> SimpleNamespace:
+        del host
+        if port is not None:
+            self.port = port
+        if public_host is not None:
+            self.public_host = public_host or "192.168.1.20"
+        self.url = f"http://{self.public_host}:{self.port}/"
+        return self.start()
 
 
 class PortraitLayoutTests(unittest.TestCase):
@@ -68,6 +113,21 @@ class PortraitLayoutTests(unittest.TestCase):
         self.window.show()
         QTest.qWait(100)
         self.app.processEvents()
+
+    def _replace_window_with_companion(
+        self,
+    ) -> tuple[CompanionCoordinator, FakeCompanionServer]:
+        self.window.close()
+        self.window.deleteLater()
+        QApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        self.app.processEvents()
+        coordinator = CompanionCoordinator()
+        server = FakeCompanionServer()
+        self.window = MainWindow(
+            companion_coordinator=coordinator,
+            companion_server=server,  # type: ignore[arg-type]
+        )
+        return coordinator, server
 
     def test_canvas_dominates_horizontal_split_and_sidebar_scrolls(self) -> None:
         self._show_window()
@@ -217,6 +277,153 @@ class PortraitLayoutTests(unittest.TestCase):
 
         self.app.processEvents()
         self.assertFalse(self.window.isVisible())
+
+    def test_companion_handoff_blocks_desktop_and_reloads_mobile_state(self) -> None:
+        coordinator, _server = self._replace_window_with_companion()
+        with (
+            patch.object(
+                QMessageBox,
+                "question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ),
+            patch.object(QMessageBox, "information"),
+        ):
+            self.window.start_companion_mode()
+
+        self.assertEqual(
+            coordinator.status().state, CompanionState.COMPANION_ACTIVE
+        )
+        self.assertIs(
+            self.window.viewer_stack.currentWidget(),
+            self.window.companion_status_panel,
+        )
+        for control in (
+            self.window.folder_button,
+            self.window.rescan_button,
+            self.window.manga_combo,
+            self.window.volume_combo,
+            self.window.export_button,
+            self.window.complete_button,
+        ):
+            self.assertFalse(control.isEnabled())
+
+        previous_selection = set(self.window.selected_paths)
+        self.window.toggle_current_selection()
+        self.assertEqual(self.window.selected_paths, previous_selection)
+        with patch(
+            "pocket_manga_editor.main_window.scan_working_directory"
+        ) as scan:
+            self.window.rescan()
+        scan.assert_not_called()
+
+        pairing_code = self.window._pairing_code
+        self.assertIsNotNone(pairing_code)
+        assert pairing_code is not None
+        credential = coordinator.pair(pairing_code)
+        client_id = "iphone-home-screen"
+        coordinator.claim_controller(credential, client_id)
+        library = coordinator.library(credential, client_id)
+        manga_id = library["mangas"][0]["id"]
+        manga = coordinator.manga(credential, client_id, manga_id)["manga"]
+        volume_id = manga["volumes"][0]["id"]
+        volume = coordinator.volume(credential, client_id, volume_id)["volume"]
+        second_page_id = volume["pages"][1]["id"]
+        coordinator.set_selection(
+            credential,
+            client_id,
+            volume_id,
+            second_page_id,
+            True,
+        )
+        coordinator.set_position(
+            credential,
+            client_id,
+            volume_id,
+            second_page_id,
+        )
+
+        with patch.object(
+            QMessageBox,
+            "question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ):
+            self.window.end_companion_mode()
+
+        self.assertEqual(coordinator.status().state, CompanionState.DESKTOP_ACTIVE)
+        self.assertIs(self.window.viewer_stack.currentWidget(), self.window.canvas)
+        self.assertIsNotNone(self.window.current_volume)
+        assert self.window.current_volume is not None
+        self.assertEqual(self.window.current_index, 1)
+        self.assertEqual(
+            self.window.selected_paths,
+            {self.window.current_volume.pages[1].relative_path},
+        )
+        self.assertTrue(self.window.folder_button.isEnabled())
+        self.assertTrue(self.window.rescan_button.isEnabled())
+
+    def test_close_during_companion_drains_mobile_ownership(self) -> None:
+        coordinator, _server = self._replace_window_with_companion()
+        self._show_window()
+        with (
+            patch.object(
+                QMessageBox,
+                "question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ),
+            patch.object(QMessageBox, "information"),
+        ):
+            self.window.start_companion_mode()
+        self.assertEqual(
+            coordinator.status().state, CompanionState.COMPANION_ACTIVE
+        )
+
+        self.window.close()
+
+        self.assertEqual(coordinator.status().state, CompanionState.DESKTOP_ACTIVE)
+        self.assertFalse(self.window.isVisible())
+
+    def test_companion_error_recovery_rescans_before_restoring_desktop(self) -> None:
+        coordinator, _server = self._replace_window_with_companion()
+        with (
+            patch.object(
+                QMessageBox,
+                "question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ),
+            patch.object(QMessageBox, "information"),
+        ):
+            self.window.start_companion_mode()
+
+        pairing_code = self.window._pairing_code
+        self.assertIsNotNone(pairing_code)
+        assert pairing_code is not None
+        credential = coordinator.pair(pairing_code)
+        client_id = "iphone-recovery"
+        coordinator.claim_controller(credential, client_id)
+        library = coordinator.library(credential, client_id)
+        manga_id = library["mangas"][0]["id"]
+        manga = coordinator.manga(credential, client_id, manga_id)["manga"]
+        volume_id = manga["volumes"][0]["id"]
+        volume = coordinator.volume(credential, client_id, volume_id)["volume"]
+        coordinator.set_position(
+            credential,
+            client_id,
+            volume_id,
+            volume["pages"][1]["id"],
+        )
+        coordinator.fail("Simulated Companion failure")
+
+        with patch.object(
+            QMessageBox,
+            "warning",
+            return_value=QMessageBox.StandardButton.Yes,
+        ):
+            self.window.end_companion_mode()
+
+        self.assertEqual(coordinator.status().state, CompanionState.DESKTOP_ACTIVE)
+        self.assertIs(self.window.viewer_stack.currentWidget(), self.window.canvas)
+        self.assertEqual(self.window.current_index, 1)
+        self.assertTrue(self.window.folder_button.isEnabled())
 
     def test_completion_detaches_deleted_manga_before_rescan_and_close(self) -> None:
         volume = self.window.current_volume
