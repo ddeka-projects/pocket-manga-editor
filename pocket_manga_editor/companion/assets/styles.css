@@ -614,6 +614,9 @@ select:focus-visible {
   outline-offset: -5px;
 }
 
+/* Keep the legacy class so an installed client with cached CSS still lays out
+   the newly reassigned lower selection target correctly. */
+.bottom-selection-zone,
 .chrome-toggle {
   position: absolute;
   right: 0;

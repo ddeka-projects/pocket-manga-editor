@@ -106,6 +106,18 @@ class CompanionAssetContractTests(unittest.TestCase):
         self.assertIn("selection-failed", self.javascript)
         self.assertIn("responseRevision >= volume.revision", self.javascript)
         self.assertIn("applySelectionConfirmation", self.javascript)
+        self.assertIn(
+            'id="chrome-toggle" class="tap-zone chrome-toggle-zone"',
+            self.html,
+        )
+        self.assertIn(
+            'class="bottom-selection-zone chrome-toggle"',
+            self.html,
+        )
+        self.assertNotIn("Saving selection…", self.javascript)
+        self.assertNotIn("Saving deselection…", self.javascript)
+        self.assertNotIn("Selected ✓", self.javascript)
+        self.assertNotIn('showReaderFeedback(confirmed ? "Selected', self.javascript)
 
     def test_javascript_uses_only_the_companion_api_and_exact_write_payloads(self) -> None:
         required_routes = {

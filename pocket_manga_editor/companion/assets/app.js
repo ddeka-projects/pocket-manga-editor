@@ -1061,7 +1061,6 @@
       && currentPage().id === page.id
     ) {
       renderSelectionState(currentPage());
-      showReaderFeedback(desired ? "Saving selection…" : "Saving deselection…", "neutral", 1_200);
     }
 
     try {
@@ -1107,7 +1106,6 @@
         if (currentPage() && currentPage().id === page.id) {
           renderSelectionState(currentPage());
           pulseSelection("selection-pulse");
-          showReaderFeedback(confirmed ? "Selected ✓" : "Deselected", confirmed ? "success" : "neutral");
         }
       }
     } catch (error) {
