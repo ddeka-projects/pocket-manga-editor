@@ -21,6 +21,7 @@
   --left-safe: env(safe-area-inset-left, 0px);
   --top-band: calc(var(--top-safe) + clamp(86px, 14dvh, 122px));
   --bottom-band: calc(var(--bottom-safe) + clamp(76px, 13dvh, 112px));
+  --reader-image-offset-y: clamp(20px, 3dvh, 28px);
   font-family:
     -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
   font-synthesis: none;
@@ -490,9 +491,12 @@ select:focus-visible {
   width: auto;
   max-width: 100%;
   height: auto;
-  max-height: 100%;
+  max-height: calc(
+    100% - var(--reader-image-offset-y) - var(--reader-image-offset-y)
+  );
   object-fit: contain;
   opacity: 1;
+  transform: translateY(var(--reader-image-offset-y));
   transition: opacity 130ms ease;
   -webkit-touch-callout: none;
 }

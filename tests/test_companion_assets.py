@@ -89,6 +89,11 @@ class CompanionAssetContractTests(unittest.TestCase):
     def test_reader_layout_keeps_the_required_gesture_and_accessibility_contract(self) -> None:
         self.assertIn("grid-template-columns: 30% 40% 30%", self.css)
         self.assertIn("object-fit: contain", self.css)
+        self.assertIn("--reader-image-offset-y: clamp(20px, 3dvh, 28px)", self.css)
+        self.assertIn(
+            "transform: translateY(var(--reader-image-offset-y))",
+            self.css,
+        )
         self.assertIn("env(safe-area-inset-top", self.css)
         self.assertIn("env(safe-area-inset-bottom", self.css)
         self.assertIn("prefers-reduced-motion: reduce", self.css)
