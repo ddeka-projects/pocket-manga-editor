@@ -1,4 +1,4 @@
-"""Thread-safe Companion Mode ownership and service coordinator."""
+"""Thread-safe Companion Mode ownership and activity coordinator."""
 
 from __future__ import annotations
 
@@ -7,30 +7,38 @@ from pathlib import Path
 import threading
 
 from ..models import ScanResult
-from ..storage import SessionStore
 from .auth import CredentialStore, PairingManager, PairingOffer
 from .lease import ControllerLease, LeaseSnapshot
-from .review import ReviewContext, ReviewMutation, ReviewSaveError, ReviewService
-from .snapshot import LibrarySnapshot, PageSnapshotEntry
+from .review import (
+    ActivityContext,
+    PositionMutation,
+    ReviewSaveError,
+    ReviewService,
+    SelectionMutation,
+)
+from .snapshot import ImageSnapshotEntry, LibrarySnapshot
 from .state import (
+    CompanionActivity,
     CompanionState,
     CompanionStateError,
     DesktopMutationBlocked,
     MobileAccessError,
     ShutdownTransitionError,
+    WrongActivityError,
     validate_transition,
 )
 
 
 @dataclass(frozen=True, slots=True)
 class MobileContext:
+    activity: CompanionActivity
     manga_id: str
     manga_name: str
-    volume_id: str
-    volume_name: str
-    page_id: str
-    page_label: str
-    selected_count: int
+    folder_id: str
+    folder_name: str
+    image_id: str
+    image_name: str
+    selected_count: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,8 +52,16 @@ class CoordinatorStatus:
     lease_expires_at: float | None
     snapshot_id: str | None
     mobile_context: MobileContext | None
-    selected_count: int
+    selected_count: int | None
     last_error: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _ActivityBinding:
+    client_id: str
+    page_instance_id: str | None
+    manga_id: str
+    activity: CompanionActivity
 
 
 class CompanionCoordinator:
@@ -59,15 +75,14 @@ class CompanionCoordinator:
         controller_lease: ControllerLease | None = None,
     ) -> None:
         if pairing_manager is not None and credential_store is not None:
-            raise ValueError(
-                "Pass either pairing_manager or credential_store, not both."
-            )
+            raise ValueError("Pass either pairing_manager or credential_store, not both.")
         self._lock = threading.RLock()
         self._state = CompanionState.DESKTOP_ACTIVE
         self._auth = pairing_manager or PairingManager(store=credential_store)
         self._lease = controller_lease or ControllerLease()
         self._snapshot: LibrarySnapshot | None = None
         self._review: ReviewService | None = None
+        self._activity_binding: _ActivityBinding | None = None
         self._context: MobileContext | None = None
         self._last_error: str | None = None
         self._credential_error: str | None = None
@@ -88,11 +103,7 @@ class CompanionCoordinator:
                 raise MobileAccessError("Companion entry has not started.")
             try:
                 snapshot = LibrarySnapshot.build(working_directory, scan_result)
-                review = ReviewService(
-                    snapshot,
-                    session_store=SessionStore(snapshot.working_directory),
-                    context_callback=self._receive_context,
-                )
+                review = ReviewService(snapshot, context_callback=self._receive_context)
             except BaseException as exc:
                 self._state = CompanionState.COMPANION_ERROR
                 self._last_error = str(exc)
@@ -100,6 +111,7 @@ class CompanionCoordinator:
             validate_transition(self._state, CompanionState.COMPANION_ACTIVE)
             self._snapshot = snapshot
             self._review = review
+            self._activity_binding = None
             self._context = None
             self._state = CompanionState.COMPANION_ACTIVE
             return snapshot
@@ -127,6 +139,7 @@ class CompanionCoordinator:
                 if self._review is not None:
                     self._review.flush()
                 self._lease.disconnect()
+                self._activity_binding = None
                 return self._context
             except BaseException as exc:
                 self._state = CompanionState.COMPANION_ERROR
@@ -140,6 +153,7 @@ class CompanionCoordinator:
             validate_transition(self._state, CompanionState.DESKTOP_ACTIVE)
             self._snapshot = None
             self._review = None
+            self._activity_binding = None
             self._context = None
             self._state = CompanionState.DESKTOP_ACTIVE
 
@@ -151,22 +165,20 @@ class CompanionCoordinator:
             self._last_error = str(message)
             self._recovery_in_progress = False
             self._lease.disconnect()
+            self._activity_binding = None
 
     def begin_recovery(self) -> MobileContext | None:
-        """Revoke mobile access while keeping desktop mutations fail-closed."""
-
         with self._lock:
             if self._state is not CompanionState.COMPANION_ERROR:
                 raise MobileAccessError("Companion Mode is not in an error state.")
             self._lease.disconnect()
             self._snapshot = None
             self._review = None
+            self._activity_binding = None
             self._recovery_in_progress = True
             return self._context
 
     def finish_recovery(self) -> None:
-        """Restore desktop authority after the caller successfully reconciles state."""
-
         with self._lock:
             if (
                 self._state is not CompanionState.COMPANION_ERROR
@@ -176,6 +188,7 @@ class CompanionCoordinator:
             validate_transition(self._state, CompanionState.DESKTOP_ACTIVE)
             self._snapshot = None
             self._review = None
+            self._activity_binding = None
             self._context = None
             self._lease.disconnect()
             self._state = CompanionState.DESKTOP_ACTIVE
@@ -183,8 +196,6 @@ class CompanionCoordinator:
             self._recovery_in_progress = False
 
     def recover_to_desktop(self) -> None:
-        """Reject the obsolete one-step recovery API to preserve write ownership."""
-
         raise CompanionStateError(
             "Recovery is two-phase: call begin_recovery(), reconcile and reload "
             "desktop state, then call finish_recovery()."
@@ -208,12 +219,14 @@ class CompanionCoordinator:
         with self._lock:
             credential = self._auth.pair(code)
             self._lease.disconnect()
+            self._activity_binding = None
             self._credential_error = None
             return credential
 
     def forget_device(self) -> None:
         with self._lock:
             self._lease.disconnect()
+            self._activity_binding = None
             try:
                 self._auth.forget()
             except OSError as exc:
@@ -223,7 +236,9 @@ class CompanionCoordinator:
                 self._credential_error = None
 
     def disconnect_client(self) -> None:
-        self._lease.disconnect()
+        with self._lock:
+            self._lease.disconnect()
+            self._activity_binding = None
 
     def authorize_device(self, credential: str | None) -> None:
         self._auth.authorize(credential)
@@ -237,7 +252,15 @@ class CompanionCoordinator:
         with self._lock:
             self._require_active_locked()
             self._auth.authorize(credential)
-            return self._lease.claim(client_id, page_instance_id)
+            previous = self._lease.snapshot()
+            claimed = self._lease.claim(client_id, page_instance_id)
+            if (
+                previous.instance_id != claimed.instance_id
+                or previous.page_instance_id != claimed.page_instance_id
+            ):
+                self._activity_binding = None
+                self._context = None
+            return claimed
 
     def heartbeat_controller(
         self,
@@ -260,6 +283,7 @@ class CompanionCoordinator:
             self._require_active_locked()
             self._auth.authorize(credential)
             self._lease.release(client_id, page_instance_id)
+            self._activity_binding = None
 
     def library(
         self,
@@ -268,85 +292,116 @@ class CompanionCoordinator:
         page_instance_id: str | None = None,
     ) -> dict[str, object]:
         with self._lock:
-            review = self._mobile_review_locked(
+            return self._mobile_review_locked(
                 credential, client_id, page_instance_id
-            )
-            return review.library_payload()
+            ).library_payload()
 
-    def manga(
+    def open_manga(
         self,
         credential: str | None,
         client_id: str,
         manga_id: str,
+        activity: CompanionActivity,
         page_instance_id: str | None = None,
     ) -> dict[str, object]:
         with self._lock:
             review = self._mobile_review_locked(
                 credential, client_id, page_instance_id
             )
-            return review.manga_payload(manga_id)
+            review.snapshot.manga(manga_id)
+            self._activity_binding = _ActivityBinding(
+                client_id, page_instance_id, manga_id, activity
+            )
+            return review.manga_payload(manga_id, activity)
 
-    def volume(
+    def folder(
         self,
         credential: str | None,
         client_id: str,
-        volume_id: str,
+        folder_id: str,
+        activity: CompanionActivity,
         page_instance_id: str | None = None,
     ) -> dict[str, object]:
         with self._lock:
             review = self._mobile_review_locked(
                 credential, client_id, page_instance_id
             )
-            return review.volume_payload(volume_id)
+            self._require_activity_locked(
+                client_id, page_instance_id, activity, folder_id=folder_id
+            )
+            return review.folder_payload(folder_id, activity)
 
     def set_position(
         self,
         credential: str | None,
         client_id: str,
-        volume_id: str,
-        page_id: str,
+        activity: CompanionActivity,
+        folder_id: str,
+        image_id: str,
         page_instance_id: str | None = None,
-    ) -> ReviewMutation:
+    ) -> PositionMutation:
         with self._lock:
             review = self._mobile_review_locked(
                 credential, client_id, page_instance_id
             )
+            self._require_activity_locked(
+                client_id, page_instance_id, activity, folder_id=folder_id
+            )
             try:
-                return review.set_position(volume_id, page_id)
+                return review.set_position(activity, folder_id, image_id)
             except ReviewSaveError as exc:
-                self.fail(str(exc))
+                if activity is CompanionActivity.EDIT:
+                    self.fail(str(exc))
                 raise
 
     def set_selection(
         self,
         credential: str | None,
         client_id: str,
-        volume_id: str,
-        page_id: str,
+        activity: CompanionActivity,
+        folder_id: str,
+        image_id: str,
         selected: bool,
         page_instance_id: str | None = None,
-    ) -> ReviewMutation:
+    ) -> SelectionMutation:
         with self._lock:
             review = self._mobile_review_locked(
                 credential, client_id, page_instance_id
             )
+            self._require_activity_locked(
+                client_id, page_instance_id, activity, folder_id=folder_id
+            )
+            if activity is not CompanionActivity.EDIT:
+                raise WrongActivityError(
+                    "Selections are available only in Edit activity."
+                )
             try:
-                return review.set_selection(volume_id, page_id, selected)
+                return review.set_selection(
+                    activity, folder_id, image_id, selected
+                )
             except ReviewSaveError as exc:
                 self.fail(str(exc))
                 raise
 
-    def page_for_image(
+    def image_for_delivery(
         self,
         credential: str | None,
         client_id: str,
-        page_id: str,
+        image_id: str,
         page_instance_id: str | None = None,
-    ) -> tuple[LibrarySnapshot, PageSnapshotEntry]:
+    ) -> tuple[LibrarySnapshot, ImageSnapshotEntry]:
         with self._lock:
-            self._mobile_review_locked(credential, client_id, page_instance_id)
-            assert self._snapshot is not None
-            return self._snapshot, self._snapshot.page(page_id)
+            review = self._mobile_review_locked(
+                credential, client_id, page_instance_id
+            )
+            image = review.snapshot.image(image_id)
+            self._require_activity_locked(
+                client_id,
+                page_instance_id,
+                None,
+                folder_id=image.folder_id,
+            )
+            return review.snapshot, image
 
     def status(self) -> CoordinatorStatus:
         with self._lock:
@@ -362,7 +417,7 @@ class CompanionCoordinator:
                 lease.lease_expires_at,
                 self._snapshot.snapshot_id if self._snapshot is not None else None,
                 self._context,
-                self._context.selected_count if self._context is not None else 0,
+                self._context.selected_count if self._context is not None else None,
                 self._last_error or self._credential_error,
             )
 
@@ -378,12 +433,37 @@ class CompanionCoordinator:
         assert self._review is not None
         return self._review
 
+    def _require_activity_locked(
+        self,
+        client_id: str,
+        page_instance_id: str | None,
+        activity: CompanionActivity | None,
+        *,
+        folder_id: str,
+    ) -> None:
+        binding = self._activity_binding
+        if (
+            binding is None
+            or binding.client_id != client_id
+            or binding.page_instance_id != page_instance_id
+            or (activity is not None and binding.activity is not activity)
+        ):
+            raise WrongActivityError(
+                "Choose the matching Read or Edit activity before continuing."
+            )
+        assert self._snapshot is not None
+        folder = self._snapshot.folder(folder_id)
+        if folder.manga_id != binding.manga_id:
+            raise WrongActivityError(
+                "This folder is outside the chosen manga activity."
+            )
+
     def _require_active_locked(self) -> None:
         if self._state is CompanionState.EXITING_COMPANION:
             raise ShutdownTransitionError("Companion Mode is shutting down.")
         if self._state is not CompanionState.COMPANION_ACTIVE:
             raise MobileAccessError("Companion Mode is not active.")
 
-    def _receive_context(self, context: ReviewContext) -> None:
+    def _receive_context(self, context: ActivityContext) -> None:
         with self._lock:
             self._context = MobileContext(**asdict(context))

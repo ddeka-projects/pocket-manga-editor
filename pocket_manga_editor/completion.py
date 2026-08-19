@@ -1,41 +1,69 @@
-"""Finalize one manga batch and retain an append-only completion history.
-
-Completion is intentionally separate from the Qt interface.  The preview API
-does all read-only validation needed by confirmation dialogs, while
-``complete_manga`` verifies that the preview is still current before moving or
-deleting anything.
-"""
+"""Crash-safe completion into immutable, per-manga output batches."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
-import shutil
 import stat
-import tempfile
 from typing import Any
 import uuid
 
 from . import __version__
+from .exporter import (
+    ExportError,
+    ExportRecoveryError,
+    recover_interrupted_exports_locked,
+    verify_managed_output,
+)
+from .filesystem_ops import (
+    prepare_managed_path,
+    remove_managed_path,
+    rename_no_replace,
+)
 from .library_lock import LibraryBusyError, LibraryLockError, library_mutation_lock
 from .models import MangaRef
-from .scanner import CHAPTER_PATTERN, VOLUME_PATTERN
-from .storage import atomic_write_json
+from .path_safety import is_link_or_reparse
+from .scanner import ScanError, scan_working_directory
+from .storage import EditingStateError, EditingStore, atomic_write_json
+from .workspace import (
+    MangaWorkspacePaths,
+    WorkspaceError,
+    manga_workspace_paths,
+    validate_completed_workspace,
+    validate_completion_workspace,
+    validate_live_manga,
+    validate_transaction_workspace,
+)
 
 
-COMPLETION_LOG_SCHEMA_VERSION = 1
-COMPLETION_LOG_FILENAME = "completion-log.json"
-_TRANSACTION_MARKER_FILENAME = "transaction.json"
-_TRANSACTION_SCHEMA_VERSION = 1
-_STAGING_PREFIX = ".pme-completion-"
-_OUTPUT_VOLUME_PATTERN = re.compile(r"^Vol\.(?P<volume>\d+(?:\.\d+)?)$")
-_IMAGE_SUFFIXES = frozenset({".jpg", ".png"})
+TRANSACTION_SCHEMA_VERSION = 1
+TRANSACTION_DIRECTORY_PREFIX = "completion-"
+TRANSACTION_MARKER_FILENAME = "transaction.json"
+COMMITTED_MARKER_FILENAME = "committed.json"
+_RETIRED_TRANSACTION_PREFIX = ".retired-completion-"
+_BATCH_PATTERN = re.compile(r"^batch-(?P<number>\d{4,})$")
+_DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_INTENT_KEYS = frozenset(
+    {
+        "schema_version",
+        "transaction_id",
+        "manga",
+        "batch",
+        "created_at",
+        "app_version",
+        "present",
+        "snapshot_token",
+    }
+)
+_COMMIT_KEYS = frozenset({"schema_version", "transaction_id"})
+
+_TreeSnapshot = tuple[tuple[str, str, int, int, str | None], ...]
+_BatchNamespace = tuple[tuple[str, str, int, int], ...]
 
 
 class CompletionError(RuntimeError):
@@ -43,22 +71,22 @@ class CompletionError(RuntimeError):
 
 
 class CompletionChangedError(CompletionError):
-    """Raised when the filesystem changed after the user reviewed a preview."""
+    """Raised when the filesystem changed after confirmation was shown."""
 
 
 class CompletionBusyError(CompletionError):
-    """Raised when another window is currently mutating this library."""
+    """Raised when another process currently owns the library mutation lock."""
 
 
 class CompletionRecoveryError(CompletionError):
-    """Raised when a failed pre-commit transaction could not be fully restored."""
+    """Raised when an interrupted transaction cannot be reconciled safely."""
 
     state_may_have_changed = True
 
 
 @dataclass(frozen=True, slots=True)
-class OutputVolumeSummary:
-    """Images currently present in one output volume folder."""
+class ManagedOutputFolderSummary:
+    """Manifest-backed exported images in one exact source folder."""
 
     name: str
     image_files: tuple[str, ...]
@@ -69,48 +97,43 @@ class OutputVolumeSummary:
 
 
 @dataclass(frozen=True, slots=True)
-class PriorCompletionSummary:
-    """Small history item suitable for a completion confirmation dialog."""
+class CompletionBatchSummary:
+    """One durable batch discovered directly from the completed directory."""
 
-    completed_at: str
-    source_volumes: tuple[str, ...]
-    output_volumes: tuple[str, ...]
-    image_count: int
+    name: str
+    directory: Path
 
 
 @dataclass(frozen=True, slots=True)
 class CompletionPreview:
-    """Validated, read-only description of a proposed completion."""
+    """Validated, read-only description shown before destructive confirmation."""
 
     manga_name: str
     source_directory: Path
+    workspace_directory: Path
     output_directory: Path
-    completed_directory: Path
-    source_volumes: tuple[str, ...]
-    source_folders: tuple[str, ...]
-    output_volumes: tuple[OutputVolumeSummary, ...]
-    missing_volumes: tuple[str, ...]
-    unexpected_volumes: tuple[str, ...]
-    previous_completions: tuple[PriorCompletionSummary, ...]
+    destination_batch: Path
+    source_folder_count: int
+    output_folders: tuple[ManagedOutputFolderSummary, ...]
+    existing_batches: tuple[CompletionBatchSummary, ...]
     snapshot_token: str
 
     @property
-    def total_image_count(self) -> int:
-        return sum(volume.image_count for volume in self.output_volumes)
+    def exported_folder_count(self) -> int:
+        return len(self.output_folders)
 
     @property
-    def has_volume_mismatch(self) -> bool:
-        return bool(self.missing_volumes or self.unexpected_volumes)
+    def total_image_count(self) -> int:
+        return sum(folder.image_count for folder in self.output_folders)
 
 
 @dataclass(frozen=True, slots=True)
 class CompletionResult:
-    """Paths and counts produced by a successful completion."""
+    """The immutable batch created by a successful completion."""
 
-    completed_directory: Path
-    log_path: Path
-    completed_at: str
-    output_volumes: tuple[OutputVolumeSummary, ...]
+    batch_directory: Path
+    batch_name: str
+    output_folders: tuple[ManagedOutputFolderSummary, ...]
     total_image_count: int
     cleanup_warnings: tuple[str, ...] = ()
 
@@ -130,124 +153,139 @@ class CompletionRecoveryResult:
 
 @dataclass(frozen=True, slots=True)
 class _CompletionPaths:
-    root: Path
-    metadata: Path
+    workspace: MangaWorkspacePaths
     source: Path
-    output: Path
-    selections: Path
-    exports: Path
-    completed_root: Path
-    completed: Path
-    log: Path
+    target_batch: Path
+
+
+@dataclass(frozen=True, slots=True)
+class _TransactionIntent:
+    transaction_id: str
+    manga_name: str
+    batch_name: str
+    reading_present: bool
+    editing_present: bool
+    snapshot_token: str
 
 
 def analyze_completion(
     working_directory: str | Path, manga: MangaRef
 ) -> CompletionPreview:
-    """Validate and describe a manga completion without changing any files."""
-
-    paths = _completion_paths(working_directory, manga)
-    source_tree, source_volumes, source_folders = _validate_source(paths, manga)
-    output_tree, output_volumes = _validate_output(paths)
-    _validate_optional_managed_tree(paths.selections, "selection metadata")
-    _validate_optional_managed_tree(paths.exports, "export metadata")
-
-    log_payload, log_bytes = _load_log(paths.log)
-    previous = tuple(
-        _prior_summary(entry)
-        for entry in log_payload["completions"]
-        if entry["manga"] == manga.name
-    )
-
-    missing, unexpected = _compare_volumes(source_volumes, output_volumes)
-    total_images = sum(volume.image_count for volume in output_volumes)
-    if total_images == 0:
-        raise CompletionError(
-            f"'{paths.output}' contains no exported JPG or PNG pages. "
-            "Export at least one page before completing this manga."
-        )
-
-    token_payload = {
-        "manga": manga.name,
-        "source": source_tree,
-        "source_volumes": source_volumes,
-        "source_folders": source_folders,
-        "output": output_tree,
-        "output_volumes": [
-            (volume.name, volume.image_files) for volume in output_volumes
-        ],
-        "missing": missing,
-        "unexpected": unexpected,
-        "log": hashlib.sha256(log_bytes).hexdigest() if log_bytes is not None else None,
-    }
-    snapshot_token = hashlib.sha256(
-        json.dumps(token_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
-
-    return CompletionPreview(
-        manga_name=manga.name,
-        source_directory=paths.source,
-        output_directory=paths.output,
-        completed_directory=paths.completed,
-        source_volumes=source_volumes,
-        source_folders=source_folders,
-        output_volumes=output_volumes,
-        missing_volumes=missing,
-        unexpected_volumes=unexpected,
-        previous_completions=previous,
-        snapshot_token=snapshot_token,
-    )
-
-
-def recover_interrupted_completions(
-    working_directory: str | Path,
-) -> CompletionRecoveryResult:
-    """Recover durable completion transactions left by a crash or forced exit.
-
-    Recovery is safe to call before every library scan.  It serializes against
-    active completions, rolls uncommitted transactions back, and finishes
-    cleanup for transactions whose IDs are already present in the log.
-    """
-
-    root = _resolve_working_directory(working_directory)
-    metadata = root / ".pocket-manga-editor"
-    _validate_managed_parent(metadata, root, "app metadata folder")
-    if not _lexists(metadata):
-        return CompletionRecoveryResult(0, 0)
+    """Validate and describe a completion without changing any files."""
 
     try:
-        with library_mutation_lock(root):
-            return _recover_interrupted_completions_locked(root, metadata)
+        workspace = manga_workspace_paths(working_directory, manga.name)
+        with library_mutation_lock(workspace.root):
+            return _analyze_completion_locked(workspace.root, manga)
     except LibraryBusyError as exc:
         raise CompletionBusyError(str(exc)) from exc
     except LibraryLockError as exc:
         raise CompletionError(str(exc)) from exc
+    except WorkspaceError as exc:
+        raise CompletionError(str(exc)) from exc
+
+
+def _analyze_completion_locked(root: Path, manga: MangaRef) -> CompletionPreview:
+    """Analyze while the caller owns the global library mutation lock."""
+
+    try:
+        workspace = validate_completion_workspace(
+            manga_workspace_paths(root, manga.name)
+        )
+        source = validate_live_manga(workspace.root, manga)
+        live_manga = _rescan_manga(workspace.root, manga.name)
+        validate_live_manga(workspace.root, live_manga)
+        editing = EditingStore(workspace.root)._load_locked(workspace.root, live_manga)
+        inventory = verify_managed_output(workspace, editing)
+    except (WorkspaceError, ScanError, EditingStateError, ExportError, OSError) as exc:
+        if isinstance(exc, CompletionError):
+            raise
+        raise CompletionError(str(exc)) from exc
+
+    if inventory.image_count < 1:
+        raise CompletionError(
+            f"'{workspace.output}' contains no valid app-managed exported images. "
+            "Export at least one selected image before completing this manga."
+        )
+
+    try:
+        if (
+            source.stat(follow_symlinks=False).st_dev
+            != workspace.workspace.stat(follow_symlinks=False).st_dev
+        ):
+            raise CompletionError(
+                "The source manga and its metadata workspace are on different "
+                "filesystems, so completion cannot stage them atomically."
+            )
+    except CompletionError:
+        raise
+    except OSError as exc:
+        raise CompletionError(
+            f"Could not verify the completion staging filesystem: {exc}"
+        ) from exc
+
+    source_tree = _snapshot_tree(source, "source manga")
+    output_tree = _snapshot_tree(workspace.output, "manga output")
+    reading_file = _snapshot_optional_file(workspace.reading, "reading metadata")
+    editing_file = _snapshot_optional_file(workspace.editing, "editing metadata")
+    existing_batches, destination_batch, batch_namespace = _batch_inventory(workspace)
+
+    output_folders = tuple(
+        ManagedOutputFolderSummary(folder.folder_name, tuple(folder.image_names))
+        for folder in inventory.folders
+    )
+    snapshot_token = _completion_snapshot_token(
+        manga_name=manga.name,
+        source_tree=source_tree,
+        source_folder_count=len(live_manga.folders),
+        output_tree=output_tree,
+        output_folders=output_folders,
+        reading_file=reading_file,
+        editing_file=editing_file,
+        batch_namespace=batch_namespace,
+        destination_batch_name=destination_batch.name,
+    )
+
+    return CompletionPreview(
+        manga_name=manga.name,
+        source_directory=source,
+        workspace_directory=workspace.workspace,
+        output_directory=workspace.output,
+        destination_batch=destination_batch,
+        source_folder_count=len(live_manga.folders),
+        output_folders=output_folders,
+        existing_batches=existing_batches,
+        snapshot_token=snapshot_token,
+    )
 
 
 def complete_manga(
     working_directory: str | Path,
     manga: MangaRef,
     expected_preview: CompletionPreview,
-    *,
-    allow_volume_mismatch: bool = False,
 ) -> CompletionResult:
-    """Finalize a manga after revalidating a previously displayed preview.
+    """Finalize active output after revalidating the confirmed preview."""
 
-    The source, output, selections, and export manifests are first renamed into
-    a same-filesystem staging directory.  Until the atomic log update succeeds,
-    every rename can be reversed.  Once the history entry is committed, the
-    staged source and metadata are permanently removed.
-    """
-
-    paths = _completion_paths(working_directory, manga)
     try:
-        with library_mutation_lock(paths.root):
-            return _complete_manga_locked(
-                paths.root,
-                manga,
-                expected_preview,
-                allow_volume_mismatch=allow_volume_mismatch,
-            )
+        workspace = manga_workspace_paths(working_directory, manga.name)
+        with library_mutation_lock(workspace.root):
+            return _complete_manga_locked(workspace.root, manga, expected_preview)
+    except LibraryBusyError as exc:
+        raise CompletionBusyError(str(exc)) from exc
+    except LibraryLockError as exc:
+        raise CompletionError(str(exc)) from exc
+    except WorkspaceError as exc:
+        raise CompletionError(str(exc)) from exc
+
+
+def recover_interrupted_completions(
+    working_directory: str | Path,
+) -> CompletionRecoveryResult:
+    """Roll back precommit journals and finish postcommit cleanup."""
+
+    try:
+        with library_mutation_lock(working_directory) as root:
+            return _recover_interrupted_completions_locked(root)
     except LibraryBusyError as exc:
         raise CompletionBusyError(str(exc)) from exc
     except LibraryLockError as exc:
@@ -255,577 +293,320 @@ def complete_manga(
 
 
 def _complete_manga_locked(
-    working_directory: Path,
-    manga: MangaRef,
-    expected_preview: CompletionPreview,
-    *,
-    allow_volume_mismatch: bool,
+    root: Path, manga: MangaRef, expected_preview: CompletionPreview
 ) -> CompletionResult:
-    """Complete a manga while the process-wide completion lock is held."""
+    try:
+        recover_interrupted_exports_locked(root)
+    except ExportRecoveryError as exc:
+        raise CompletionRecoveryError(
+            f"Interrupted export recovery must finish before completion: {exc}"
+        ) from exc
+    except ExportError as exc:
+        raise CompletionError(
+            f"Interrupted export recovery must finish before completion: {exc}"
+        ) from exc
 
-    current = analyze_completion(working_directory, manga)
+    workspace = validate_transaction_workspace(
+        manga_workspace_paths(root, manga.name)
+    )
+    active_transactions, _retired = _completion_transaction_directories(workspace)
+    if active_transactions:
+        raise CompletionRecoveryError(
+            f"Interrupted completion data already exists for '{manga.name}'. "
+            "Run completion recovery before trying again."
+        )
+
+    current = _analyze_completion_locked(root, manga)
     if not _same_preview_identity(expected_preview, current):
         raise CompletionChangedError(
-            "The manga source, output, or completion history changed after the "
-            "confirmation was opened. Review the completion details again."
-        )
-    if current.has_volume_mismatch and not allow_volume_mismatch:
-        raise CompletionError(
-            "The source and output volumes do not match. Explicit confirmation "
-            "is required to complete this manga anyway."
+            "The manga source, output, active metadata, or completed batches changed "
+            "after confirmation was opened. Review the completion details again."
         )
 
-    paths = _completion_paths(working_directory, manga)
-    log_payload, _log_bytes = _load_log(paths.log)
-
-    completed_at = datetime.now(timezone.utc).isoformat()
+    paths = _CompletionPaths(
+        workspace=workspace,
+        source=current.source_directory,
+        target_batch=current.destination_batch,
+    )
     transaction_id = str(uuid.uuid4())
-    new_entry = _completion_entry(current, completed_at, transaction_id)
-    updated_log = {
-        "schema_version": COMPLETION_LOG_SCHEMA_VERSION,
-        "completions": [*log_payload["completions"], new_entry],
-    }
+    intent = _TransactionIntent(
+        transaction_id=transaction_id,
+        manga_name=manga.name,
+        batch_name=paths.target_batch.name,
+        reading_present=_lexists(workspace.reading),
+        editing_present=_lexists(workspace.editing),
+        snapshot_token=current.snapshot_token,
+    )
+    transaction = workspace.transactions / (
+        TRANSACTION_DIRECTORY_PREFIX + transaction_id
+    )
+    phase = "create completion recovery data"
+    committed_warning: str | None = None
 
     try:
-        paths.metadata.mkdir(parents=True, exist_ok=True)
-        staging = Path(
-            tempfile.mkdtemp(prefix=_STAGING_PREFIX, dir=paths.metadata)
+        workspace.workspace.mkdir(parents=True, exist_ok=True)
+        workspace.transactions.mkdir(parents=True, exist_ok=True)
+        _fsync_directory(workspace.workspace)
+        transaction.mkdir()
+        _fsync_directory(workspace.transactions)
+
+        phase = "save the completion recovery marker"
+        atomic_write_json(
+            transaction / TRANSACTION_MARKER_FILENAME,
+            _intent_payload(intent),
         )
-    except OSError as exc:
-        raise CompletionError(f"Could not create completion staging: {exc}") from exc
+        _fsync_directory(transaction)
 
-    moved: list[tuple[Path, Path]] = []
-    installed = False
-    committed = False
-    rollback_errors: list[str] = []
-    commit_warnings: list[str] = []
-    phase = "save the completion recovery marker"
-    preserve_staging = False
-
-    try:
-        marker = {
-            "schema_version": _TRANSACTION_SCHEMA_VERSION,
-            "transaction_id": transaction_id,
-            "manga": manga.name,
-            "created_at": completed_at,
-            "app_version": __version__,
-            "present": {
-                "source": _lexists(paths.source),
-                "output": _lexists(paths.output),
-                "selections": _lexists(paths.selections),
-                "exports": _lexists(paths.exports),
-            },
-        }
-        atomic_write_json(staging / _TRANSACTION_MARKER_FILENAME, marker)
-        _fsync_directory(staging)
-        _fsync_directory(paths.metadata)
-
-        phase = "stage the manga files"
-        for original, stage_name in (
-            (paths.output, "output"),
-            (paths.selections, "selections"),
-            (paths.exports, "exports"),
-            # Move the source last so an abrupt exit early in staging leaves the
-            # manga discoverable until startup recovery runs.
-            (paths.source, "source"),
+        phase = "stage the active manga data"
+        for original, staged in (
+            (workspace.output, transaction / "output"),
+            (workspace.reading, transaction / "reading.json"),
+            (workspace.editing, transaction / "editing.json"),
+            (paths.source, transaction / "source"),
         ):
             if _lexists(original):
-                staged_path = staging / stage_name
-                os.replace(original, staged_path)
-                moved.append((original, staged_path))
-                _fsync_directory(original.parent)
-                _fsync_directory(staging)
+                _rename_managed(original, staged)
 
-        phase = "install the completed output"
-        staged_output = staging / "output"
-        paths.completed_root.mkdir(parents=True, exist_ok=True)
-        os.replace(staged_output, paths.completed)
-        installed = True
-        _fsync_directory(staging)
-        _fsync_directory(paths.completed_root)
+        phase = "revalidate the staged manga data"
+        _verify_staged_preview(paths.workspace, transaction, current)
 
-        phase = "save the completion history"
-        atomic_write_json(paths.log, updated_log)
-        # The visible atomic log replace is the logical commit point. From here
-        # onward no exception or interrupt may roll source/output back without
-        # also removing that durable transaction entry.
-        committed = True
-        try:
-            _fsync_directory(paths.log.parent)
-        except OSError as exc:
-            # The atomic replace is already visible and must not be rolled back
-            # independently of its transaction ID. Report reduced durability as
-            # a committed cleanup warning instead.
-            commit_warnings.append(
-                f"Could not sync the completion history directory: {exc}"
+        phase = "install the completed batch"
+        if _lexists(paths.target_batch):
+            raise CompletionChangedError(
+                f"The destination batch '{paths.target_batch.name}' now exists."
             )
+        workspace.completed.mkdir(parents=True, exist_ok=True)
+        _fsync_directory(workspace.workspace)
+        _rename_managed(transaction / "output", paths.target_batch)
+
+        phase = "commit the completion"
+        atomic_write_json(
+            transaction / COMMITTED_MARKER_FILENAME,
+            {
+                "schema_version": TRANSACTION_SCHEMA_VERSION,
+                "transaction_id": transaction_id,
+            },
+        )
+        try:
+            _fsync_directory(transaction)
+        except OSError as exc:
+            committed_warning = f"Could not sync the commit marker directory: {exc}"
     except BaseException as exc:
-        if not committed:
-            rollback_errors = _rollback_completion(paths, moved, installed)
-            preserve_staging = bool(rollback_errors)
-        if isinstance(exc, Exception):
+        try:
+            commit_state = _commit_state(transaction, transaction_id)
+        except CompletionRecoveryError as marker_error:
+            raise CompletionRecoveryError(
+                f"Could not determine whether completion committed while trying to "
+                f"{phase}: {marker_error}. Recovery data remains in '{transaction}'."
+            ) from exc
+
+        if commit_state:
+            if not isinstance(exc, Exception):
+                raise
+            committed_warning = f"Could not {phase} after the completion committed: {exc}"
+        else:
+            marker_path = transaction / TRANSACTION_MARKER_FILENAME
+            if not _lexists(transaction):
+                rollback_errors = []
+            elif _lexists(marker_path):
+                try:
+                    disk_intent = _load_transaction_intent(root, transaction)
+                except CompletionRecoveryError as marker_error:
+                    raise CompletionRecoveryError(
+                        f"Could not {phase}: {exc}. The recovery marker is unsafe: "
+                        f"{marker_error}. Recovery data remains in '{transaction}'."
+                    ) from exc
+                rollback_errors = _rollback_uncommitted(
+                    paths.workspace, transaction, disk_intent
+                )
+            else:
+                rollback_errors = _discard_markerless_transaction(transaction)
+
+            if not isinstance(exc, Exception):
+                raise
             detail = f"Could not {phase}: {exc}"
             if rollback_errors:
-                detail += " Rollback was incomplete: " + "; ".join(rollback_errors)
-                detail += f". Recovery data remains in '{staging}'."
+                detail += ". Rollback was incomplete: " + "; ".join(rollback_errors)
+                detail += f". Recovery data remains in '{transaction}'."
                 raise CompletionRecoveryError(detail) from exc
+            if isinstance(exc, CompletionChangedError):
+                raise CompletionChangedError(detail) from exc
             raise CompletionError(detail) from exc
-        raise
-    finally:
-        if not committed and not preserve_staging and _lexists(staging):
-            shutil.rmtree(staging, ignore_errors=True)
 
-    # The completion is irrevocably committed once the log replace succeeds.
-    # Cleanup failures therefore remain successful completions: callers must
-    # detach/rescan, while these warnings can tell the user about residue.
-    cleanup_warnings: list[str] = list(commit_warnings)
-    staged_output = staging / "output"
-    for _original, staged_path in moved:
-        if staged_path == staged_output or not _lexists(staged_path):
-            continue
-        try:
-            _remove_managed_path(staged_path)
-        except OSError as exc:
-            cleanup_warnings.append(f"Could not remove staged '{staged_path.name}': {exc}")
-    if _lexists(staging):
-        try:
-            shutil.rmtree(staging)
-        except OSError as exc:
-            cleanup_warnings.append(f"Could not remove completion staging: {exc}")
-
+    cleanup_warnings: list[str] = []
+    if committed_warning:
+        cleanup_warnings.append(committed_warning)
+    cleanup_warnings.extend(_finish_committed(paths.workspace, transaction, intent))
     return CompletionResult(
-        completed_directory=paths.completed,
-        log_path=paths.log,
-        completed_at=completed_at,
-        output_volumes=current.output_volumes,
+        batch_directory=paths.target_batch,
+        batch_name=paths.target_batch.name,
+        output_folders=current.output_folders,
         total_image_count=current.total_image_count,
         cleanup_warnings=tuple(cleanup_warnings),
     )
 
 
-def _completion_paths(
-    working_directory: str | Path, manga: MangaRef
-) -> _CompletionPaths:
-    root = _resolve_working_directory(working_directory)
-
-    name = manga.name
-    if not _is_safe_manga_name(name):
-        raise CompletionError("The manga name cannot be used as a safe folder name.")
-    if name.casefold() == COMPLETION_LOG_FILENAME.casefold():
-        raise CompletionError(
-            f"'{name}' is reserved for the completion history and cannot be completed."
-        )
-
-    source = root / name
-    manga_path = Path(manga.path).expanduser()
-    if manga_path.is_symlink() or not _lexists(manga_path):
-        raise CompletionError("The source manga folder is missing or is a symbolic link.")
-    try:
-        resolved_manga = manga_path.resolve(strict=True)
-    except OSError as exc:
-        raise CompletionError(f"The source manga folder could not be resolved: {exc}") from exc
-    if resolved_manga != source or resolved_manga.parent != root:
-        raise CompletionError(
-            "The source manga must be the matching folder directly inside the "
-            "working directory."
-        )
-
+def _recover_interrupted_completions_locked(root: Path) -> CompletionRecoveryResult:
     metadata = root / ".pocket-manga-editor"
-    completed_root = metadata / "completed"
-    paths = _CompletionPaths(
-        root=root,
-        metadata=metadata,
-        source=source,
-        output=metadata / "output" / name,
-        selections=metadata / "selections" / name,
-        exports=metadata / "exports" / name,
-        completed_root=completed_root,
-        completed=completed_root / name,
-        log=completed_root / COMPLETION_LOG_FILENAME,
-    )
+    if not _lexists(metadata):
+        return CompletionRecoveryResult(0, 0)
+    if is_link_or_reparse(metadata) or not metadata.is_dir():
+        raise CompletionRecoveryError("The app metadata path is not a safe directory.")
 
-    for candidate, label in (
-        (metadata, "app metadata folder"),
-        (metadata / "output", "output root"),
-        (metadata / "selections", "selection metadata root"),
-        (metadata / "exports", "export metadata root"),
-        (completed_root, "completed root"),
-    ):
-        _validate_managed_parent(candidate, root, label)
-
-    if _lexists(paths.completed):
-        if paths.completed.is_symlink():
-            suffix = " (symbolic links are not allowed)"
-        else:
-            suffix = ""
-        raise CompletionError(
-            f"A completed item already exists at '{paths.completed}'{suffix}. "
-            "Move it elsewhere before completing another batch with this name."
-        )
-    if _lexists(paths.log) and paths.log.is_symlink():
-        raise CompletionError("The completion history cannot be a symbolic link.")
-    return paths
-
-
-def _resolve_working_directory(working_directory: str | Path) -> Path:
-    raw_root = Path(working_directory).expanduser()
-    if raw_root.is_symlink():
-        raise CompletionError("The working directory cannot be a symbolic link.")
+    discovered: list[tuple[MangaWorkspacePaths, Path]] = []
+    retired: list[Path] = []
     try:
-        root = raw_root.resolve(strict=True)
-    except OSError as exc:
-        raise CompletionError(f"The working directory could not be resolved: {exc}") from exc
-    if not root.is_dir():
-        raise CompletionError(f"The working directory is not a folder: {root}")
-    return root
-
-
-def _is_safe_manga_name(name: object) -> bool:
-    return (
-        isinstance(name, str)
-        and bool(name)
-        and name not in {".", ".."}
-        and Path(name).name == name
-        and "/" not in name
-        and "\\" not in name
-    )
-
-
-def _validate_managed_parent(path: Path, root: Path, label: str) -> None:
-    if not path.resolve(strict=False).is_relative_to(root):
-        raise CompletionError(f"The {label} points outside the working directory.")
-    if _lexists(path):
-        if path.is_symlink():
-            raise CompletionError(f"The {label} cannot be a symbolic link.")
-        if not path.is_dir():
-            raise CompletionError(f"The {label} is not a folder.")
-
-
-def _validate_source(
-    paths: _CompletionPaths, manga: MangaRef
-) -> tuple[
-    tuple[tuple[str, str, int, int], ...],
-    tuple[str, ...],
-    tuple[str, ...],
-]:
-    if not paths.source.is_dir() or paths.source.is_symlink():
-        raise CompletionError("The source manga is missing or is not a safe folder.")
-    names_by_identity: dict[str, str] = {}
-    for volume in manga.volumes:
-        if volume.manga_name != manga.name or volume.manga_path.resolve() != paths.source:
-            raise CompletionError("The source volume metadata belongs to another manga.")
-
-    # MangaRef intentionally omits empty, malformed, ambiguous, and unreadable
-    # volume folders and can become stale after a scan. It is therefore used
-    # only to validate ownership; the live immediate Vol.* directories are the
-    # complete source-volume inventory used for comparison and logging.
-    try:
-        children = sorted(
-            paths.source.iterdir(), key=lambda path: (path.name.casefold(), path.name)
+        workspace_candidates = sorted(
+            metadata.iterdir(), key=lambda path: (path.name.casefold(), path.name)
         )
     except OSError as exc:
-        raise CompletionError(f"Could not inventory source volume folders: {exc}") from exc
+        raise CompletionRecoveryError(
+            f"Could not inspect completion recovery workspaces: {exc}"
+        ) from exc
 
-    source_folders: list[str] = []
-    unmatched_folders: list[str] = []
-    for child in children:
-        try:
-            child_stat = child.lstat()
-        except OSError as exc:
-            raise CompletionError(f"Could not inspect source item '{child}': {exc}") from exc
-        if not stat.S_ISDIR(child_stat.st_mode):
+    for candidate in workspace_candidates:
+        if candidate.name == ".library-mutation.lock":
             continue
-        if not child.name.casefold().startswith("vol."):
-            continue
-        source_folders.append(child.name)
-        match = CHAPTER_PATTERN.fullmatch(child.name) or VOLUME_PATTERN.fullmatch(child.name)
-        if match is None:
-            unmatched_folders.append(child.name)
-            continue
-        identity = _decimal_identity(match.group("volume"))
-        if identity is None:
-            unmatched_folders.append(child.name)
-            continue
-        names_by_identity.setdefault(identity, f"Vol.{match.group('volume')}")
-
-    ordered_identities = sorted(
-        names_by_identity,
-        key=lambda identity: (Decimal(identity), names_by_identity[identity].casefold()),
-    )
-    source_volumes = tuple(names_by_identity[identity] for identity in ordered_identities)
-    source_volumes += tuple(
-        sorted(unmatched_folders, key=lambda value: (value.casefold(), value))
-    )
-    return (
-        _tree_snapshot(paths.source, "source manga"),
-        source_volumes,
-        tuple(source_folders),
-    )
-
-
-def _validate_output(
-    paths: _CompletionPaths,
-) -> tuple[tuple[tuple[str, str, int, int], ...], tuple[OutputVolumeSummary, ...]]:
-    if not _lexists(paths.output):
-        raise CompletionError(
-            f"There is no exported output for '{paths.output.name}'."
-        )
-    if paths.output.is_symlink() or not paths.output.is_dir():
-        raise CompletionError("The manga output is not a safe folder.")
-    tree = _tree_snapshot(paths.output, "manga output")
-
-    try:
-        children = sorted(
-            paths.output.iterdir(), key=lambda path: (path.name.casefold(), path.name)
-        )
-    except OSError as exc:
-        raise CompletionError(f"Could not inspect the manga output: {exc}") from exc
-
-    volumes: list[OutputVolumeSummary] = []
-    for child in children:
-        if child.is_symlink():
-            raise CompletionError("Output folders and files cannot be symbolic links.")
-        if not child.is_dir():
-            continue
-        try:
-            images = tuple(
-                sorted(
-                    (
-                        page.name
-                        for page in child.iterdir()
-                        if page.is_file()
-                        and not page.is_symlink()
-                        and page.suffix.casefold() in _IMAGE_SUFFIXES
-                    ),
-                    key=lambda name: (name.casefold(), name),
-                )
+        if is_link_or_reparse(candidate):
+            raise CompletionRecoveryError(
+                f"Manga workspace '{candidate}' cannot be a symbolic link or junction."
             )
-        except OSError as exc:
-            raise CompletionError(f"Could not inspect output volume '{child}': {exc}") from exc
-        volumes.append(OutputVolumeSummary(child.name, images))
-    return tree, tuple(volumes)
+        if not candidate.is_dir():
+            continue
+        try:
+            workspace = validate_transaction_workspace(
+                manga_workspace_paths(root, candidate.name)
+            )
+        except WorkspaceError as exc:
+            raise CompletionRecoveryError(str(exc)) from exc
+        active_items, retired_items = _completion_transaction_directories(workspace)
+        discovered.extend((workspace, item) for item in active_items)
+        retired.extend(retired_items)
+
+    warnings: list[str] = []
+    for terminal in retired:
+        warnings.extend(_remove_retired_transaction(terminal))
+
+    parsed: list[tuple[MangaWorkspacePaths, Path, _TransactionIntent]] = []
+    seen_ids: set[str] = set()
+    seen_targets: set[Path] = set()
+    for workspace, transaction in discovered:
+        marker = transaction / TRANSACTION_MARKER_FILENAME
+        if not _lexists(marker):
+            errors = _discard_markerless_transaction(transaction)
+            if errors:
+                raise CompletionRecoveryError("; ".join(errors))
+            continue
+        intent = _load_transaction_intent(root, transaction)
+        if intent.transaction_id in seen_ids:
+            raise CompletionRecoveryError(
+                f"Duplicate completion transaction ID: {intent.transaction_id}"
+            )
+        target = workspace.completed / intent.batch_name
+        if target in seen_targets:
+            raise CompletionRecoveryError(
+                f"Multiple completion transactions claim '{target}'."
+            )
+        seen_ids.add(intent.transaction_id)
+        seen_targets.add(target)
+        parsed.append((workspace, transaction, intent))
+
+    rolled_back = 0
+    cleaned = 0
+    for workspace, transaction, intent in parsed:
+        if _commit_state(transaction, intent.transaction_id):
+            try:
+                validate_completed_workspace(workspace)
+            except WorkspaceError as exc:
+                raise CompletionRecoveryError(str(exc)) from exc
+            warnings.extend(_finish_committed(workspace, transaction, intent))
+            if not _lexists(transaction):
+                cleaned += 1
+            continue
+
+        try:
+            validate_completion_workspace(workspace)
+        except WorkspaceError as exc:
+            raise CompletionRecoveryError(str(exc)) from exc
+        errors = _rollback_uncommitted(workspace, transaction, intent)
+        if errors:
+            raise CompletionRecoveryError(
+                f"Could not roll back transaction {intent.transaction_id}: "
+                + "; ".join(errors)
+            )
+        rolled_back += 1
+
+    return CompletionRecoveryResult(rolled_back, cleaned, tuple(warnings))
 
 
-def _validate_optional_managed_tree(path: Path, label: str) -> None:
-    if not _lexists(path):
-        return
-    if path.is_symlink() or not path.is_dir():
-        raise CompletionError(f"The {label} is not a safe folder.")
-    _tree_snapshot(path, label)
+def _rescan_manga(root: Path, manga_name: str) -> MangaRef:
+    result = scan_working_directory(root)
+    for manga in result.mangas:
+        if manga.name == manga_name:
+            return manga
+    raise CompletionError(
+        f"The source manga '{manga_name}' no longer contains a discoverable image folder."
+    )
 
 
-def _tree_snapshot(
-    root: Path, label: str
-) -> tuple[tuple[str, str, int, int], ...]:
-    """Return a deterministic stat snapshot while rejecting every symlink."""
+def _batch_inventory(
+    workspace: MangaWorkspacePaths,
+) -> tuple[
+    tuple[CompletionBatchSummary, ...],
+    Path,
+    _BatchNamespace,
+]:
+    if not _lexists(workspace.completed):
+        return (), workspace.completed / "batch-0001", ()
 
-    entries: list[tuple[str, str, int, int]] = []
+    summaries: list[tuple[int, CompletionBatchSummary]] = []
+    namespace: list[tuple[str, str, int, int]] = []
+    occupied_casefold: set[str] = set()
+    highest = 0
     try:
-        root_stat = root.lstat()
-        if stat.S_ISLNK(root_stat.st_mode):
-            raise CompletionError(f"The {label} cannot be a symbolic link.")
-        entries.append((".", "directory", root_stat.st_size, root_stat.st_mtime_ns))
-
-        def raise_walk_error(error: OSError) -> None:
-            raise error
-
-        for current_text, directory_names, filenames in os.walk(
-            root, followlinks=False, onerror=raise_walk_error
-        ):
-            current = Path(current_text)
-            directory_names.sort(key=lambda value: (value.casefold(), value))
-            filenames.sort(key=lambda value: (value.casefold(), value))
-            for name, kind in (
-                *((name, "directory") for name in directory_names),
-                *((name, "file") for name in filenames),
-            ):
-                child = current / name
-                child_stat = child.lstat()
-                if stat.S_ISLNK(child_stat.st_mode):
-                    relative = child.relative_to(root).as_posix()
-                    raise CompletionError(
-                        f"The {label} contains a symbolic link: {relative}"
-                    )
-                actual_kind = "directory" if stat.S_ISDIR(child_stat.st_mode) else kind
-                entries.append(
-                    (
-                        child.relative_to(root).as_posix(),
-                        actual_kind,
-                        child_stat.st_size,
-                        child_stat.st_mtime_ns,
-                    )
+        entries = sorted(
+            workspace.completed.iterdir(),
+            key=lambda path: (path.name.casefold(), path.name),
+        )
+        for entry in entries:
+            information = entry.stat(follow_symlinks=False)
+            kind = (
+                "directory"
+                if stat.S_ISDIR(information.st_mode)
+                else "file"
+                if stat.S_ISREG(information.st_mode)
+                else "special"
+            )
+            namespace.append(
+                (entry.name, kind, information.st_size, information.st_mtime_ns)
+            )
+            occupied_casefold.add(entry.name.casefold())
+            number = _batch_number(entry.name)
+            if number is None:
+                continue
+            if is_link_or_reparse(entry) or not stat.S_ISDIR(information.st_mode):
+                raise CompletionError(
+                    f"Completed batch path is not a safe directory: {entry}"
                 )
+            highest = max(highest, number)
+            summaries.append((number, CompletionBatchSummary(entry.name, entry)))
     except CompletionError:
         raise
     except OSError as exc:
-        raise CompletionError(f"Could not inspect the {label}: {exc}") from exc
-    entries.sort(key=lambda item: (item[0].casefold(), item[0]))
-    return tuple(entries)
+        raise CompletionError(f"Could not inspect completed batches: {exc}") from exc
 
-
-def _compare_volumes(
-    source_names: tuple[str, ...], output: tuple[OutputVolumeSummary, ...]
-) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """Match canonical numeric identities while preserving original labels."""
-
-    remaining_by_identity: dict[str, list[OutputVolumeSummary]] = {}
-    unexpected: list[str] = []
-    for volume in output:
-        identity = _output_volume_identity(volume.name)
-        if identity is None or volume.image_count == 0:
-            unexpected.append(volume.name)
-            continue
-        remaining_by_identity.setdefault(identity, []).append(volume)
-
-    missing: list[str] = []
-    for source_name in source_names:
-        identity = _output_volume_identity(source_name)
-        candidates = remaining_by_identity.get(identity or "", [])
-        if not candidates:
-            missing.append(source_name)
-            continue
-        exact_index = next(
-            (index for index, candidate in enumerate(candidates) if candidate.name == source_name),
-            0,
-        )
-        candidates.pop(exact_index)
-
-    for candidates in remaining_by_identity.values():
-        unexpected.extend(volume.name for volume in candidates)
-    unexpected.sort(key=lambda value: (value.casefold(), value))
-    return tuple(missing), tuple(unexpected)
-
-
-def _output_volume_identity(name: str) -> str | None:
-    match = _OUTPUT_VOLUME_PATTERN.fullmatch(name)
-    if match is None:
-        return None
-    return _decimal_identity(match.group("volume"))
-
-
-def _decimal_identity(value: str) -> str | None:
-    try:
-        return format(Decimal(value).normalize(), "f")
-    except InvalidOperation:
-        return None
-
-
-def _load_log(path: Path) -> tuple[dict[str, Any], bytes | None]:
-    if not _lexists(path):
-        return {
-            "schema_version": COMPLETION_LOG_SCHEMA_VERSION,
-            "completions": [],
-        }, None
-    if path.is_symlink() or not path.is_file():
-        raise CompletionError("The completion history is not a safe regular file.")
-    try:
-        raw = path.read_bytes()
-        payload = json.loads(raw.decode("utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise CompletionError(f"The completion history could not be read safely: {exc}") from exc
-
-    if (
-        not isinstance(payload, dict)
-        or payload.get("schema_version") != COMPLETION_LOG_SCHEMA_VERSION
-        or not isinstance(payload.get("completions"), list)
-    ):
-        raise CompletionError("The completion history uses an invalid or unsupported format.")
-    for entry in payload["completions"]:
-        _validate_log_entry(entry)
-    return payload, raw
-
-
-def _validate_log_entry(entry: object) -> None:
-    if not isinstance(entry, dict):
-        raise CompletionError("The completion history contains an invalid entry.")
-    if not all(
-        isinstance(entry.get(field), str)
-        for field in ("transaction_id", "manga", "completed_at", "app_version")
-    ):
-        raise CompletionError("The completion history contains an invalid entry.")
-    try:
-        uuid.UUID(entry["transaction_id"])
-    except (ValueError, AttributeError):
-        raise CompletionError("The completion history contains an invalid transaction ID.")
-    source = entry.get("source")
-    output = entry.get("output")
-    volume_check = entry.get("volume_check")
-    if (
-        not isinstance(source, dict)
-        or not isinstance(source.get("relative_path"), str)
-        or not _string_list(source.get("volumes"))
-        or not _string_list(source.get("folders"))
-        or not isinstance(output, dict)
-        or not isinstance(output.get("directory"), str)
-        or not isinstance(output.get("total_image_count"), int)
-        or isinstance(output.get("total_image_count"), bool)
-        or output["total_image_count"] < 0
-        or not isinstance(output.get("volumes"), list)
-        or not isinstance(volume_check, dict)
-        or not _string_list(volume_check.get("missing_from_output"))
-        or not _string_list(volume_check.get("unexpected_in_output"))
-    ):
-        raise CompletionError("The completion history contains an invalid entry.")
-
-    counted = 0
-    for volume in output["volumes"]:
-        if (
-            not isinstance(volume, dict)
-            or not isinstance(volume.get("name"), str)
-            or not _string_list(volume.get("images"))
-            or not isinstance(volume.get("image_count"), int)
-            or isinstance(volume.get("image_count"), bool)
-            or volume["image_count"] != len(volume["images"])
-        ):
-            raise CompletionError("The completion history contains an invalid volume entry.")
-        counted += volume["image_count"]
-    if counted != output["total_image_count"]:
-        raise CompletionError("The completion history contains inconsistent image counts.")
-
-
-def _string_list(value: object) -> bool:
-    return isinstance(value, list) and all(isinstance(item, str) for item in value)
-
-
-def _prior_summary(entry: dict[str, Any]) -> PriorCompletionSummary:
-    return PriorCompletionSummary(
-        completed_at=entry["completed_at"],
-        source_volumes=tuple(entry["source"]["volumes"]),
-        output_volumes=tuple(volume["name"] for volume in entry["output"]["volumes"]),
-        image_count=entry["output"]["total_image_count"],
+    next_number = highest + 1
+    while True:
+        name = f"batch-{next_number:04d}"
+        if name.casefold() not in occupied_casefold:
+            break
+        next_number += 1
+    summaries.sort(key=lambda item: (item[0], item[1].name))
+    return (
+        tuple(summary for _number, summary in summaries),
+        workspace.completed / name,
+        tuple(namespace),
     )
-
-
-def _completion_entry(
-    preview: CompletionPreview, completed_at: str, transaction_id: str
-) -> dict[str, Any]:
-    return {
-        "transaction_id": transaction_id,
-        "manga": preview.manga_name,
-        "completed_at": completed_at,
-        "app_version": __version__,
-        "source": {
-            "relative_path": preview.source_directory.name,
-            "volumes": list(preview.source_volumes),
-            "folders": list(preview.source_folders),
-        },
-        "output": {
-            "directory": preview.completed_directory.name,
-            "volumes": [
-                {
-                    "name": volume.name,
-                    "image_count": volume.image_count,
-                    "images": list(volume.image_files),
-                }
-                for volume in preview.output_volumes
-            ],
-            "total_image_count": preview.total_image_count,
-        },
-        "volume_check": {
-            "missing_from_output": list(preview.missing_volumes),
-            "unexpected_in_output": list(preview.unexpected_volumes),
-        },
-    }
 
 
 def _same_preview_identity(
@@ -835,271 +616,646 @@ def _same_preview_identity(
         isinstance(expected, CompletionPreview)
         and expected.manga_name == current.manga_name
         and expected.source_directory == current.source_directory
+        and expected.workspace_directory == current.workspace_directory
         and expected.output_directory == current.output_directory
-        and expected.completed_directory == current.completed_directory
+        and expected.destination_batch == current.destination_batch
         and expected.snapshot_token == current.snapshot_token
     )
 
 
-def _recover_interrupted_completions_locked(
-    root: Path, metadata: Path
-) -> CompletionRecoveryResult:
-    completed_root = metadata / "completed"
-    try:
-        staging_items = sorted(
-            (
-                child
-                for child in metadata.iterdir()
-                if child.name.startswith(_STAGING_PREFIX)
-            ),
-            key=lambda path: path.name,
+def _completion_snapshot_token(
+    *,
+    manga_name: str,
+    source_tree: _TreeSnapshot,
+    source_folder_count: int,
+    output_tree: _TreeSnapshot,
+    output_folders: tuple[ManagedOutputFolderSummary, ...],
+    reading_file: tuple[int, int, str] | None,
+    editing_file: tuple[int, int, str] | None,
+    batch_namespace: _BatchNamespace,
+    destination_batch_name: str,
+) -> str:
+    payload = {
+        "manga": manga_name,
+        "source": source_tree,
+        "source_folder_count": source_folder_count,
+        "output": output_tree,
+        "managed_output": [
+            (folder.name, folder.image_files) for folder in output_folders
+        ],
+        "reading": reading_file,
+        "editing": editing_file,
+        "batch_namespace": batch_namespace,
+        "destination_batch": destination_batch_name,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _verify_staged_preview(
+    workspace: MangaWorkspacePaths,
+    transaction: Path,
+    preview: CompletionPreview,
+) -> None:
+    """Prove the staged destructive payload still matches the accepted preview."""
+
+    source_tree = _snapshot_tree(transaction / "source", "staged source manga")
+    output_tree = _snapshot_tree(transaction / "output", "staged manga output")
+    reading_file = _snapshot_optional_file(
+        transaction / "reading.json", "staged reading metadata"
+    )
+    editing_file = _snapshot_optional_file(
+        transaction / "editing.json", "staged editing metadata"
+    )
+    _existing, destination_batch, batch_namespace = _batch_inventory(workspace)
+    staged_token = _completion_snapshot_token(
+        manga_name=preview.manga_name,
+        source_tree=source_tree,
+        source_folder_count=preview.source_folder_count,
+        output_tree=output_tree,
+        output_folders=preview.output_folders,
+        reading_file=reading_file,
+        editing_file=editing_file,
+        batch_namespace=batch_namespace,
+        destination_batch_name=destination_batch.name,
+    )
+    if staged_token != preview.snapshot_token:
+        raise CompletionChangedError(
+            "The manga source, output, active metadata, or completed batches changed "
+            "while completion data was being staged."
         )
-    except OSError as exc:
-        raise CompletionRecoveryError(
-            f"Could not inspect completion recovery data: {exc}"
-        ) from exc
-    if not staging_items:
-        return CompletionRecoveryResult(0, 0)
 
-    marked_staging: list[Path] = []
-    for staging in staging_items:
-        if staging.is_symlink() or not staging.is_dir():
-            raise CompletionRecoveryError(
-                f"Completion recovery item is not a safe folder: {staging}"
-            )
-        marker_path = staging / _TRANSACTION_MARKER_FILENAME
-        if _lexists(marker_path):
-            marked_staging.append(staging)
-            continue
-        # A crash before the durable marker was installed cannot have moved any
-        # managed path. Empty staging or atomic marker-temp residue is safe to
-        # drop; any other content fails closed.
-        try:
-            residue = tuple(staging.iterdir())
-        except OSError as exc:
-            raise CompletionRecoveryError(
-                f"Could not inspect markerless recovery data: {staging}: {exc}"
-            ) from exc
-        safe_residue = all(
-            not child.is_symlink()
-            and child.is_file()
-            and child.name.startswith(f".{_TRANSACTION_MARKER_FILENAME}.")
-            and child.name.endswith(".tmp")
-            for child in residue
-        )
-        if not safe_residue:
-            raise CompletionRecoveryError(
-                f"Completion recovery marker is missing: {marker_path}"
-            )
-        try:
-            shutil.rmtree(staging)
-        except OSError as exc:
-            raise CompletionRecoveryError(
-                f"Could not remove unused completion recovery data: {staging}: {exc}"
-            ) from exc
 
-    if not marked_staging:
-        return CompletionRecoveryResult(0, 0)
-
-    for candidate, label in (
-        (metadata / "output", "output root"),
-        (metadata / "selections", "selection metadata root"),
-        (metadata / "exports", "export metadata root"),
-        (completed_root, "completed root"),
-    ):
-        try:
-            _validate_managed_parent(candidate, root, label)
-        except CompletionError as exc:
-            raise CompletionRecoveryError(str(exc)) from exc
-    try:
-        log_payload, _raw = _load_log(completed_root / COMPLETION_LOG_FILENAME)
-    except CompletionError as exc:
-        raise CompletionRecoveryError(str(exc)) from exc
-    committed_ids = {
-        entry["transaction_id"] for entry in log_payload["completions"]
+def _intent_payload(intent: _TransactionIntent) -> dict[str, Any]:
+    return {
+        "schema_version": TRANSACTION_SCHEMA_VERSION,
+        "transaction_id": intent.transaction_id,
+        "manga": intent.manga_name,
+        "batch": intent.batch_name,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "app_version": __version__,
+        "present": {
+            "source": True,
+            "output": True,
+            "reading": intent.reading_present,
+            "editing": intent.editing_present,
+        },
+        "snapshot_token": intent.snapshot_token,
     }
 
-    rolled_back = 0
-    cleaned = 0
-    seen_ids: set[str] = set()
-    for staging in marked_staging:
-        marker = _load_transaction_marker(staging)
-        transaction_id = marker["transaction_id"]
-        if transaction_id in seen_ids:
-            raise CompletionRecoveryError(
-                f"Duplicate completion transaction ID in recovery data: {transaction_id}"
-            )
-        seen_ids.add(transaction_id)
-        paths = _recovery_paths(root, metadata, marker["manga"])
-        _validate_recovery_transaction_paths(staging, paths)
 
-        try:
-            if transaction_id in committed_ids:
-                _finish_committed_recovery(staging, paths)
-                cleaned += 1
-            else:
-                _rollback_interrupted_recovery(staging, paths, marker["present"])
-                rolled_back += 1
-        except CompletionRecoveryError:
-            raise
-        except OSError as exc:
-            raise CompletionRecoveryError(
-                f"Could not recover transaction {transaction_id}: {exc}"
-            ) from exc
-
-    return CompletionRecoveryResult(rolled_back, cleaned)
-
-
-def _load_transaction_marker(staging: Path) -> dict[str, Any]:
-    marker_path = staging / _TRANSACTION_MARKER_FILENAME
-    if not _lexists(marker_path) or marker_path.is_symlink() or not marker_path.is_file():
+def _load_transaction_intent(root: Path, transaction: Path) -> _TransactionIntent:
+    marker = transaction / TRANSACTION_MARKER_FILENAME
+    if is_link_or_reparse(marker) or not marker.is_file():
         raise CompletionRecoveryError(
-            f"Completion recovery marker is missing or unsafe: {marker_path}"
+            f"Completion recovery marker is missing or unsafe: {marker}"
         )
     try:
-        payload = json.loads(marker_path.read_text(encoding="utf-8"))
+        payload = json.loads(marker.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise CompletionRecoveryError(
-            f"Completion recovery marker could not be read: {marker_path}: {exc}"
+            f"Completion recovery marker could not be read: {marker}: {exc}"
         ) from exc
+
     present = payload.get("present") if isinstance(payload, dict) else None
     if (
         not isinstance(payload, dict)
-        or payload.get("schema_version") != _TRANSACTION_SCHEMA_VERSION
+        or set(payload) != _INTENT_KEYS
+        or type(payload.get("schema_version")) is not int
+        or payload["schema_version"] != TRANSACTION_SCHEMA_VERSION
         or not isinstance(payload.get("transaction_id"), str)
         or not isinstance(payload.get("manga"), str)
+        or not isinstance(payload.get("batch"), str)
+        or not _valid_created_at(payload.get("created_at"))
+        or not _valid_app_version(payload.get("app_version"))
+        or not isinstance(payload.get("snapshot_token"), str)
+        or _DIGEST_PATTERN.fullmatch(payload["snapshot_token"]) is None
         or not isinstance(present, dict)
-        or set(present) != {"source", "output", "selections", "exports"}
-        or any(not isinstance(value, bool) for value in present.values())
+        or set(present) != {"source", "output", "reading", "editing"}
+        or present.get("source") is not True
+        or present.get("output") is not True
+        or type(present.get("reading")) is not bool
+        or type(present.get("editing")) is not bool
     ):
         raise CompletionRecoveryError(
-            f"Completion recovery marker is invalid: {marker_path}"
+            f"Completion recovery marker has an invalid format: {marker}"
         )
     try:
-        uuid.UUID(payload["transaction_id"])
+        transaction_uuid = uuid.UUID(payload["transaction_id"])
     except (ValueError, AttributeError) as exc:
         raise CompletionRecoveryError(
-            f"Completion recovery marker has an invalid transaction ID: {marker_path}"
+            f"Completion recovery marker has an invalid transaction ID: {marker}"
         ) from exc
+    if payload["transaction_id"] != str(transaction_uuid):
+        raise CompletionRecoveryError(
+            f"Completion recovery marker has a non-canonical transaction ID: {marker}"
+        )
+    expected_name = TRANSACTION_DIRECTORY_PREFIX + str(transaction_uuid)
+    if transaction.name != expected_name:
+        raise CompletionRecoveryError(
+            f"Completion recovery directory does not match its marker: {transaction}"
+        )
+    if _batch_number(payload["batch"]) is None:
+        raise CompletionRecoveryError(
+            f"Completion recovery marker has an unsafe batch name: {marker}"
+        )
+    try:
+        workspace = manga_workspace_paths(root, payload["manga"])
+    except WorkspaceError as exc:
+        raise CompletionRecoveryError(str(exc)) from exc
+    if transaction.parent != workspace.transactions:
+        raise CompletionRecoveryError(
+            f"Completion recovery marker belongs to another manga: {marker}"
+        )
+    return _TransactionIntent(
+        transaction_id=payload["transaction_id"],
+        manga_name=payload["manga"],
+        batch_name=payload["batch"],
+        reading_present=present["reading"],
+        editing_present=present["editing"],
+        snapshot_token=payload["snapshot_token"],
+    )
+
+
+def _commit_state(transaction: Path, transaction_id: str) -> bool:
+    marker = transaction / COMMITTED_MARKER_FILENAME
+    if not _lexists(marker):
+        return False
+    if is_link_or_reparse(marker) or not marker.is_file():
+        raise CompletionRecoveryError(f"Commit marker is unsafe: {marker}")
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise CompletionRecoveryError(f"Commit marker is unreadable: {marker}: {exc}") from exc
     if (
-        not _is_safe_manga_name(payload["manga"])
-        or payload["manga"].casefold() == COMPLETION_LOG_FILENAME.casefold()
+        not isinstance(payload, dict)
+        or set(payload) != _COMMIT_KEYS
+        or type(payload.get("schema_version")) is not int
+        or payload["schema_version"] != TRANSACTION_SCHEMA_VERSION
+        or not isinstance(payload.get("transaction_id"), str)
+        or payload.get("transaction_id") != transaction_id
     ):
-        raise CompletionRecoveryError(
-            f"Completion recovery marker has an unsafe manga name: {marker_path}"
-        )
-    return payload
+        raise CompletionRecoveryError(f"Commit marker is invalid: {marker}")
+    return True
 
 
-def _recovery_paths(root: Path, metadata: Path, manga_name: str) -> _CompletionPaths:
-    completed_root = metadata / "completed"
-    return _CompletionPaths(
-        root=root,
-        metadata=metadata,
-        source=root / manga_name,
-        output=metadata / "output" / manga_name,
-        selections=metadata / "selections" / manga_name,
-        exports=metadata / "exports" / manga_name,
-        completed_root=completed_root,
-        completed=completed_root / manga_name,
-        log=completed_root / COMPLETION_LOG_FILENAME,
+def _valid_created_at(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        created_at = datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return (
+        created_at.tzinfo is not None
+        and created_at.utcoffset() == timezone.utc.utcoffset(created_at)
+        and created_at.isoformat() == value
     )
 
 
-def _validate_recovery_transaction_paths(
-    staging: Path, paths: _CompletionPaths
-) -> None:
-    for candidate in (
-        paths.source,
-        paths.output,
-        paths.selections,
-        paths.exports,
-        paths.completed,
-        staging / "source",
-        staging / "output",
-        staging / "selections",
-        staging / "exports",
-    ):
-        if not _lexists(candidate):
-            continue
-        if candidate.is_symlink() or not candidate.is_dir():
-            raise CompletionRecoveryError(
-                f"Completion recovery path is not a safe folder: {candidate}"
-            )
-
-
-def _rollback_interrupted_recovery(
-    staging: Path, paths: _CompletionPaths, present: dict[str, bool]
-) -> None:
-    staged_output = staging / "output"
-    output_locations = tuple(
-        path
-        for path in (paths.output, staged_output, paths.completed)
-        if _lexists(path)
-    )
-    if present["output"]:
-        if len(output_locations) != 1:
-            raise CompletionRecoveryError(
-                "Interrupted completion output cannot be restored unambiguously: "
-                + ", ".join(str(path) for path in output_locations)
-            )
-        output_location = output_locations[0]
-        if output_location != paths.output:
-            paths.output.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(output_location, paths.output)
-    elif staged_output in output_locations or paths.completed in output_locations:
-        raise CompletionRecoveryError(
-            "Interrupted completion contains output that was not recorded by its marker."
+def _valid_app_version(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= 128
+        and value == value.strip()
+        and all(
+            character.isprintable() and not character.isspace()
+            for character in value
         )
+    )
 
-    for name, original in (
-        ("selections", paths.selections),
-        ("exports", paths.exports),
-        ("source", paths.source),
+
+def _rollback_uncommitted(
+    workspace: MangaWorkspacePaths,
+    transaction: Path,
+    intent: _TransactionIntent,
+) -> list[str]:
+    errors: list[str] = []
+    source = workspace.root / intent.manga_name
+    target = workspace.completed / intent.batch_name
+
+    output_locations = [
+        candidate
+        for candidate in (workspace.output, transaction / "output", target)
+        if _lexists(candidate)
+    ]
+    if len(output_locations) != 1:
+        errors.append(
+            "output cannot be restored unambiguously (found "
+            + ", ".join(str(path) for path in output_locations)
+            + ")"
+        )
+    else:
+        try:
+            output_location = output_locations[0]
+            _snapshot_tree(output_location, "completion output being restored")
+            if output_location != workspace.output:
+                _rename_managed(output_location, workspace.output)
+        except (CompletionError, OSError) as exc:
+            errors.append(f"could not restore output: {exc}")
+
+    for label, original, staged, originally_present in (
+        ("source", source, transaction / "source", True),
+        (
+            "reading metadata",
+            workspace.reading,
+            transaction / "reading.json",
+            intent.reading_present,
+        ),
+        (
+            "editing metadata",
+            workspace.editing,
+            transaction / "editing.json",
+            intent.editing_present,
+        ),
     ):
-        staged = staging / name
         original_exists = _lexists(original)
         staged_exists = _lexists(staged)
-        if present[name]:
-            if original_exists and staged_exists:
-                raise CompletionRecoveryError(
-                    f"Interrupted completion has conflicting '{name}' copies."
+        if originally_present:
+            if original_exists == staged_exists:
+                errors.append(
+                    f"{label} cannot be restored unambiguously; expected exactly one copy"
                 )
-            if not original_exists and not staged_exists:
-                raise CompletionRecoveryError(
-                    f"Interrupted completion is missing its '{name}' data."
-                )
+                continue
+            carrier = staged if staged_exists else original
             if staged_exists:
-                original.parent.mkdir(parents=True, exist_ok=True)
-                os.replace(staged, original)
-        elif staged_exists:
-            raise CompletionRecoveryError(
-                f"Interrupted completion contains unrecorded '{name}' data."
-            )
+                try:
+                    if label == "source":
+                        _snapshot_tree(carrier, "source manga being restored")
+                    else:
+                        _validate_regular_file(carrier, label)
+                    _rename_managed(staged, original)
+                except (CompletionError, OSError) as exc:
+                    errors.append(f"could not restore {label}: {exc}")
+            else:
+                try:
+                    if label == "source":
+                        _snapshot_tree(carrier, "source manga being restored")
+                    else:
+                        _validate_regular_file(carrier, label)
+                except (CompletionError, OSError) as exc:
+                    errors.append(f"could not validate restored {label}: {exc}")
+        elif original_exists or staged_exists:
+            errors.append(f"transaction contains unrecorded {label}")
 
-    shutil.rmtree(staging)
+    if errors:
+        return errors
+    errors.extend(_retire_transaction(transaction))
+    return errors
 
 
-def _finish_committed_recovery(staging: Path, paths: _CompletionPaths) -> None:
-    staged_output = staging / "output"
+def _finish_committed(
+    workspace: MangaWorkspacePaths,
+    transaction: Path,
+    intent: _TransactionIntent,
+) -> list[str]:
+    """Finish only transaction-owned residue; never touch active paths."""
+
+    warnings: list[str] = []
+    cleanup_incomplete = False
+    target = workspace.completed / intent.batch_name
+    staged_output = transaction / "output"
     if _lexists(staged_output):
-        if _lexists(paths.completed):
+        if _lexists(target):
             raise CompletionRecoveryError(
-                "A committed completion has conflicting completed output copies."
+                f"Committed transaction has conflicting output copies at "
+                f"'{staged_output}' and '{target}'."
             )
-        paths.completed_root.mkdir(parents=True, exist_ok=True)
-        os.replace(staged_output, paths.completed)
-        _fsync_directory(paths.completed_root)
-    # With no staged output, the committed output was already installed. It may
-    # since have been moved by the user, and active output may belong to a newer
-    # batch; neither is recovery data and neither should block cleanup.
-    shutil.rmtree(staging)
+        try:
+            workspace.completed.mkdir(parents=True, exist_ok=True)
+            _fsync_directory(workspace.workspace)
+            _validate_directory(staged_output, "staged completion output")
+            _rename_managed(staged_output, target)
+        except (CompletionError, OSError) as exc:
+            warnings.append(f"Could not finish installing '{target.name}': {exc}")
+            return warnings
+    elif not _lexists(target):
+        warnings.append(
+            f"Completed batch '{intent.batch_name}' is no longer in the workspace; "
+            "it may have been archived or removed."
+        )
+
+    # A visible commit marker is the logical commit point, but destructive
+    # cleanup must not begin until its directory entry is durable. If the
+    # original post-write sync failed, leave every staged payload intact for a
+    # later recovery attempt rather than risk a power loss exposing a partial
+    # precommit tree with no durable marker.
+    try:
+        _fsync_directory(transaction)
+    except OSError as exc:
+        warnings.append(f"Could not sync committed recovery data: {exc}")
+        return warnings
+
+    for staged, label in (
+        (transaction / "source", "staged source manga"),
+        (transaction / "reading.json", "staged reading metadata"),
+        (transaction / "editing.json", "staged editing metadata"),
+    ):
+        if not _lexists(staged):
+            continue
+        try:
+            _remove_managed_path(staged, label)
+        except (CompletionError, OSError) as exc:
+            warnings.append(f"Could not remove {label}: {exc}")
+            cleanup_incomplete = True
+
+    if cleanup_incomplete or any(
+        _lexists(transaction / name)
+        for name in ("output", "source", "reading.json", "editing.json")
+    ):
+        return warnings
+    warnings.extend(_retire_transaction(transaction))
+    return warnings
+
+
+def _completion_transaction_directories(
+    workspace: MangaWorkspacePaths,
+) -> tuple[tuple[Path, ...], tuple[Path, ...]]:
+    if not _lexists(workspace.transactions):
+        return (), ()
+    active: list[Path] = []
+    retired: list[Path] = []
+    try:
+        children = sorted(
+            workspace.transactions.iterdir(),
+            key=lambda path: (path.name.casefold(), path.name),
+        )
+    except OSError as exc:
+        raise CompletionRecoveryError(
+            f"Could not inspect '{workspace.transactions}': {exc}"
+        ) from exc
+    for child in children:
+        if child.name.startswith(TRANSACTION_DIRECTORY_PREFIX):
+            if is_link_or_reparse(child) or not child.is_dir():
+                raise CompletionRecoveryError(
+                    f"Completion transaction is not a safe directory: {child}"
+                )
+            active.append(child)
+        elif child.name.startswith(_RETIRED_TRANSACTION_PREFIX):
+            if is_link_or_reparse(child) or not child.is_dir():
+                raise CompletionRecoveryError(
+                    f"Retired completion transaction is unsafe: {child}"
+                )
+            retired.append(child)
+    return tuple(active), tuple(retired)
+
+
+def _discard_markerless_transaction(transaction: Path) -> list[str]:
+    try:
+        children = tuple(transaction.iterdir())
+    except OSError as exc:
+        return [f"Could not inspect markerless completion transaction: {exc}"]
+    safe = all(
+        not is_link_or_reparse(child)
+        and child.is_file()
+        and child.name.startswith(f".{TRANSACTION_MARKER_FILENAME}.")
+        and child.name.endswith(".tmp")
+        for child in children
+    )
+    if not safe:
+        return [
+            f"Completion recovery marker is missing and '{transaction}' contains data"
+        ]
+    return _retire_transaction(transaction)
+
+
+def _retire_transaction(transaction: Path) -> list[str]:
+    """Atomically make a payload-free journal safe for partial marker deletion."""
+
+    retired = transaction.parent / (
+        _RETIRED_TRANSACTION_PREFIX
+        + transaction.name.removeprefix(TRANSACTION_DIRECTORY_PREFIX)
+    )
+    try:
+        rename_no_replace(transaction, retired)
+        _fsync_directory(retired.parent)
+    except OSError as exc:
+        return [f"Could not retire completion recovery data: {exc}"]
+    return _remove_retired_transaction(retired)
+
+
+def _remove_retired_transaction(retired: Path) -> list[str]:
+    warnings: list[str] = []
+    try:
+        children = tuple(retired.iterdir())
+        for child in children:
+            marker_name = child.name in {
+                TRANSACTION_MARKER_FILENAME,
+                COMMITTED_MARKER_FILENAME,
+            }
+            temporary_name = (
+                child.name.startswith(".transaction.json.")
+                or child.name.startswith(".committed.json.")
+            ) and child.name.endswith(".tmp")
+            if (
+                is_link_or_reparse(child)
+                or not child.is_file()
+                or not (marker_name or temporary_name)
+            ):
+                raise OSError(f"unexpected recovery residue: {child}")
+        remove_managed_path(retired)
+        _fsync_directory(retired.parent)
+    except OSError as exc:
+        warnings.append(f"Could not remove retired completion recovery data: {exc}")
+    return warnings
+
+
+def _rename_managed(source: Path, destination: Path) -> None:
+    if not _lexists(source):
+        raise OSError(f"managed source is missing: {source}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        rename_no_replace(source, destination)
+    except OSError as exc:
+        if _lexists(destination):
+            raise OSError(
+                f"managed destination already exists: {destination}"
+            ) from exc
+        raise
+    _fsync_directory(source.parent)
+    if destination.parent != source.parent:
+        _fsync_directory(destination.parent)
+
+
+def _remove_managed_path(path: Path, label: str) -> None:
+    if is_link_or_reparse(path):
+        raise OSError(f"{label} is a symbolic link or junction")
+    information = prepare_managed_path(path)
+    if stat.S_ISDIR(information.st_mode):
+        _snapshot_tree(path, label)
+    elif stat.S_ISREG(information.st_mode):
+        _validate_regular_file(path, label)
+    else:
+        raise OSError(f"{label} is not a regular file or directory")
+    remove_managed_path(path)
+    _fsync_directory(path.parent)
+
+
+def _snapshot_tree(root: Path, label: str) -> _TreeSnapshot:
+    """Return a content-aware snapshot while rejecting unsafe entries."""
+
+    _validate_directory(root, label)
+    try:
+        resolved_root = root.resolve(strict=True)
+        root_information = root.stat(follow_symlinks=False)
+        root_device = root_information.st_dev
+        entries: list[tuple[str, str, int, int, str | None]] = [
+            (
+                ".",
+                "directory",
+                root_information.st_size,
+                root_information.st_mtime_ns,
+                None,
+            )
+        ]
+
+        def visit(directory: Path) -> None:
+            children = sorted(
+                directory.iterdir(), key=lambda path: (path.name.casefold(), path.name)
+            )
+            for child in children:
+                if is_link_or_reparse(child):
+                    raise CompletionError(
+                        f"The {label} contains a symbolic link or junction: "
+                        f"{child.relative_to(root).as_posix()}"
+                    )
+                information = child.stat(follow_symlinks=False)
+                resolved = child.resolve(strict=True)
+                if not resolved.is_relative_to(resolved_root):
+                    raise CompletionError(
+                        f"The {label} contains a path outside its root: {child}"
+                    )
+                if information.st_dev != root_device:
+                    raise CompletionError(
+                        f"The {label} crosses a mounted filesystem boundary: {child}"
+                    )
+                relative = child.relative_to(root).as_posix()
+                if stat.S_ISDIR(information.st_mode):
+                    kind = "directory"
+                    digest = None
+                elif stat.S_ISREG(information.st_mode):
+                    kind = "file"
+                    digest = _stable_file_digest(child, information, label)
+                else:
+                    raise CompletionError(
+                        f"The {label} contains an unsupported special file: {relative}"
+                    )
+                entries.append(
+                    (
+                        relative,
+                        kind,
+                        information.st_size,
+                        information.st_mtime_ns,
+                        digest,
+                    )
+                )
+                if kind == "directory":
+                    visit(child)
+
+        visit(root)
+    except CompletionError:
+        raise
+    except OSError as exc:
+        raise CompletionError(f"Could not inspect the {label}: {exc}") from exc
+    return tuple(entries)
+
+
+def _stable_file_digest(
+    path: Path, expected: os.stat_result, tree_label: str
+) -> str:
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        opened_before = os.fstat(descriptor)
+        if (
+            opened_before.st_dev != expected.st_dev
+            or opened_before.st_ino != expected.st_ino
+            or not stat.S_ISREG(opened_before.st_mode)
+        ):
+            raise CompletionChangedError(
+                f"A file in the {tree_label} changed while it was opened: {path}"
+            )
+        digest = hashlib.sha256()
+        byte_count = 0
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            byte_count += len(chunk)
+            digest.update(chunk)
+        opened_after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+
+    if is_link_or_reparse(path):
+        raise CompletionChangedError(
+            f"A file in the {tree_label} became a link while it was read: {path}"
+        )
+    path_after = path.stat(follow_symlinks=False)
+    stable_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns")
+    if (
+        any(getattr(opened_before, field) != getattr(opened_after, field) for field in stable_fields)
+        or any(getattr(opened_after, field) != getattr(path_after, field) for field in stable_fields)
+        or byte_count != opened_after.st_size
+    ):
+        raise CompletionChangedError(
+            f"A file in the {tree_label} changed while it was read: {path}"
+        )
+    return digest.hexdigest()
+
+
+def _snapshot_optional_file(path: Path, label: str) -> tuple[int, int, str] | None:
+    if not _lexists(path):
+        return None
+    if is_link_or_reparse(path):
+        raise CompletionError(f"The {label} cannot be a symbolic link or junction.")
+    try:
+        before = path.stat(follow_symlinks=False)
+        if not stat.S_ISREG(before.st_mode):
+            raise CompletionError(f"The {label} is not a regular file.")
+        raw = path.read_bytes()
+        after = path.stat(follow_symlinks=False)
+    except CompletionError:
+        raise
+    except OSError as exc:
+        raise CompletionError(f"Could not inspect the {label}: {exc}") from exc
+    if (
+        before.st_size != after.st_size
+        or before.st_mtime_ns != after.st_mtime_ns
+        or len(raw) != after.st_size
+    ):
+        raise CompletionChangedError(f"The {label} changed while it was inspected.")
+    return after.st_size, after.st_mtime_ns, hashlib.sha256(raw).hexdigest()
+
+
+def _validate_directory(path: Path, label: str) -> None:
+    if not _lexists(path) or is_link_or_reparse(path):
+        raise CompletionError(f"The {label} is missing or is a link: {path}")
+    try:
+        information = path.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise CompletionError(f"Could not inspect the {label}: {exc}") from exc
+    if not stat.S_ISDIR(information.st_mode):
+        raise CompletionError(f"The {label} is not a directory: {path}")
+
+
+def _validate_regular_file(path: Path, label: str) -> None:
+    if not _lexists(path) or is_link_or_reparse(path):
+        raise CompletionError(f"The {label} is missing or is a link: {path}")
+    try:
+        information = path.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise CompletionError(f"Could not inspect the {label}: {exc}") from exc
+    if not stat.S_ISREG(information.st_mode):
+        raise CompletionError(f"The {label} is not a regular file: {path}")
 
 
 def _fsync_directory(path: Path) -> None:
-    """Persist a marker rename on platforms that support directory fsync."""
-
-    if os.name == "nt":  # pragma: no cover - Windows cannot open directories this way
+    if os.name == "nt":  # pragma: no cover - Windows cannot fsync directories
         return
     flags = os.O_RDONLY
     if hasattr(os, "O_DIRECTORY"):
@@ -1108,39 +1264,23 @@ def _fsync_directory(path: Path) -> None:
     try:
         os.fsync(descriptor)
     finally:
-        os.close(descriptor)
-
-
-def _rollback_completion(
-    paths: _CompletionPaths,
-    moved: list[tuple[Path, Path]],
-    installed: bool,
-) -> list[str]:
-    errors: list[str] = []
-    if installed and _lexists(paths.completed):
         try:
-            os.replace(paths.completed, paths.output)
-        except OSError as exc:
-            errors.append(f"could not restore output: {exc}")
-
-    for original, staged in reversed(moved):
-        if original == paths.output and installed:
-            continue
-        if not _lexists(staged):
-            continue
-        try:
-            original.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(staged, original)
-        except OSError as exc:
-            errors.append(f"could not restore '{original}': {exc}")
-    return errors
+            os.close(descriptor)
+        except OSError:
+            pass
 
 
-def _remove_managed_path(path: Path) -> None:
-    if path.is_dir() and not path.is_symlink():
-        shutil.rmtree(path)
-    else:
-        path.unlink()
+def _batch_number(name: str) -> int | None:
+    match = _BATCH_PATTERN.fullmatch(name)
+    if match is None:
+        return None
+    try:
+        number = int(match.group("number"))
+    except ValueError:
+        return None
+    if number < 1 or name != f"batch-{number:04d}":
+        return None
+    return number
 
 
 def _lexists(path: Path) -> bool:

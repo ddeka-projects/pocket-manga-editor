@@ -1,72 +1,35 @@
-"""Shared, GUI-independent models for manga discovery and review."""
+"""Filesystem-faithful, GUI-independent manga library models."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import Decimal
 from pathlib import Path
 
 
 @dataclass(frozen=True, slots=True)
-class PageRef:
-    """A source image and the volume/chapter metadata encoded by its folder."""
+class ImageRef:
+    """One supported image directly inside an image folder."""
 
-    manga_name: str
-    manga_path: Path
-    volume_number: Decimal
-    volume_label: str
-    chapter_number: Decimal | None
-    chapter_label: str
-    chapter_title: str
-    page_number: Decimal
-    page_label: str
-    source_path: Path
-    relative_path: str
-
-    @property
-    def output_filename(self) -> str:
-        """Return an export name unique within a volume."""
-
-        extension = self.source_path.suffix.casefold()
-        if self.chapter_number is None:
-            return f"P{self.page_label}{extension}"
-        return f"C{self.chapter_label}_P{self.page_label}{extension}"
+    name: str
+    path: Path
 
 
 @dataclass(frozen=True, slots=True)
-class VolumeRef:
-    """An ordered volume sourced from chapters or a direct volume folder."""
+class FolderRef:
+    """One exact, user-named source folder containing supported images."""
 
-    manga_name: str
-    manga_path: Path
-    number: Decimal
-    label: str
-    pages: tuple[PageRef, ...]
-
-    @property
-    def display_name(self) -> str:
-        return f"Vol. {self.label}"
-
-    @property
-    def storage_name(self) -> str:
-        """Keep generated paths compatible with the original Vol.XX layout."""
-
-        return f"Vol.{self.label}"
-
-    @property
-    def identity(self) -> str:
-        """Return a formatting-independent serialized volume identifier."""
-
-        return format(self.number.normalize(), "f")
+    name: str
+    path: Path
+    images: tuple[ImageRef, ...]
 
 
 @dataclass(frozen=True, slots=True)
 class MangaRef:
-    """A discovered manga and all of its non-empty volumes."""
+    """One manga source directory and its image-bearing child folders."""
 
     name: str
     path: Path
-    volumes: tuple[VolumeRef, ...]
+    folders: tuple[FolderRef, ...]
 
 
 @dataclass(frozen=True, slots=True)

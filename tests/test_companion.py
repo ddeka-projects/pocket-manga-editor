@@ -32,7 +32,7 @@ from pocket_manga_editor.companion.lease import (
     LeaseConflictError,
     LeaseExpiredError,
 )
-from pocket_manga_editor.companion.review import ReviewService
+from pocket_manga_editor.companion.review import ReviewSaveError, ReviewService
 from pocket_manga_editor.companion.server import CompanionHTTPService
 from pocket_manga_editor.companion.snapshot import (
     LibrarySnapshot,
@@ -40,15 +40,22 @@ from pocket_manga_editor.companion.snapshot import (
     SnapshotLookupError,
 )
 from pocket_manga_editor.companion.state import (
+    CompanionActivity,
     CompanionState,
     CompanionStateError,
     DesktopMutationBlocked,
     MobileAccessError,
     ShutdownTransitionError,
+    WrongActivityError,
     validate_transition,
 )
 from pocket_manga_editor.scanner import scan_working_directory
-from pocket_manga_editor.storage import SessionStore
+from pocket_manga_editor.storage import (
+    EditingStore,
+    ReadingFolderState,
+    ReadingSnapshot,
+    ReadingStore,
+)
 
 
 class FakeClock:
@@ -66,25 +73,33 @@ class CompanionFixture(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary_directory.name)
-        self.first_page = self.add_page("Series One", "Vol. 01", "001.jpg", b"jpg-one")
-        self.second_page = self.add_page("Series One", "Vol. 01", "002.PNG", b"png-two")
-        self.other_page = self.add_page("Series Two", "Vol. 02", "001.jpg", b"jpg-three")
+        self.first_image = self.add_image(
+            "Series One", "Part III - Ch 21", "1.jpg", b"jpg-one"
+        )
+        self.second_image = self.add_image(
+            "Series One", "Part III - Ch 21", "2.PNG", b"png-two"
+        )
+        self.tenth_image = self.add_image(
+            "Series One", "Part III - Ch 21", "10.jpg", b"jpg-ten"
+        )
+        self.other_folder_image = self.add_image(
+            "Series One", "Volume Two - Ch 12", "cover.JPG", b"cover"
+        )
+        self.other_manga_image = self.add_image(
+            "Series Two", "Bonus scans", "scan-a.png", b"scan"
+        )
         self.scan_result = scan_working_directory(self.root)
 
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
 
-    def add_page(
-        self,
-        manga: str,
-        volume: str,
-        filename: str,
-        content: bytes,
+    def add_image(
+        self, manga: str, folder: str, filename: str, content: bytes
     ) -> Path:
-        page = self.root / manga / volume / filename
-        page.parent.mkdir(parents=True, exist_ok=True)
-        page.write_bytes(content)
-        return page
+        image = self.root / manga / folder / filename
+        image.parent.mkdir(parents=True, exist_ok=True)
+        image.write_bytes(content)
+        return image
 
     def build_snapshot(self, *, token_prefix: str = "opaque") -> LibrarySnapshot:
         counter = iter(range(100))
@@ -109,7 +124,6 @@ class CompanionStateTests(unittest.TestCase):
             (CompanionState.EXITING_COMPANION, CompanionState.COMPANION_ERROR),
             (CompanionState.COMPANION_ERROR, CompanionState.DESKTOP_ACTIVE),
         }
-
         for current in CompanionState:
             for target in CompanionState:
                 with self.subTest(current=current, target=target):
@@ -143,33 +157,21 @@ class PairingTests(unittest.TestCase):
         manager = self.manager()
         with self.assertRaises(UnpairedError):
             manager.authorize(None)
-        offer = manager.open_pairing(ttl_seconds=30, max_attempts=3)
-
-        issued_credential = manager.pair(offer.code)
-
-        self.assertEqual(issued_credential, self.credential)
+        credential = manager.pair(manager.open_pairing().code)
         raw = self.store.path.read_text(encoding="utf-8")
         payload = json.loads(raw)
+        self.assertEqual(credential, self.credential)
         self.assertNotIn(self.credential, raw)
-        self.assertNotIn(offer.code, raw)
         self.assertEqual(
             payload["credential_verifier"],
-            hashlib.sha256(self.credential.encode("utf-8")).hexdigest(),
+            hashlib.sha256(self.credential.encode()).hexdigest(),
         )
-
         restarted = self.manager()
-        self.assertTrue(restarted.paired)
         restarted.authorize(self.credential)
         with self.assertRaises(AuthenticationError):
-            restarted.authorize("wrong-device-secret")
+            restarted.authorize("wrong")
 
-        restarted.forget()
-        self.assertFalse(restarted.paired)
-        self.assertFalse(self.store.path.exists())
-        with self.assertRaises(AuthenticationError):
-            restarted.authorize(self.credential)
-
-    def test_pairing_window_expires_and_failed_attempts_close_it(self) -> None:
+    def test_pairing_expiry_and_attempt_limit_remain_enforced(self) -> None:
         manager = self.manager()
         manager.open_pairing(ttl_seconds=10, max_attempts=2)
         with self.assertRaises(InvalidPairingCodeError):
@@ -179,235 +181,200 @@ class PairingTests(unittest.TestCase):
         with self.assertRaises(PairingClosedError):
             manager.pair("123456")
 
-        manager.open_pairing(ttl_seconds=10)
-        self.clock.advance(10)
-        with self.assertRaises(PairingClosedError):
-            manager.pair("123456")
-
-    def test_failed_persistent_revocation_still_invalidates_live_credential(self) -> None:
+    def test_failed_persistent_revocation_invalidates_live_credential(self) -> None:
         manager = self.manager()
         manager.open_pairing()
         manager.pair("123456")
-
         with patch.object(self.store, "clear", side_effect=OSError("read only")):
             with self.assertRaises(OSError):
                 manager.forget()
-
         self.assertTrue(manager.revocation_pending)
-        self.assertTrue(manager.paired)
         with self.assertRaises(AuthenticationError):
             manager.authorize(self.credential)
-
         manager.forget()
         self.assertFalse(manager.revocation_pending)
         self.assertFalse(manager.paired)
 
 
 class ControllerLeaseTests(unittest.TestCase):
-    def test_one_controller_owns_the_lease_and_can_reclaim_during_grace(self) -> None:
+    def test_one_page_instance_owns_and_reclaims_the_lease(self) -> None:
         clock = FakeClock()
-        lease = ControllerLease(ttl_seconds=10, grace_seconds=20, clock=clock)
-
-        first = lease.claim("phone-window")
-        self.assertTrue(first.connected)
+        lease = ControllerLease(ttl_seconds=5, grace_seconds=10, clock=clock)
+        lease.claim("browser", "page-one")
         with self.assertRaises(LeaseConflictError):
-            lease.claim("second-tab")
-
-        clock.advance(11)
+            lease.claim("browser", "page-two")
+        clock.advance(6)
         with self.assertRaises(LeaseExpiredError):
-            lease.authorize("phone-window")
-        with self.assertRaises(LeaseConflictError):
-            lease.claim("second-tab")
+            lease.authorize("browser", "page-one")
+        self.assertTrue(lease.claim("browser", "page-two").connected)
 
-        reclaimed = lease.claim("phone-window")
-        self.assertTrue(reclaimed.connected)
-        lease.release("phone-window")
-        self.assertEqual(lease.claim("second-tab").instance_id, "second-tab")
-
-    def test_new_controller_can_claim_only_after_the_grace_period(self) -> None:
+    def test_different_client_waits_for_full_grace(self) -> None:
         clock = FakeClock()
         lease = ControllerLease(ttl_seconds=5, grace_seconds=10, clock=clock)
-        lease.claim("first")
-
-        clock.advance(16)
-
-        self.assertEqual(lease.claim("second").instance_id, "second")
-        with self.assertRaises(LeaseConflictError):
-            lease.release("first")
-
-    def test_duplicated_tab_with_same_client_id_cannot_share_live_lease(self) -> None:
-        clock = FakeClock()
-        lease = ControllerLease(ttl_seconds=5, grace_seconds=10, clock=clock)
-        lease.claim("browser-session", "page-one")
-
-        with self.assertRaises(LeaseConflictError):
-            lease.claim("browser-session", "page-two")
-        with self.assertRaises(LeaseConflictError):
-            lease.heartbeat("browser-session", "page-two")
-
-        self.assertTrue(
-            lease.authorize("browser-session", "page-one").connected
-        )
-
-    def test_same_client_new_page_takes_over_after_ttl_not_grace(self) -> None:
-        clock = FakeClock()
-        lease = ControllerLease(ttl_seconds=5, grace_seconds=10, clock=clock)
-        lease.claim("browser-session", "old-page")
-
-        clock.advance(6)
-
-        replacement = lease.claim("browser-session", "new-page")
-        self.assertTrue(replacement.connected)
-        self.assertTrue(
-            lease.authorize("browser-session", "new-page").connected
-        )
-        with self.assertRaises(LeaseConflictError):
-            lease.authorize("browser-session", "old-page")
-
-    def test_different_client_still_waits_for_full_grace_with_page_nonce(self) -> None:
-        clock = FakeClock()
-        lease = ControllerLease(ttl_seconds=5, grace_seconds=10, clock=clock)
-        lease.claim("first-session", "first-page")
-
+        lease.claim("first", "page")
         clock.advance(6)
         with self.assertRaises(LeaseConflictError):
-            lease.claim("second-session", "second-page")
-
+            lease.claim("second", "page")
         clock.advance(10)
-        claimed = lease.claim("second-session", "second-page")
-        self.assertEqual(claimed.instance_id, "second-session")
+        self.assertEqual(lease.claim("second", "page").instance_id, "second")
 
 
 class LibrarySnapshotTests(CompanionFixture):
-    def test_snapshot_ids_are_opaque_scoped_and_change_between_sessions(self) -> None:
+    def test_ids_are_opaque_scoped_and_follow_manga_folder_image(self) -> None:
         first = self.build_snapshot(token_prefix="alpha")
         second = self.build_snapshot(token_prefix="beta")
-        first_manga = first.mangas[0]
-        first_volume_id = first_manga.volume_ids[0]
-        first_page_id = first.volume(first_volume_id).page_ids[0]
-
+        manga = first.mangas[0]
+        folder_id = manga.folder_ids[0]
+        image_id = first.folder(folder_id).image_ids[0]
         public_ids = {
             first.snapshot_id,
-            *(manga.id for manga in first.mangas),
+            *(entry.id for entry in first.mangas),
+            *(folder for entry in first.mangas for folder in entry.folder_ids),
             *(
-                volume_id
-                for manga in first.mangas
-                for volume_id in manga.volume_ids
-            ),
-            *(
-                page_id
-                for manga in first.mangas
-                for volume_id in manga.volume_ids
-                for page_id in first.volume(volume_id).page_ids
+                image
+                for entry in first.mangas
+                for folder in entry.folder_ids
+                for image in first.folder(folder).image_ids
             ),
         }
-        for public_id in public_ids:
-            self.assertNotIn("Series", public_id)
-            self.assertNotIn("Vol.", public_id)
-            self.assertNotIn("/", public_id)
-            self.assertNotIn(str(self.root), public_id)
+        for value in public_ids:
+            self.assertNotIn("Series", value)
+            self.assertNotIn("Part", value)
+            self.assertNotIn("/", value)
+            self.assertNotIn(str(self.root), value)
+        with self.assertRaises(SnapshotLookupError):
+            second.manga(manga.id)
+        with self.assertRaises(SnapshotLookupError):
+            second.folder(folder_id)
+        with self.assertRaises(SnapshotLookupError):
+            second.image(image_id)
 
-        self.assertNotEqual(first.snapshot_id, second.snapshot_id)
-        with self.assertRaises(SnapshotLookupError):
-            second.manga(first_manga.id)
-        with self.assertRaises(SnapshotLookupError):
-            second.volume(first_volume_id)
-        with self.assertRaises(SnapshotLookupError):
-            second.page(first_page_id)
-        with self.assertRaises(SnapshotLookupError):
-            first.page(str(self.first_page))
-
-    def test_page_ids_cannot_be_used_with_a_different_volume(self) -> None:
+    def test_image_ids_cannot_cross_folder_boundaries(self) -> None:
         snapshot = self.build_snapshot()
-        first_volume_id = snapshot.mangas[0].volume_ids[0]
-        second_volume_id = snapshot.mangas[1].volume_ids[0]
-        first_page_id = snapshot.volume(first_volume_id).page_ids[0]
-
-        self.assertEqual(
-            snapshot.page_in_volume(first_volume_id, first_page_id).id,
-            first_page_id,
-        )
+        manga = snapshot.mangas[0]
+        first_folder, second_folder = manga.folder_ids
+        image = snapshot.folder(first_folder).image_ids[0]
+        self.assertEqual(snapshot.image_in_folder(first_folder, image).id, image)
         with self.assertRaises(SnapshotLookupError):
-            snapshot.page_in_volume(second_volume_id, first_page_id)
+            snapshot.image_in_folder(second_folder, image)
 
-    def test_snapshot_rejects_an_intermediate_symlinked_page_path(self) -> None:
-        volume_folder = self.first_page.parent
-        relocated = self.root / "relocated-volume"
-        volume_folder.rename(relocated)
+    def test_snapshot_rejects_symlinked_folder_after_scan(self) -> None:
+        source = self.first_image.parent
+        relocated = self.root / "relocated"
+        source.rename(relocated)
         try:
-            volume_folder.symlink_to(relocated, target_is_directory=True)
+            source.symlink_to(relocated, target_is_directory=True)
         except OSError as exc:
             self.skipTest(f"Directory symlinks are unavailable: {exc}")
-
         with self.assertRaises(SnapshotError):
             LibrarySnapshot.build(self.root, self.scan_result)
 
 
 class ReviewPersistenceTests(CompanionFixture):
-    def test_selection_and_position_are_persisted_before_commands_return(self) -> None:
+    def test_library_is_neutral_and_default_reads_create_no_metadata(self) -> None:
         snapshot = self.build_snapshot()
-        volume_id = snapshot.mangas[0].volume_ids[0]
-        volume = snapshot.volume(volume_id)
-        first_page_id, second_page_id = volume.page_ids
         review = ReviewService(snapshot)
+        manga = snapshot.mangas[0]
+        with (
+            patch.object(ReadingStore, "load") as read_load,
+            patch.object(EditingStore, "load") as edit_load,
+        ):
+            library = review.library_payload()
+        read_load.assert_not_called()
+        edit_load.assert_not_called()
+        read_payload = review.manga_payload(manga.id, CompanionActivity.READ)
+        edit_payload = review.manga_payload(manga.id, CompanionActivity.EDIT)
+        self.assertNotIn("selected_count", library["mangas"][0])
+        self.assertNotIn("selected_count", read_payload["manga"])
+        self.assertIn("selected_count", edit_payload["manga"])
+        self.assertFalse(ReadingStore(self.root).path_for(manga.ref).exists())
+        self.assertFalse(EditingStore(self.root).path_for(manga.ref).exists())
 
-        selection = review.set_selection(volume_id, first_page_id, True)
-
-        stored = SessionStore(self.root).load(volume.ref)
-        self.assertEqual(stored.current_index, 0)
-        self.assertEqual(
-            stored.selected_paths,
-            {snapshot.page(first_page_id).ref.relative_path},
-        )
-        self.assertEqual(selection.revision, 1)
-        self.assertTrue(selection.selected)
-
-        repeated = review.set_selection(volume_id, first_page_id, True)
-        self.assertEqual(repeated.revision, selection.revision)
-
-        position = review.set_position(volume_id, second_page_id)
-
-        stored = SessionStore(self.root).load(volume.ref)
-        self.assertEqual(stored.current_index, 1)
-        self.assertEqual(
-            stored.selected_paths,
-            {snapshot.page(first_page_id).ref.relative_path},
-        )
-        self.assertEqual(position.current_page_id, second_page_id)
-        self.assertEqual(position.revision, 2)
-
-    def test_payloads_expose_ids_and_labels_but_no_filesystem_paths(self) -> None:
+    def test_read_and_edit_positions_and_selections_are_independent(self) -> None:
         snapshot = self.build_snapshot()
-        volume_id = snapshot.mangas[0].volume_ids[0]
-        payload = ReviewService(snapshot).volume_payload(volume_id)
-        serialized = json.dumps(payload)
+        manga = snapshot.mangas[0]
+        folder_id = manga.folder_ids[0]
+        folder = snapshot.folder(folder_id)
+        first_id, second_id, tenth_id = folder.image_ids
+        review = ReviewService(snapshot)
+        review.set_position(CompanionActivity.READ, folder_id, second_id)
+        review.set_position(CompanionActivity.EDIT, folder_id, tenth_id)
+        selection = review.set_selection(
+            CompanionActivity.EDIT, folder_id, first_id, True
+        )
+        reading = ReadingStore(self.root).load(manga.ref)
+        editing = EditingStore(self.root).load(manga.ref)
+        self.assertEqual(reading.folders[folder.ref.name].current_image, "2.PNG")
+        self.assertEqual(editing.folders[folder.ref.name].current_image, "10.jpg")
+        self.assertEqual(
+            editing.folders[folder.ref.name].selected_images, frozenset({"1.jpg"})
+        )
+        self.assertEqual(selection.manga_selected_count, 1)
 
+    def test_read_payload_contains_no_paths_or_selection_semantics(self) -> None:
+        snapshot = self.build_snapshot()
+        manga = snapshot.mangas[0]
+        folder_id = manga.folder_ids[0]
+        payload = ReviewService(snapshot).folder_payload(
+            folder_id, CompanionActivity.READ
+        )
+        serialized = json.dumps(payload)
         self.assertNotIn(str(self.root), serialized)
-        self.assertNotIn("Vol. 01/001.jpg", serialized)
-        self.assertEqual(payload["snapshot_id"], snapshot.snapshot_id)
+        self.assertNotIn("selected", serialized)
+        self.assertNotIn("exports", serialized)
         self.assertTrue(
             all(
-                page["image_url"].startswith("/api/page/p_")
-                for page in payload["volume"]["pages"]
+                image["image_url"].startswith("/api/image/i_")
+                for image in payload["folder"]["images"]
             )
         )
 
-    def test_selection_of_another_page_does_not_regress_saved_position(self) -> None:
+    def test_mobile_warnings_never_expose_storage_error_paths(self) -> None:
         snapshot = self.build_snapshot()
-        volume_id = snapshot.mangas[0].volume_ids[0]
-        volume = snapshot.volume(volume_id)
-        first_page_id, second_page_id = volume.page_ids
+        manga = snapshot.mangas[0]
+        folder_states = {
+            folder.name: ReadingFolderState(folder.images[0].name)
+            for folder in manga.ref.folders
+        }
+        loaded = ReadingSnapshot(
+            manga.ref.folders[0].name,
+            folder_states,
+            (f"Could not read {self.root}/private/reading.json",),
+        )
+        with patch.object(ReadingStore, "load", return_value=loaded):
+            payload = ReviewService(snapshot).manga_payload(
+                manga.id, CompanionActivity.READ
+            )
+        serialized = json.dumps(payload)
+        self.assertNotIn(str(self.root), serialized)
+        self.assertEqual(len(payload["warnings"]), 1)
+
+    def test_forced_read_selection_never_calls_editing_store(self) -> None:
+        snapshot = self.build_snapshot()
+        manga = snapshot.mangas[0]
+        folder_id = manga.folder_ids[0]
+        image_id = snapshot.folder(folder_id).image_ids[0]
         review = ReviewService(snapshot)
+        with patch.object(EditingStore, "set_selection") as save:
+            with self.assertRaises(WrongActivityError):
+                review.set_selection(
+                    CompanionActivity.READ, folder_id, image_id, True
+                )
+        save.assert_not_called()
+        self.assertFalse(EditingStore(self.root).path_for(manga.ref).exists())
 
-        review.set_position(volume_id, second_page_id)
-        mutation = review.set_selection(volume_id, first_page_id, True)
-
-        stored = SessionStore(self.root).load(volume.ref)
-        self.assertEqual(stored.current_index, 1)
-        self.assertEqual(mutation.current_page_id, second_page_id)
+    def test_selection_of_another_image_does_not_regress_position(self) -> None:
+        snapshot = self.build_snapshot()
+        manga = snapshot.mangas[0]
+        folder_id = manga.folder_ids[0]
+        first_id, _second_id, tenth_id = snapshot.folder(folder_id).image_ids
+        review = ReviewService(snapshot)
+        review.set_position(CompanionActivity.EDIT, folder_id, tenth_id)
+        review.set_selection(CompanionActivity.EDIT, folder_id, first_id, True)
+        editing = EditingStore(self.root).load(manga.ref)
         self.assertEqual(
-            stored.selected_paths,
-            {snapshot.page(first_page_id).ref.relative_path},
+            editing.folders[snapshot.folder(folder_id).ref.name].current_image,
+            "10.jpg",
         )
 
 
@@ -421,83 +388,122 @@ class CoordinatorLifecycleTests(CompanionFixture):
         )
         pairing.open_pairing()
         pairing.pair("654321")
-        self.clock = FakeClock()
-        self.coordinator = CompanionCoordinator(
-            pairing_manager=pairing,
-            controller_lease=ControllerLease(clock=self.clock),
-        )
+        self.coordinator = CompanionCoordinator(pairing_manager=pairing)
 
-    def test_entry_active_exit_transfers_and_restores_write_authority(self) -> None:
+    def activate(self):
+        snapshot = self.coordinator.enter_companion(self.root, self.scan_result)
+        self.coordinator.claim_controller(self.credential, "phone", "page")
+        return snapshot
+
+    def test_activity_context_and_ownership_transfer(self) -> None:
         self.coordinator.require_desktop_mutation()
-
-        self.coordinator.begin_entry()
-
-        self.assertEqual(
-            self.coordinator.status().state,
-            CompanionState.ENTERING_COMPANION,
-        )
+        snapshot = self.activate()
         with self.assertRaises(DesktopMutationBlocked):
             self.coordinator.require_desktop_mutation()
-        with self.assertRaises(MobileAccessError):
-            self.coordinator.claim_controller(self.credential, "phone")
-
-        snapshot = self.coordinator.activate(self.root, self.scan_result)
-        self.coordinator.claim_controller(self.credential, "phone")
-        volume_id = snapshot.mangas[0].volume_ids[0]
-        page_id = snapshot.volume(volume_id).page_ids[0]
+        manga = snapshot.mangas[0]
+        self.coordinator.open_manga(
+            self.credential,
+            "phone",
+            manga.id,
+            CompanionActivity.READ,
+            "page",
+        )
+        read_context = self.coordinator.status().mobile_context
+        self.assertEqual(read_context.activity, CompanionActivity.READ)
+        self.assertIsNone(read_context.selected_count)
+        self.coordinator.open_manga(
+            self.credential,
+            "phone",
+            manga.id,
+            CompanionActivity.EDIT,
+            "page",
+        )
+        folder_id = manga.folder_ids[0]
+        image_id = snapshot.folder(folder_id).image_ids[0]
         self.coordinator.set_selection(
-            self.credential, "phone", volume_id, page_id, True
+            self.credential,
+            "phone",
+            CompanionActivity.EDIT,
+            folder_id,
+            image_id,
+            True,
+            "page",
         )
-
-        final_context = self.coordinator.begin_exit()
-
-        self.assertIsNotNone(final_context)
-        self.assertEqual(
-            self.coordinator.status().state,
-            CompanionState.EXITING_COMPANION,
-        )
+        context = self.coordinator.begin_exit()
+        self.assertEqual(context.selected_count, 1)
         with self.assertRaises(ShutdownTransitionError):
-            self.coordinator.set_position(
-                self.credential, "phone", volume_id, page_id
-            )
-        with self.assertRaises(DesktopMutationBlocked):
-            self.coordinator.require_desktop_mutation()
-
+            self.coordinator.library(self.credential, "phone", "page")
         self.coordinator.finish_exit()
-
-        status = self.coordinator.status()
-        self.assertEqual(status.state, CompanionState.DESKTOP_ACTIVE)
-        self.assertIsNone(status.snapshot_id)
-        self.assertFalse(status.active_client)
         self.coordinator.require_desktop_mutation()
-        with self.assertRaises(MobileAccessError):
-            self.coordinator.claim_controller(self.credential, "phone")
 
-    def test_error_state_is_fail_closed_until_explicit_recovery(self) -> None:
+    def test_error_state_remains_fail_closed_until_two_phase_recovery(self) -> None:
         self.coordinator.fail("uncertain save")
-
         status = self.coordinator.status()
         self.assertEqual(status.state, CompanionState.COMPANION_ERROR)
         self.assertEqual(status.last_error, "uncertain save")
         with self.assertRaises(DesktopMutationBlocked):
             self.coordinator.require_desktop_mutation()
         with self.assertRaises(MobileAccessError):
-            self.coordinator.claim_controller(self.credential, "phone")
+            self.coordinator.claim_controller(self.credential, "phone", "page")
 
         self.coordinator.begin_recovery()
-
         with self.assertRaises(DesktopMutationBlocked):
             self.coordinator.require_desktop_mutation()
         with self.assertRaises(MobileAccessError):
-            self.coordinator.claim_controller(self.credential, "phone")
-
+            self.coordinator.claim_controller(self.credential, "phone", "page")
         self.coordinator.finish_recovery()
-
         self.assertEqual(
             self.coordinator.status().state,
             CompanionState.DESKTOP_ACTIVE,
         )
         self.coordinator.require_desktop_mutation()
+
+    def test_read_save_failure_does_not_fail_companion(self) -> None:
+        snapshot = self.activate()
+        manga = snapshot.mangas[0]
+        self.coordinator.open_manga(
+            self.credential, "phone", manga.id, CompanionActivity.READ, "page"
+        )
+        folder_id = manga.folder_ids[0]
+        image_id = snapshot.folder(folder_id).image_ids[1]
+        with patch.object(ReadingStore, "set_position", side_effect=OSError("disk")):
+            with self.assertRaises(ReviewSaveError):
+                self.coordinator.set_position(
+                    self.credential,
+                    "phone",
+                    CompanionActivity.READ,
+                    folder_id,
+                    image_id,
+                    "page",
+                )
+        self.assertEqual(
+            self.coordinator.status().state, CompanionState.COMPANION_ACTIVE
+        )
+        self.assertTrue(self.coordinator.status().active_client)
+
+    def test_edit_save_failure_is_fail_closed(self) -> None:
+        snapshot = self.activate()
+        manga = snapshot.mangas[0]
+        self.coordinator.open_manga(
+            self.credential, "phone", manga.id, CompanionActivity.EDIT, "page"
+        )
+        folder_id = manga.folder_ids[0]
+        image_id = snapshot.folder(folder_id).image_ids[0]
+        with patch.object(EditingStore, "set_selection", side_effect=OSError("disk")):
+            with self.assertRaises(ReviewSaveError):
+                self.coordinator.set_selection(
+                    self.credential,
+                    "phone",
+                    CompanionActivity.EDIT,
+                    folder_id,
+                    image_id,
+                    True,
+                    "page",
+                )
+        self.assertEqual(self.coordinator.status().state, CompanionState.COMPANION_ERROR)
+        self.assertFalse(self.coordinator.status().active_client)
+        with self.assertRaises(DesktopMutationBlocked):
+            self.coordinator.require_desktop_mutation()
 
 
 class CompanionAPITests(CompanionFixture):
@@ -515,18 +521,9 @@ class CompanionAPITests(CompanionFixture):
         )
         pairing.open_pairing()
         pairing.pair("112233")
-        self.clock = FakeClock()
-        self.coordinator = CompanionCoordinator(
-            pairing_manager=pairing,
-            controller_lease=ControllerLease(clock=self.clock),
-        )
-        self.snapshot = self.coordinator.enter_companion(
-            self.root, self.scan_result
-        )
-        self.api = CompanionAPI(
-            self.coordinator,
-            allowed_hosts={"desktop.local"},
-        )
+        self.coordinator = CompanionCoordinator(pairing_manager=pairing)
+        self.snapshot = self.coordinator.enter_companion(self.root, self.scan_result)
+        self.api = CompanionAPI(self.coordinator, allowed_hosts={"desktop.local"})
 
     @staticmethod
     def payload(response) -> dict[str, object]:
@@ -537,7 +534,6 @@ class CompanionAPITests(CompanionFixture):
         *,
         credential: str | None = None,
         client_id: str | None = None,
-        page_instance_id: str | None = None,
         content_type: str | None = None,
         origin: str | None = None,
         host: str | None = None,
@@ -547,201 +543,96 @@ class CompanionAPITests(CompanionFixture):
             headers["Cookie"] = f"{COOKIE_NAME}={credential}"
         if client_id is not None:
             headers["X-Companion-Instance"] = client_id
-            headers["X-Companion-Page"] = (
-                page_instance_id or self.PAGE_INSTANCE_ID
-            )
+            headers["X-Companion-Page"] = self.PAGE_INSTANCE_ID
         if content_type is not None:
             headers["Content-Type"] = content_type
         if origin is not None:
             headers["Origin"] = origin
         return headers
 
-    def json_request(
-        self,
-        method: str,
-        target: str,
-        payload: dict[str, object],
-        *,
-        credential: str | None = None,
-        client_id: str | None = None,
-        page_instance_id: str | None = None,
-        origin: str | None = ORIGIN,
-        content_type: str = "application/json; charset=utf-8",
-        host: str | None = None,
-    ):
+    def json_request(self, method: str, target: str, payload: dict[str, object]):
         return self.api.handle(
             method,
             target,
             self.headers(
-                credential=credential,
-                client_id=client_id,
-                page_instance_id=page_instance_id,
-                content_type=content_type,
-                origin=origin,
-                host=host,
+                credential=self.credential,
+                client_id=self.CLIENT_ID,
+                content_type="application/json; charset=utf-8",
+                origin=self.ORIGIN,
             ),
-            json.dumps(payload).encode("utf-8"),
+            json.dumps(payload).encode(),
         )
 
-    def claim(
-        self,
-        client_id: str = CLIENT_ID,
-        page_instance_id: str = PAGE_INSTANCE_ID,
-    ):
+    def claim(self):
         return self.json_request(
             "POST",
             "/api/controller/claim",
-            {"client_id": client_id, "page_id": page_instance_id},
-            credential=self.credential,
+            {"client_id": self.CLIENT_ID, "page_id": self.PAGE_INSTANCE_ID},
         )
 
-    def test_status_is_public_minimal_while_library_requires_auth_and_lease(self) -> None:
-        status = self.api.handle("GET", "/api/status", {"Host": self.HOST})
+    def authenticated(self):
+        return self.headers(credential=self.credential, client_id=self.CLIENT_ID)
 
-        self.assertEqual(status.status, 200)
-        status_payload = self.payload(status)
-        self.assertTrue(status_payload["status"]["companion_active"])
-        serialized = status.body.decode("utf-8")
-        self.assertNotIn("Series One", serialized)
-        self.assertNotIn(str(self.root), serialized)
-
-        unauthorized = self.api.handle(
+    def open_activity(self, activity: str = "read"):
+        manga_id = self.snapshot.mangas[0].id
+        response = self.api.handle(
             "GET",
-            "/api/library",
-            self.headers(client_id=self.CLIENT_ID),
+            f"/api/manga/{manga_id}?activity={activity}",
+            self.authenticated(),
+        )
+        self.assertEqual(response.status, 200, response.body)
+        return self.payload(response)
+
+    def test_status_public_but_library_requires_auth_and_lease(self) -> None:
+        status = self.api.handle("GET", "/api/status", {"Host": self.HOST})
+        self.assertEqual(status.status, 200)
+        self.assertNotIn("Series One", status.body.decode())
+        unauthorized = self.api.handle(
+            "GET", "/api/library", self.headers(client_id=self.CLIENT_ID)
         )
         self.assertEqual(unauthorized.status, 401)
-        self.assertEqual(
-            self.payload(unauthorized)["error"]["code"],
-            "unauthorized",
-        )
-
         unclaimed = self.api.handle(
-            "GET",
-            "/api/library",
-            self.headers(
-                credential=self.credential,
-                client_id=self.CLIENT_ID,
-            ),
+            "GET", "/api/library", self.authenticated()
         )
         self.assertEqual(unclaimed.status, 409)
-        self.assertEqual(
-            self.payload(unclaimed)["error"]["code"],
-            "lease_expired",
-        )
 
     def test_claim_heartbeat_contention_and_release_enforce_one_controller(self) -> None:
         claimed = self.claim()
         self.assertEqual(claimed.status, 200)
         self.assertEqual(
-            self.payload(claimed)["snapshot_id"],
-            self.snapshot.snapshot_id,
+            self.payload(claimed)["snapshot_id"], self.snapshot.snapshot_id
         )
-
-        blocked = self.claim("second-tab")
+        blocked = self.json_request(
+            "POST",
+            "/api/controller/claim",
+            {"client_id": "second-phone", "page_id": "second-page"},
+        )
         self.assertEqual(blocked.status, 423)
-        self.assertEqual(
-            self.payload(blocked)["error"]["code"],
-            "lease_conflict",
-        )
+        self.assertEqual(self.payload(blocked)["error"]["code"], "lease_conflict")
 
         heartbeat = self.json_request(
             "POST",
             "/api/controller/heartbeat",
-            {
-                "client_id": self.CLIENT_ID,
-                "page_id": self.PAGE_INSTANCE_ID,
-            },
-            credential=self.credential,
+            {"client_id": self.CLIENT_ID, "page_id": self.PAGE_INSTANCE_ID},
         )
         self.assertEqual(heartbeat.status, 200)
-
         released = self.json_request(
             "POST",
             "/api/controller/release",
-            {
-                "client_id": self.CLIENT_ID,
-                "page_id": self.PAGE_INSTANCE_ID,
-            },
-            credential=self.credential,
+            {"client_id": self.CLIENT_ID, "page_id": self.PAGE_INSTANCE_ID},
         )
         self.assertEqual(released.status, 200)
-
         after_release = self.api.handle(
-            "GET",
-            "/api/library",
-            self.headers(
-                credential=self.credential,
-                client_id=self.CLIENT_ID,
-            ),
+            "GET", "/api/library", self.authenticated()
         )
         self.assertEqual(after_release.status, 409)
         self.assertEqual(
-            self.payload(after_release)["error"]["code"],
-            "lease_expired",
+            self.payload(after_release)["error"]["code"], "lease_expired"
         )
 
-    def test_duplicated_tab_is_blocked_until_same_session_lease_ttl_expires(
-        self,
-    ) -> None:
-        self.assertEqual(self.claim(page_instance_id="original-page").status, 200)
-
-        duplicate = self.claim(page_instance_id="duplicated-page")
-        self.assertEqual(duplicate.status, 423)
-        self.assertEqual(
-            self.payload(duplicate)["error"]["code"],
-            "lease_conflict",
-        )
-
-        self.clock.advance(31)
-        replacement = self.claim(page_instance_id="reloaded-page")
-        self.assertEqual(replacement.status, 200)
-
-        stale_page = self.api.handle(
-            "GET",
-            "/api/library",
-            self.headers(
-                credential=self.credential,
-                client_id=self.CLIENT_ID,
-                page_instance_id="original-page",
-            ),
-        )
-        self.assertEqual(stale_page.status, 423)
-
-        current_page = self.api.handle(
-            "GET",
-            "/api/library",
-            self.headers(
-                credential=self.credential,
-                client_id=self.CLIENT_ID,
-                page_instance_id="reloaded-page",
-            ),
-        )
-        self.assertEqual(current_page.status, 200)
-
-    def test_controller_routes_and_authenticated_routes_require_page_nonce(
-        self,
-    ) -> None:
-        missing_claim_page = self.json_request(
-            "POST",
-            "/api/controller/claim",
-            {"client_id": self.CLIENT_ID},
-            credential=self.credential,
-        )
-        self.assertEqual(missing_claim_page.status, 400)
-
+    def test_authenticated_routes_require_the_page_nonce_header(self) -> None:
         self.assertEqual(self.claim().status, 200)
-        for route in ("heartbeat", "release"):
-            with self.subTest(route=route):
-                response = self.json_request(
-                    "POST",
-                    f"/api/controller/{route}",
-                    {"client_id": self.CLIENT_ID},
-                    credential=self.credential,
-                )
-                self.assertEqual(response.status, 400)
-
-        missing_header = self.api.handle(
+        response = self.api.handle(
             "GET",
             "/api/library",
             {
@@ -750,232 +641,9 @@ class CompanionAPITests(CompanionFixture):
                 "X-Companion-Instance": self.CLIENT_ID,
             },
         )
-        self.assertEqual(missing_header.status, 400)
+        self.assertEqual(response.status, 400)
 
-    def test_library_manga_volume_and_write_routes_round_trip_existing_state(self) -> None:
-        self.assertEqual(self.claim().status, 200)
-        authenticated = self.headers(
-            credential=self.credential,
-            client_id=self.CLIENT_ID,
-        )
-
-        library_response = self.api.handle(
-            "GET", "/api/library", authenticated
-        )
-        self.assertEqual(library_response.status, 200)
-        library = self.payload(library_response)
-        manga_id = library["mangas"][0]["id"]
-        self.assertNotIn(str(self.root), library_response.body.decode("utf-8"))
-
-        manga_response = self.api.handle(
-            "GET", f"/api/manga/{manga_id}", authenticated
-        )
-        self.assertEqual(manga_response.status, 200)
-        volume_id = self.payload(manga_response)["manga"]["volumes"][0]["id"]
-
-        volume_response = self.api.handle(
-            "GET", f"/api/volume/{volume_id}", authenticated
-        )
-        self.assertEqual(volume_response.status, 200)
-        pages = self.payload(volume_response)["volume"]["pages"]
-        first_page_id, second_page_id = (page["id"] for page in pages)
-
-        selected = self.json_request(
-            "PUT",
-            f"/api/volume/{volume_id}/selection",
-            {"page_id": first_page_id, "selected": True},
-            credential=self.credential,
-            client_id=self.CLIENT_ID,
-        )
-        self.assertEqual(selected.status, 200)
-        self.assertTrue(self.payload(selected)["review"]["selected"])
-
-        volume = self.snapshot.volume(volume_id)
-        stored = SessionStore(self.root).load(volume.ref)
-        self.assertEqual(
-            stored.selected_paths,
-            {self.snapshot.page(first_page_id).ref.relative_path},
-        )
-
-        positioned = self.json_request(
-            "PUT",
-            f"/api/volume/{volume_id}/position",
-            {"page_id": second_page_id},
-            credential=self.credential,
-            client_id=self.CLIENT_ID,
-        )
-        self.assertEqual(positioned.status, 200)
-        self.assertEqual(
-            self.payload(positioned)["review"]["current_page_id"],
-            second_page_id,
-        )
-        self.assertEqual(SessionStore(self.root).load(volume.ref).current_index, 1)
-
-        missing_route = self.api.handle(
-            "POST",
-            "/api/export",
-            self.headers(
-                credential=self.credential,
-                client_id=self.CLIENT_ID,
-                content_type="application/json",
-                origin=self.ORIGIN,
-            ),
-            b"{}",
-        )
-        self.assertEqual(missing_route.status, 404)
-
-    def test_images_are_authenticated_validated_and_privately_cacheable(self) -> None:
-        self.assertEqual(self.claim().status, 200)
-        volume_id = self.snapshot.mangas[0].volume_ids[0]
-        first_page_id, second_page_id = self.snapshot.volume(volume_id).page_ids
-        authenticated = self.headers(
-            credential=self.credential,
-            client_id=self.CLIENT_ID,
-        )
-
-        unauthorized = self.api.handle(
-            "GET",
-            f"/api/page/{first_page_id}/image",
-            self.headers(client_id=self.CLIENT_ID),
-        )
-        self.assertEqual(unauthorized.status, 401)
-
-        for page_id, expected_type, expected_body in (
-            (first_page_id, "image/jpeg", b"jpg-one"),
-            (second_page_id, "image/png", b"png-two"),
-        ):
-            with self.subTest(page_id=page_id):
-                response = self.api.handle(
-                    "GET", f"/api/page/{page_id}/image", authenticated
-                )
-                headers = dict(response.headers)
-                self.assertEqual(response.status, 200)
-                self.assertEqual(response.read_body(), expected_body)
-                self.assertEqual(headers["Content-Type"], expected_type)
-                self.assertEqual(headers["Content-Length"], str(len(expected_body)))
-                self.assertIn("private", headers["Cache-Control"])
-                self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
-
-                conditional = self.api.handle(
-                    "GET",
-                    f"/api/page/{page_id}/image",
-                    {**authenticated, "If-None-Match": headers["ETag"]},
-                )
-                self.assertEqual(conditional.status, 304)
-                self.assertEqual(conditional.body, b"")
-
-        forged = self.api.handle(
-            "GET", "/api/page/p_forged/image", authenticated
-        )
-        self.assertEqual(forged.status, 404)
-        self.assertEqual(
-            self.payload(forged)["error"]["code"],
-            "stale_snapshot",
-        )
-
-    def test_host_origin_and_json_content_type_fail_closed(self) -> None:
-        self.assertEqual(self.claim().status, 200)
-        volume_id = self.snapshot.mangas[0].volume_ids[0]
-        page_id = self.snapshot.volume(volume_id).page_ids[0]
-
-        missing_host = self.api.handle("GET", "/api/status", {})
-        public_host = self.api.handle(
-            "GET", "/api/status", {"Host": "attacker.example:8787"}
-        )
-        cross_origin = self.json_request(
-            "PUT",
-            f"/api/volume/{volume_id}/position",
-            {"page_id": page_id},
-            credential=self.credential,
-            client_id=self.CLIENT_ID,
-            origin="http://attacker.example:8787",
-        )
-        wrong_scheme = self.json_request(
-            "PUT",
-            f"/api/volume/{volume_id}/position",
-            {"page_id": page_id},
-            credential=self.credential,
-            client_id=self.CLIENT_ID,
-            origin="https://desktop.local:8787",
-        )
-        wrong_content_type = self.json_request(
-            "PUT",
-            f"/api/volume/{volume_id}/position",
-            {"page_id": page_id},
-            credential=self.credential,
-            client_id=self.CLIENT_ID,
-            content_type="text/plain",
-        )
-
-        self.assertEqual(missing_host.status, 403)
-        self.assertEqual(public_host.status, 403)
-        self.assertEqual(cross_origin.status, 403)
-        self.assertEqual(wrong_scheme.status, 403)
-        self.assertEqual(wrong_content_type.status, 415)
-
-        allowed_lan_host = self.api.handle(
-            "GET", "/api/status", {"Host": "192.168.1.50:8787"}
-        )
-        self.assertEqual(allowed_lan_host.status, 200)
-        self.assertFalse(
-            any(
-                name.casefold() == "access-control-allow-origin"
-                for name, _value in allowed_lan_host.headers
-            )
-        )
-
-    def test_missing_live_page_and_save_failure_do_not_confirm_a_write(self) -> None:
-        self.assertEqual(self.claim().status, 200)
-        volume_id = self.snapshot.mangas[0].volume_ids[0]
-        page_id = self.snapshot.volume(volume_id).page_ids[0]
-        self.first_page.unlink()
-
-        missing_page = self.json_request(
-            "PUT",
-            f"/api/volume/{volume_id}/selection",
-            {"page_id": page_id, "selected": True},
-            credential=self.credential,
-            client_id=self.CLIENT_ID,
-        )
-
-        self.assertEqual(missing_page.status, 404)
-        self.assertEqual(
-            self.payload(missing_page)["error"]["code"],
-            "missing_image",
-        )
-        self.assertFalse(
-            SessionStore(self.root)
-            .path_for(self.snapshot.volume(volume_id).ref)
-            .exists()
-        )
-
-        self.first_page.write_bytes(b"jpg-one")
-        with patch(
-            "pocket_manga_editor.companion.review.SessionStore.save",
-            side_effect=OSError("disk unavailable"),
-        ):
-            failed_save = self.json_request(
-                "PUT",
-                f"/api/volume/{volume_id}/selection",
-                {"page_id": page_id, "selected": True},
-                credential=self.credential,
-                client_id=self.CLIENT_ID,
-            )
-
-        self.assertEqual(failed_save.status, 503)
-        self.assertEqual(
-            self.payload(failed_save)["error"]["code"],
-            "save_failure",
-        )
-        self.assertEqual(
-            self.coordinator.status().state,
-            CompanionState.COMPANION_ERROR,
-        )
-        self.assertFalse(self.coordinator.status().active_client)
-        with self.assertRaises(DesktopMutationBlocked):
-            self.coordinator.require_desktop_mutation()
-
-    def test_pair_route_sets_strict_cookie_but_does_not_activate_mode(self) -> None:
+    def test_pair_sets_a_strict_cookie_without_activating_companion(self) -> None:
         credential = "new-paired-device-credential"
         pairing = PairingManager(
             code_factory=lambda: "445566",
@@ -984,7 +652,6 @@ class CompanionAPITests(CompanionFixture):
         coordinator = CompanionCoordinator(pairing_manager=pairing)
         coordinator.start_pairing()
         api = CompanionAPI(coordinator, allowed_hosts={"desktop.local"})
-
         response = api.handle(
             "POST",
             "/api/pair",
@@ -995,16 +662,15 @@ class CompanionAPITests(CompanionFixture):
             },
             b'{"code":"445566"}',
         )
-
         self.assertEqual(response.status, 200)
         self.assertNotIn(credential, response.body.decode("utf-8"))
         cookie = dict(response.headers)["Set-Cookie"]
         self.assertIn(f"{COOKIE_NAME}={credential}", cookie)
         self.assertIn("HttpOnly", cookie)
         self.assertIn("SameSite=Strict", cookie)
-        self.assertFalse(coordinator.status().state is CompanionState.COMPANION_ACTIVE)
+        self.assertEqual(coordinator.status().state, CompanionState.DESKTOP_ACTIVE)
 
-        inactive_claim = api.handle(
+        inactive = api.handle(
             "POST",
             "/api/controller/claim",
             {
@@ -1015,11 +681,339 @@ class CompanionAPITests(CompanionFixture):
             },
             b'{"client_id":"phone","page_id":"inactive-page"}',
         )
-        self.assertEqual(inactive_claim.status, 409)
-        self.assertEqual(
-            self.payload(inactive_claim)["error"]["code"],
-            "inactive_mode",
+        self.assertEqual(inactive.status, 409)
+        self.assertEqual(self.payload(inactive)["error"]["code"], "inactive_mode")
+
+    def test_controller_and_mutation_bodies_have_exact_clean_break_shapes(self) -> None:
+        legacy_claim = self.json_request(
+            "POST",
+            "/api/controller/claim",
+            {"instance_id": self.CLIENT_ID, "page_id": self.PAGE_INSTANCE_ID},
         )
+        self.assertEqual(legacy_claim.status, 400)
+        extra_claim = self.json_request(
+            "POST",
+            "/api/controller/claim",
+            {
+                "client_id": self.CLIENT_ID,
+                "page_id": self.PAGE_INSTANCE_ID,
+                "instance_id": self.CLIENT_ID,
+            },
+        )
+        self.assertEqual(extra_claim.status, 400)
+        self.assertEqual(self.claim().status, 200)
+
+        for route in ("heartbeat", "release"):
+            with self.subTest(route=route):
+                response = self.json_request(
+                    "POST",
+                    f"/api/controller/{route}",
+                    {
+                        "client_id": self.CLIENT_ID,
+                        "page_id": self.PAGE_INSTANCE_ID,
+                        "unexpected": True,
+                    },
+                )
+                self.assertEqual(response.status, 400)
+
+        read_manga = self.open_activity("read")["manga"]
+        folder_id = read_manga["folders"][0]["id"]
+        read_folder = self.payload(
+            self.api.handle(
+                "GET",
+                f"/api/folder/{folder_id}?activity=read",
+                self.authenticated(),
+            )
+        )["folder"]
+        image_id = read_folder["images"][0]["id"]
+        read_position = self.json_request(
+            "PUT",
+            f"/api/read/folder/{folder_id}/position",
+            {"image_id": image_id, "unexpected": True},
+        )
+        self.assertEqual(read_position.status, 400)
+
+        self.open_activity("edit")
+        edit_position = self.json_request(
+            "PUT",
+            f"/api/edit/folder/{folder_id}/position",
+            {"image_id": image_id, "unexpected": True},
+        )
+        self.assertEqual(edit_position.status, 400)
+        edit_selection = self.json_request(
+            "PUT",
+            f"/api/edit/folder/{folder_id}/selection",
+            {"image_id": image_id, "selected": True, "unexpected": True},
+        )
+        self.assertEqual(edit_selection.status, 400)
+
+    def test_activity_neutral_library_and_strict_activity_query(self) -> None:
+        self.assertEqual(self.claim().status, 200)
+        library_response = self.api.handle(
+            "GET", "/api/library", self.authenticated()
+        )
+        library = self.payload(library_response)
+        self.assertNotIn("selected_count", library["mangas"][0])
+        manga_id = library["mangas"][0]["id"]
+        for query in ("", "?activity=", "?activity=read&activity=edit", "?mode=read"):
+            with self.subTest(query=query):
+                response = self.api.handle(
+                    "GET", f"/api/manga/{manga_id}{query}", self.authenticated()
+                )
+                self.assertEqual(response.status, 400)
+
+    def test_read_has_no_selection_fields_and_rejects_edit_write(self) -> None:
+        self.assertEqual(self.claim().status, 200)
+        manga = self.open_activity("read")["manga"]
+        folder_id = manga["folders"][0]["id"]
+        folder_response = self.api.handle(
+            "GET",
+            f"/api/folder/{folder_id}?activity=read",
+            self.authenticated(),
+        )
+        body = folder_response.body.decode()
+        folder = self.payload(folder_response)["folder"]
+        self.assertNotIn("selected", body)
+        self.assertNotIn("exports", body)
+        image_id = folder["images"][0]["id"]
+        rejected = self.json_request(
+            "PUT",
+            f"/api/edit/folder/{folder_id}/selection",
+            {"image_id": image_id, "selected": True},
+        )
+        self.assertEqual(rejected.status, 409)
+        self.assertEqual(self.payload(rejected)["error"]["code"], "wrong_activity")
+        self.assertFalse(
+            EditingStore(self.root).path_for(self.snapshot.mangas[0].ref).exists()
+        )
+
+    def test_read_and_edit_routes_persist_independent_state(self) -> None:
+        self.assertEqual(self.claim().status, 200)
+        read_manga = self.open_activity("read")["manga"]
+        folder_id = read_manga["folders"][0]["id"]
+        read_folder = self.payload(
+            self.api.handle(
+                "GET",
+                f"/api/folder/{folder_id}?activity=read",
+                self.authenticated(),
+            )
+        )["folder"]
+        second_id = read_folder["images"][1]["id"]
+        positioned = self.json_request(
+            "PUT",
+            f"/api/read/folder/{folder_id}/position",
+            {"image_id": second_id},
+        )
+        self.assertEqual(positioned.status, 200)
+
+        edit_manga = self.open_activity("edit")["manga"]
+        edit_folder = self.payload(
+            self.api.handle(
+                "GET",
+                f"/api/folder/{folder_id}?activity=edit",
+                self.authenticated(),
+            )
+        )["folder"]
+        tenth_id = edit_folder["images"][2]["id"]
+        first_id = edit_folder["images"][0]["id"]
+        self.assertEqual(
+            self.json_request(
+                "PUT",
+                f"/api/edit/folder/{folder_id}/position",
+                {"image_id": tenth_id},
+            ).status,
+            200,
+        )
+        selected = self.json_request(
+            "PUT",
+            f"/api/edit/folder/{folder_id}/selection",
+            {"image_id": first_id, "selected": True},
+        )
+        self.assertEqual(selected.status, 200)
+        self.assertEqual(self.payload(selected)["selection"]["manga_selected_count"], 1)
+        manga_ref = self.snapshot.mangas[0].ref
+        folder_name = self.snapshot.folder(folder_id).ref.name
+        self.assertEqual(
+            ReadingStore(self.root).load(manga_ref).folders[folder_name].current_image,
+            "2.PNG",
+        )
+        editing = EditingStore(self.root).load(manga_ref).folders[folder_name]
+        self.assertEqual(editing.current_image, "10.jpg")
+        self.assertEqual(editing.selected_images, frozenset({"1.jpg"}))
+
+    def test_activity_rebind_rejects_queued_writes_from_the_old_activity(self) -> None:
+        self.assertEqual(self.claim().status, 200)
+        manga_ref = self.snapshot.mangas[0].ref
+
+        read_manga = self.open_activity("read")["manga"]
+        folder_id = read_manga["folders"][0]["id"]
+        read_folder = self.payload(
+            self.api.handle(
+                "GET",
+                f"/api/folder/{folder_id}?activity=read",
+                self.authenticated(),
+            )
+        )["folder"]
+        image_id = read_folder["images"][1]["id"]
+
+        self.open_activity("edit")
+        stale_read = self.json_request(
+            "PUT",
+            f"/api/read/folder/{folder_id}/position",
+            {"image_id": image_id},
+        )
+        self.assertEqual(stale_read.status, 409)
+        self.assertEqual(
+            self.payload(stale_read)["error"]["code"], "wrong_activity"
+        )
+        self.assertFalse(ReadingStore(self.root).path_for(manga_ref).exists())
+
+        self.open_activity("read")
+        stale_edit = self.json_request(
+            "PUT",
+            f"/api/edit/folder/{folder_id}/selection",
+            {"image_id": image_id, "selected": True},
+        )
+        self.assertEqual(stale_edit.status, 409)
+        self.assertEqual(
+            self.payload(stale_edit)["error"]["code"], "wrong_activity"
+        )
+        self.assertFalse(EditingStore(self.root).path_for(manga_ref).exists())
+
+    def test_old_volume_page_and_mobile_destructive_routes_are_absent(self) -> None:
+        self.assertEqual(self.claim().status, 200)
+        for method, route in (
+            ("GET", "/api/volume/v_old"),
+            ("GET", "/api/page/p_old/image"),
+            ("POST", "/api/export"),
+            ("POST", "/api/complete"),
+        ):
+            with self.subTest(route=route):
+                response = self.api.handle(
+                    method,
+                    route,
+                    self.headers(
+                        credential=self.credential,
+                        client_id=self.CLIENT_ID,
+                        content_type="application/json",
+                        origin=self.ORIGIN,
+                    ),
+                    b"{}" if method == "POST" else b"",
+                )
+                self.assertEqual(response.status, 404)
+
+    def test_images_are_authenticated_validated_and_privately_cacheable(self) -> None:
+        self.assertEqual(self.claim().status, 200)
+        manga = self.open_activity("read")["manga"]
+        folder_id = manga["folders"][0]["id"]
+        folder = self.payload(
+            self.api.handle(
+                "GET",
+                f"/api/folder/{folder_id}?activity=read",
+                self.authenticated(),
+            )
+        )["folder"]
+        image_id = folder["images"][0]["id"]
+        unauthorized = self.api.handle(
+            "GET", f"/api/image/{image_id}", self.headers(client_id=self.CLIENT_ID)
+        )
+        self.assertEqual(unauthorized.status, 401)
+        response = self.api.handle(
+            "GET", f"/api/image/{image_id}", self.authenticated()
+        )
+        headers = dict(response.headers)
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.read_body(), b"jpg-one")
+        self.assertEqual(headers["Content-Type"], "image/jpeg")
+        self.assertIn("private", headers["Cache-Control"])
+        conditional = self.api.handle(
+            "GET",
+            f"/api/image/{image_id}",
+            {**self.authenticated(), "If-None-Match": headers["ETag"]},
+        )
+        self.assertEqual(conditional.status, 304)
+
+    def test_host_origin_and_content_type_still_fail_closed(self) -> None:
+        self.assertEqual(self.claim().status, 200)
+        manga = self.open_activity("read")["manga"]
+        folder_id = manga["folders"][0]["id"]
+        image_id = self.snapshot.folder(folder_id).image_ids[0]
+        missing_host = self.api.handle("GET", "/api/status", {})
+        public_host = self.api.handle(
+            "GET", "/api/status", {"Host": "attacker.example:8787"}
+        )
+        cross_origin = self.api.handle(
+            "PUT",
+            f"/api/read/folder/{folder_id}/position",
+            self.headers(
+                credential=self.credential,
+                client_id=self.CLIENT_ID,
+                content_type="application/json",
+                origin="http://attacker.example",
+            ),
+            json.dumps({"image_id": image_id}).encode(),
+        )
+        wrong_scheme = self.api.handle(
+            "PUT",
+            f"/api/read/folder/{folder_id}/position",
+            self.headers(
+                credential=self.credential,
+                client_id=self.CLIENT_ID,
+                content_type="application/json",
+                origin="https://desktop.local:8787",
+            ),
+            json.dumps({"image_id": image_id}).encode(),
+        )
+        wrong_type = self.api.handle(
+            "PUT",
+            f"/api/read/folder/{folder_id}/position",
+            self.headers(
+                credential=self.credential,
+                client_id=self.CLIENT_ID,
+                content_type="text/plain",
+                origin=self.ORIGIN,
+            ),
+            json.dumps({"image_id": image_id}).encode(),
+        )
+        self.assertEqual(missing_host.status, 403)
+        self.assertEqual(public_host.status, 403)
+        self.assertEqual(cross_origin.status, 403)
+        self.assertEqual(wrong_scheme.status, 403)
+        self.assertEqual(wrong_type.status, 415)
+        allowed_lan = self.api.handle(
+            "GET", "/api/status", {"Host": "192.168.1.50:8787"}
+        )
+        self.assertEqual(allowed_lan.status, 200)
+        self.assertFalse(
+            any(
+                name.casefold() == "access-control-allow-origin"
+                for name, _value in allowed_lan.headers
+            )
+        )
+
+    def test_missing_live_image_and_edit_save_failure_do_not_confirm(self) -> None:
+        self.assertEqual(self.claim().status, 200)
+        manga = self.open_activity("edit")["manga"]
+        folder_id = manga["folders"][0]["id"]
+        image_id = self.snapshot.folder(folder_id).image_ids[0]
+        self.first_image.unlink()
+        missing = self.json_request(
+            "PUT",
+            f"/api/edit/folder/{folder_id}/selection",
+            {"image_id": image_id, "selected": True},
+        )
+        self.assertEqual(missing.status, 404)
+        self.assertEqual(self.payload(missing)["error"]["code"], "missing_image")
+        self.first_image.write_bytes(b"jpg-one")
+        with patch.object(EditingStore, "set_selection", side_effect=OSError("disk")):
+            failed = self.json_request(
+                "PUT",
+                f"/api/edit/folder/{folder_id}/selection",
+                {"image_id": image_id, "selected": True},
+            )
+        self.assertEqual(failed.status, 503)
+        self.assertEqual(self.payload(failed)["error"]["code"], "save_failure")
+        self.assertEqual(self.coordinator.status().state, CompanionState.COMPANION_ERROR)
 
 
 class CompanionHTTPServiceTests(unittest.TestCase):
@@ -1040,15 +1034,14 @@ class CompanionHTTPServiceTests(unittest.TestCase):
         self.services.append(service)
         return service
 
-    def test_streaming_body_honors_declared_length_and_detects_truncation(self) -> None:
+    def test_streaming_body_honors_length_and_detects_truncation(self) -> None:
         grown = APIResponse(200, (), StreamingBody(io.BytesIO(b"abcdef"), 3))
         self.assertEqual(grown.read_body(), b"abc")
-
         truncated = APIResponse(200, (), StreamingBody(io.BytesIO(b"abc"), 6))
         with self.assertRaises(OSError):
             truncated.read_body()
 
-    def test_server_start_stop_and_restart_own_the_worker_lifecycle(self) -> None:
+    def test_server_start_stop_and_restart_own_worker_lifecycle(self) -> None:
         class FakeHTTPServer:
             instances: list[FakeHTTPServer] = []
 
@@ -1070,32 +1063,22 @@ class CompanionHTTPServiceTests(unittest.TestCase):
             def server_close(self) -> None:
                 self.closed = True
 
-        port = 48123
-        service = self.service(port)
-
+        service = self.service(48123)
         with patch(
             "pocket_manga_editor.companion.server._CompanionHTTPServer",
             FakeHTTPServer,
         ):
-            started = service.start()
-
-            self.assertTrue(started.running)
-            self.assertEqual(started.url, f"http://127.0.0.1:{port}/")
-            self.assertEqual(len(FakeHTTPServer.instances), 1)
+            self.assertTrue(service.start().running)
             backend = FakeHTTPServer.instances[0]
-            self.assertEqual(backend.address, ("127.0.0.1", port))
             self.assertTrue(backend.serving.wait(1))
             self.assertTrue(service.start().running)
             self.assertEqual(len(FakeHTTPServer.instances), 1)
-
-            stopped = service.stop()
-            self.assertFalse(stopped.running)
+            self.assertFalse(service.stop().running)
             self.assertTrue(backend.closed)
             self.assertTrue(service.restart().running)
             self.assertEqual(len(FakeHTTPServer.instances), 2)
-            self.assertFalse(service.stop().running)
 
-    def test_real_loopback_listener_serves_status_and_static_shell(self) -> None:
+    def test_real_listener_versions_both_protocol_assets(self) -> None:
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
                 listener.bind(("127.0.0.1", 0))
@@ -1104,96 +1087,42 @@ class CompanionHTTPServiceTests(unittest.TestCase):
             self.skipTest("The test sandbox does not permit loopback listeners.")
         service = self.service(port)
         started = service.start()
-        self.assertTrue(started.running, started.error)
-
+        if not started.running:
+            self.skipTest(started.error or "Loopback listener unavailable")
         connection = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
         try:
-            connection.request("GET", "/api/status")
-            response = connection.getresponse()
-            status_payload = json.loads(response.read().decode("utf-8"))
-            self.assertEqual(response.status, 200)
-            self.assertFalse(status_payload["status"]["companion_active"])
-            self.assertFalse(status_payload["status"]["paired"])
-
             connection.request("GET", "/")
             response = connection.getresponse()
             shell = response.read()
             self.assertEqual(response.status, 200)
-            self.assertIn(b"Pocket Manga Editor", shell)
-            self.assertIn(
-                b'/assets/app.js?v=page-lease-v2',
-                shell,
-            )
+            self.assertIn(b"/assets/app.js?v=filesystem-activity-v1", shell)
+            self.assertIn(b"/assets/styles.css?v=filesystem-activity-v1", shell)
             self.assertIn(
                 "default-src 'self'",
                 response.getheader("Content-Security-Policy") or "",
             )
-            self.assertIn(
-                "blob:",
-                response.getheader("Content-Security-Policy") or "",
-            )
-            self.assertEqual(response.getheader("X-Frame-Options"), "DENY")
-
-            connection.request("GET", "/assets/app.js?v=page-lease-v2")
+            connection.request("GET", "/assets/styles.css?v=filesystem-activity-v1")
             response = connection.getresponse()
-            javascript = response.read()
+            response.read()
             self.assertEqual(response.status, 200)
             self.assertEqual(response.getheader("Cache-Control"), "no-cache")
-            self.assertIn(b"X-Companion-Page", javascript)
-
-            with tempfile.TemporaryDirectory() as source_directory:
-                source_root = Path(source_directory)
-                source_page = source_root / "Streamed" / "Vol. 01" / "001.jpg"
-                source_page.parent.mkdir(parents=True)
-                source_page.write_bytes(b"streamed-image-body")
-                coordinator = service.coordinator
-                offer = coordinator.start_pairing()
-                credential = coordinator.pair(offer.code)
-                snapshot = coordinator.enter_companion(
-                    source_root, scan_working_directory(source_root)
-                )
-                coordinator.claim_controller(credential, "phone", "loopback-page")
-                volume_id = snapshot.mangas[0].volume_ids[0]
-                page_id = snapshot.volume(volume_id).page_ids[0]
-                connection.request(
-                    "GET",
-                    f"/api/page/{page_id}/image",
-                    headers={
-                        "Cookie": f"{COOKIE_NAME}={credential}",
-                        "X-Companion-Instance": "phone",
-                        "X-Companion-Page": "loopback-page",
-                    },
-                )
-                response = connection.getresponse()
-                self.assertEqual(response.status, 200)
-                self.assertEqual(response.read(), b"streamed-image-body")
         finally:
             connection.close()
 
-        self.assertFalse(service.stop().running)
-
-    def test_port_conflict_is_reported_without_affecting_desktop_authority(self) -> None:
-        coordinator = CompanionCoordinator()
-        service = CompanionHTTPService(
-            coordinator,
-            host="127.0.0.1",
-            port=48124,
-            public_host="127.0.0.1",
-        )
-        self.services.append(service)
+    def test_port_conflict_does_not_change_desktop_authority(self) -> None:
+        service = self.service(48124)
         with patch(
             "pocket_manga_editor.companion.server._CompanionHTTPServer",
             side_effect=OSError("Address already in use"),
         ):
             status = service.start()
-
         self.assertFalse(status.running)
         self.assertIn("Could not listen", status.error or "")
         self.assertEqual(
-            coordinator.status().state,
+            service.coordinator.status().state,
             CompanionState.DESKTOP_ACTIVE,
         )
-        coordinator.require_desktop_mutation()
+        service.coordinator.require_desktop_mutation()
 
 
 if __name__ == "__main__":

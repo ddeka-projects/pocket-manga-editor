@@ -1,10 +1,10 @@
-"""PySide6 desktop interface for keyboard-first manga page review."""
+"""PySide6 desktop interface for keyboard-first manga image review."""
 
 from __future__ import annotations
 
 from collections import OrderedDict
-from decimal import Decimal, InvalidOperation
 from pathlib import Path
+import stat
 import time
 
 from PySide6.QtCore import QByteArray, QSettings, QSize, Qt, QTimer, QUrl
@@ -38,6 +38,7 @@ from PySide6.QtWidgets import (
 )
 
 from .companion import (
+    CompanionActivity,
     CompanionCoordinator,
     CompanionHTTPService,
     CompanionState,
@@ -48,18 +49,25 @@ from .companion_ui import CompanionConnectionDialog, CompanionStatusPanel
 from .completion import (
     CompletionBusyError,
     CompletionError,
-    CompletionPreview,
     CompletionRecoveryError,
     CompletionRecoveryResult,
     analyze_completion,
     complete_manga,
     recover_interrupted_completions,
 )
-from .exporter import ExportError, export_selected_pages, output_directory_for
+from .exporter import (
+    ExportBusyError,
+    ExportError,
+    ExportRecoveryError,
+    export_manga,
+    manga_output_directory,
+    recover_interrupted_exports,
+)
 from .library_lock import LibraryBusyError
-from .models import MangaRef, PageRef, ScanIssue, ScanResult, VolumeRef
+from .models import FolderRef, MangaRef, ScanIssue, ScanResult
+from .path_safety import is_link_or_reparse
 from .scanner import ScanError, scan_working_directory
-from .storage import SessionStore
+from .storage import EditingSnapshot, EditingStateError, EditingStore
 
 
 class ImageCanvas(QFrame):
@@ -74,7 +82,7 @@ class ImageCanvas(QFrame):
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
         self._source_pixmap = QPixmap()
-        self._page_cache: OrderedDict[str, tuple[QPixmap, str | None]] = OrderedDict()
+        self._image_cache: OrderedDict[str, tuple[QPixmap, str | None]] = OrderedDict()
         self._render_timer = QTimer(self)
         self._render_timer.setSingleShot(True)
         self._render_timer.timeout.connect(self._render_image)
@@ -96,8 +104,8 @@ class ImageCanvas(QFrame):
         self.badge.adjustSize()
         self.badge.hide()
 
-    def show_page(self, path: Path) -> str | None:
-        """Load a page and return an error message if Qt cannot decode it."""
+    def show_image(self, path: Path) -> str | None:
+        """Load an image and return an error message if Qt cannot decode it."""
 
         pixmap, error = self._load_source(path)
         self._source_pixmap = pixmap
@@ -110,20 +118,20 @@ class ImageCanvas(QFrame):
         self._render_image()
         return None
 
-    def preload_pages(self, paths: tuple[Path, ...]) -> None:
-        """Decode nearby pages while the user is reading the current page."""
+    def preload_images(self, paths: tuple[Path, ...]) -> None:
+        """Decode nearby images while the user is viewing the current image."""
 
         for path in paths:
             self._load_source(path)
 
     def clear_cache(self) -> None:
-        self._page_cache.clear()
+        self._image_cache.clear()
 
     def _load_source(self, path: Path) -> tuple[QPixmap, str | None]:
         key = str(path)
-        cached = self._page_cache.pop(key, None)
+        cached = self._image_cache.pop(key, None)
         if cached is not None:
-            self._page_cache[key] = cached
+            self._image_cache[key] = cached
             return cached
 
         reader = QImageReader(str(path))
@@ -135,11 +143,11 @@ class ImageCanvas(QFrame):
         else:
             result = (QPixmap.fromImage(image), None)
 
-        self._page_cache[key] = result
+        self._image_cache[key] = result
         # Current, previous, and next are enough to make ordinary review feel
-        # immediate without retaining an entire high-resolution volume.
-        while len(self._page_cache) > 3:
-            self._page_cache.popitem(last=False)
+        # immediate without retaining an entire high-resolution folder.
+        while len(self._image_cache) > 3:
+            self._image_cache.popitem(last=False)
         return result
 
     def show_message(self, message: str) -> None:
@@ -212,14 +220,16 @@ class MainWindow(QMainWindow):
         self._pending_mobile_context: MobileContext | None = None
         self.working_directory: Path | None = None
         self.scan_result = ScanResult((), ())
-        self.session_store: SessionStore | None = None
-        self.current_volume: VolumeRef | None = None
-        self.current_index = 0
-        self.selected_paths: set[str] = set()
+        self.editing_store: EditingStore | None = None
+        self.current_manga: MangaRef | None = None
+        self.current_folder: FolderRef | None = None
+        self.current_image_index = 0
+        self.selected_images: set[str] = set()
+        self.editing_snapshot: EditingSnapshot | None = None
         self._last_output_directory: Path | None = None
         self._pending_session_saves: OrderedDict[
             tuple[str, str, str],
-            tuple[SessionStore, VolumeRef, int, frozenset[str]],
+            tuple[EditingStore, MangaRef, FolderRef, str, frozenset[str]],
         ] = OrderedDict()
         self._close_requested = False
         self._session_save_timer = QTimer(self)
@@ -238,7 +248,7 @@ class MainWindow(QMainWindow):
         self.rescan_action.setEnabled(False)
         self.rescan_button.setEnabled(False)
         self.manga_combo.setEnabled(False)
-        self.volume_combo.setEnabled(False)
+        self.folder_combo.setEnabled(False)
         self._refresh_companion_status()
         self._companion_status_timer.start()
 
@@ -265,19 +275,19 @@ class MainWindow(QMainWindow):
         self.companion_action = QAction("Start Companion Mode…", self)
         self.companion_action.triggered.connect(self.start_companion_mode)
 
-        self.previous_action = QAction("Previous Page", self)
+        self.previous_action = QAction("Previous Image", self)
         self.previous_action.setShortcut(QKeySequence(Qt.Key.Key_Left))
         self.previous_action.triggered.connect(lambda: self.navigate(-1))
 
-        self.next_action = QAction("Next Page", self)
+        self.next_action = QAction("Next Image", self)
         self.next_action.setShortcut(QKeySequence(Qt.Key.Key_Right))
         self.next_action.triggered.connect(lambda: self.navigate(1))
 
-        self.previous_selected_action = QAction("Previous Selected Page", self)
+        self.previous_selected_action = QAction("Previous Selected Image", self)
         self.previous_selected_action.setShortcut(QKeySequence("Ctrl+Left"))
         self.previous_selected_action.triggered.connect(lambda: self.navigate_selected(-1))
 
-        self.next_selected_action = QAction("Next Selected Page", self)
+        self.next_selected_action = QAction("Next Selected Image", self)
         self.next_selected_action.setShortcut(QKeySequence("Ctrl+Right"))
         self.next_selected_action.triggered.connect(lambda: self.navigate_selected(1))
 
@@ -286,22 +296,22 @@ class MainWindow(QMainWindow):
         self.toggle_action.setAutoRepeat(False)
         self.toggle_action.triggered.connect(self.toggle_current_selection)
 
-        self.select_next_action = QAction("Select and Go to Next Page", self)
+        self.select_next_action = QAction("Select and Go to Next Image", self)
         self.select_next_action.setShortcuts(
             [QKeySequence(Qt.Key.Key_Return), QKeySequence(Qt.Key.Key_Enter)]
         )
         self.select_next_action.setAutoRepeat(False)
         self.select_next_action.triggered.connect(self.select_current_and_advance)
 
-        self.first_action = QAction("First Page", self)
+        self.first_action = QAction("First Image", self)
         self.first_action.setShortcut(QKeySequence(Qt.Key.Key_Home))
         self.first_action.triggered.connect(lambda: self.go_to_index(0))
 
-        self.last_action = QAction("Last Page", self)
+        self.last_action = QAction("Last Image", self)
         self.last_action.setShortcut(QKeySequence(Qt.Key.Key_End))
-        self.last_action.triggered.connect(self.go_to_last_page)
+        self.last_action.triggered.connect(self.go_to_last_image)
 
-        self.export_action = QAction("Export Selected Pages…", self)
+        self.export_action = QAction("Export Manga…", self)
         self.export_action.setShortcut(QKeySequence("Ctrl+S"))
         self.export_action.setAutoRepeat(False)
         self.export_action.triggered.connect(self.export_selection)
@@ -456,21 +466,21 @@ class MainWindow(QMainWindow):
         self.manga_combo.currentIndexChanged.connect(self._on_manga_changed)
         library_layout.addWidget(self.manga_combo)
 
-        volume_label = QLabel("Volume")
-        volume_label.setObjectName("fieldLabel")
-        library_layout.addWidget(volume_label)
-        self.volume_combo = QComboBox()
-        self.volume_combo.setMinimumWidth(0)
-        self.volume_combo.setSizePolicy(
+        image_folder_label = QLabel("Image folder")
+        image_folder_label.setObjectName("fieldLabel")
+        library_layout.addWidget(image_folder_label)
+        self.folder_combo = QComboBox()
+        self.folder_combo.setMinimumWidth(0)
+        self.folder_combo.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
         )
-        self.volume_combo.currentIndexChanged.connect(self._on_volume_changed)
-        library_layout.addWidget(self.volume_combo)
+        self.folder_combo.currentIndexChanged.connect(self._on_folder_changed)
+        library_layout.addWidget(self.folder_combo)
         sidebar_layout.addWidget(library_card)
 
         companion_card, companion_layout = _sidebar_card("Mobile Companion")
         companion_description = QLabel(
-            "Review and select pages from one paired phone on this local network."
+            "Read or edit manga from one paired phone on this local network."
         )
         companion_description.setObjectName("mutedLabel")
         companion_description.setWordWrap(True)
@@ -503,34 +513,34 @@ class MainWindow(QMainWindow):
         companion_layout.addLayout(companion_buttons)
         sidebar_layout.addWidget(companion_card)
 
-        page_card, page_layout = _sidebar_card("Current page")
+        image_card, image_layout = _sidebar_card("Current image")
         self.progress_label = QLabel("— / —")
         self.progress_label.setObjectName("progressLabel")
-        page_layout.addWidget(self.progress_label)
-        self.heading_label = QLabel("No volume open")
+        image_layout.addWidget(self.progress_label)
+        self.heading_label = QLabel("No image folder open")
         self.heading_label.setObjectName("headingLabel")
         self.heading_label.setWordWrap(True)
         self.heading_label.setSizePolicy(
             QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
         )
-        page_layout.addWidget(self.heading_label)
+        image_layout.addWidget(self.heading_label)
 
-        self.page_label = QLabel("No page selected")
-        self.page_label.setObjectName("mutedLabel")
-        self.page_label.setWordWrap(True)
-        self.page_label.setSizePolicy(
+        self.image_name_label = QLabel("No image selected")
+        self.image_name_label.setObjectName("mutedLabel")
+        self.image_name_label.setWordWrap(True)
+        self.image_name_label.setSizePolicy(
             QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
         )
-        self.page_label.setTextInteractionFlags(
+        self.image_name_label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
-        page_layout.addWidget(self.page_label)
+        image_layout.addWidget(self.image_name_label)
 
         self.save_status_label = QLabel("Progress autosaves")
         self.save_status_label.setObjectName("saveStatus")
         self.save_status_label.setProperty("error", False)
-        page_layout.addWidget(self.save_status_label)
-        sidebar_layout.addWidget(page_card)
+        image_layout.addWidget(self.save_status_label)
+        sidebar_layout.addWidget(image_card)
 
         review_card, review_layout = _sidebar_card("Review")
         self.selection_label = QLabel("0 selected")
@@ -548,7 +558,7 @@ class MainWindow(QMainWindow):
         controls_row.addWidget(self.next_button, 1)
         review_layout.addLayout(controls_row)
 
-        self.toggle_button = QPushButton("Select Page")
+        self.toggle_button = QPushButton("Select Image")
         self.toggle_button.setObjectName("selectButton")
         self.toggle_button.clicked.connect(self.toggle_current_selection)
         review_layout.addWidget(self.toggle_button)
@@ -559,7 +569,7 @@ class MainWindow(QMainWindow):
         sidebar_layout.addWidget(review_card)
 
         self.export_card, export_layout = _sidebar_card("Export")
-        self.export_button = QPushButton("Export Selected")
+        self.export_button = QPushButton("Export Manga")
         self.export_button.setObjectName("primaryButton")
         self.export_button.clicked.connect(self.export_selection)
         export_layout.addWidget(self.export_button)
@@ -569,7 +579,7 @@ class MainWindow(QMainWindow):
         self.complete_button = QPushButton("Complete Manga…")
         self.complete_button.setObjectName("dangerButton")
         self.complete_button.setToolTip(
-            "Move this manga's exported pages to Completed, then permanently "
+            "Move this manga's current output into a completed batch, then permanently "
             "delete its source folder and saved review data."
         )
         self.complete_button.clicked.connect(self.complete_current_manga)
@@ -589,7 +599,7 @@ class MainWindow(QMainWindow):
         shortcuts = (
             ("← →", "Navigate"),
             ("Space", "Toggle"),
-            ("Enter", "Select + next"),
+            ("Enter", "Select + next image"),
             ("? / F1", "All shortcuts"),
         )
         for index, (keys, description) in enumerate(shortcuts):
@@ -994,7 +1004,7 @@ class MainWindow(QMainWindow):
         )
 
     def end_companion_mode(self) -> None:
-        """Drain mobile writes, reload SessionStore, then restore desktop ownership."""
+        """Drain mobile writes, reload editing state, then restore desktop ownership."""
 
         coordinator = self.companion_coordinator
         if coordinator is None:
@@ -1017,9 +1027,11 @@ class MainWindow(QMainWindow):
                 QMessageBox.critical(self, "Recovery failed", str(exc))
                 return
             self._remember_mobile_context(self._pending_mobile_context)
-            self.current_volume = None
-            self.current_index = 0
-            self.selected_paths.clear()
+            self.current_manga = None
+            self.current_folder = None
+            self.current_image_index = 0
+            self.selected_images.clear()
+            self.editing_snapshot = None
             rescanned, _recovery = self._rescan()
             if rescanned:
                 try:
@@ -1031,7 +1043,7 @@ class MainWindow(QMainWindow):
                     return
                 self._pending_mobile_context = None
                 self._set_companion_ui(False)
-                self._set_review_enabled(self.current_volume is not None)
+                self._set_review_enabled(self.current_folder is not None)
             else:
                 self._set_companion_ui(True)
             self._refresh_companion_status()
@@ -1072,9 +1084,11 @@ class MainWindow(QMainWindow):
         self._remember_mobile_context(self._pending_mobile_context)
 
         self._session_save_timer.stop()
-        self.current_volume = None
-        self.current_index = 0
-        self.selected_paths.clear()
+        self.current_manga = None
+        self.current_folder = None
+        self.current_image_index = 0
+        self.selected_images.clear()
+        self.editing_snapshot = None
         self._last_output_directory = None
         self.canvas.clear_cache()
         rescanned, _recovery = self._rescan()
@@ -1099,26 +1113,17 @@ class MainWindow(QMainWindow):
             return
         self._pending_mobile_context = None
         self._set_companion_ui(False)
-        self._set_review_enabled(self.current_volume is not None)
+        self._set_review_enabled(self.current_folder is not None)
         self._refresh_companion_status()
         self.statusBar().showMessage(
             "Companion Mode ended; desktop progress was reloaded.", 6000
         )
 
     def _remember_mobile_context(self, context: MobileContext | None) -> None:
-        """Make the last confirmed phone volume the next desktop resume target."""
+        """Resume desktop editing only from a confirmed phone Edit context."""
 
-        if context is not None:
+        if context is not None and context.activity is CompanionActivity.EDIT:
             self.settings.setValue("library/last_manga", context.manga_name)
-            for manga in self.scan_result.mangas:
-                if manga.name != context.manga_name:
-                    continue
-                for volume in manga.volumes:
-                    if volume.display_name == context.volume_name:
-                        self.settings.setValue("library/last_volume", volume.identity)
-                        return
-                self.settings.remove("library/last_volume")
-                return
 
     def start_pairing(self) -> None:
         coordinator = self.companion_coordinator
@@ -1249,9 +1254,9 @@ class MainWindow(QMainWindow):
         self.rescan_action.setEnabled(not active and self.working_directory is not None)
         self.rescan_button.setEnabled(not active and self.working_directory is not None)
         self.manga_combo.setEnabled(not active and bool(self.scan_result.mangas))
-        self.volume_combo.setEnabled(not active and self.current_volume is not None)
+        self.folder_combo.setEnabled(not active and self.current_folder is not None)
         self.issues_button.setEnabled(not active)
-        self._set_review_enabled(not active and self.current_volume is not None)
+        self._set_review_enabled(not active and self.current_folder is not None)
 
     def _refresh_companion_status(self) -> None:
         coordinator = self.companion_coordinator
@@ -1289,9 +1294,10 @@ class MainWindow(QMainWindow):
         context_text = None
         if status.mobile_context is not None:
             context_text = (
+                f"{status.mobile_context.activity.value.title()} · "
                 f"{status.mobile_context.manga_name} · "
-                f"{status.mobile_context.volume_name} · "
-                f"Page {status.mobile_context.page_label}"
+                f"{status.mobile_context.folder_name} · "
+                f"{status.mobile_context.image_name}"
             )
         client_text = (
             "Connected phone"
@@ -1396,18 +1402,38 @@ class MainWindow(QMainWindow):
     def _set_working_directory(self, path: Path) -> None:
         if not self._desktop_mutation_allowed():
             return
-        # The previous library was saved before this method was called. Clear
-        # its in-memory volume before attaching a store rooted in the new
-        # library, otherwise the old session could be written into the new one.
-        self.current_volume = None
-        self.current_index = 0
-        self.selected_paths.clear()
+        raw_path = Path(path).expanduser()
+        try:
+            if is_link_or_reparse(raw_path):
+                raise OSError(
+                    "The working directory cannot be a symbolic link or junction."
+                )
+            information = raw_path.stat(follow_symlinks=False)
+            resolved_path = raw_path.resolve(strict=True)
+            if not stat.S_ISDIR(information.st_mode):
+                raise OSError("The working directory is not a folder.")
+        except OSError as exc:
+            QMessageBox.critical(
+                self,
+                "Could not use working folder",
+                f"{raw_path}\n\n{exc}",
+            )
+            self.statusBar().showMessage(f"Could not use working folder: {exc}", 10000)
+            return
+
+        # Detach the previous library before attaching a store rooted in the
+        # new one, otherwise an old immutable autosave could target this root.
+        self.current_manga = None
+        self.current_folder = None
+        self.current_image_index = 0
+        self.selected_images.clear()
+        self.editing_snapshot = None
         self._last_output_directory = None
         self.scan_result = ScanResult((), ())
         self._clear_review_display("Scanning working folder…")
         self._update_scan_issues()
-        self.working_directory = path.resolve()
-        self.session_store = SessionStore(self.working_directory)
+        self.working_directory = resolved_path
+        self.editing_store = EditingStore(self.working_directory)
         self.settings.setValue("library/working_directory", str(self.working_directory))
         self.folder_label.setText(str(self.working_directory))
         self.folder_label.setToolTip(str(self.working_directory))
@@ -1429,19 +1455,28 @@ class MainWindow(QMainWindow):
         if self.working_directory is None:
             return False, None
 
-        save_succeeded = self._save_session()
-        if require_save_success and not save_succeeded:
-            self.statusBar().showMessage(
-                "Library scan stopped because review progress was not saved.", 10000
-            )
-            return False, None
+        # Capture the preferred location before recovery.  An interrupted
+        # transaction may make the in-memory editing snapshot stale, so no
+        # autosave may run until both recovery passes have inspected their
+        # journals under the library lock.
+        preferred_manga = self.current_manga.name if self.current_manga else str(
+            self.settings.value("library/last_manga", "")
+        )
+        preferred_folder = self.current_folder.name if self.current_folder else None
+        export_recovery = None
         try:
+            # Output and editing.json must be reconciled before completion
+            # recovery or the scanner observes either managed tree.
+            export_recovery = recover_interrupted_exports(self.working_directory)
             recovery = recover_interrupted_completions(self.working_directory)
-        except CompletionBusyError as exc:
+        except (ExportBusyError, CompletionBusyError) as exc:
             self._session_save_timer.stop()
-            self.current_volume = None
-            self.current_index = 0
-            self.selected_paths.clear()
+            self._pending_session_saves.clear()
+            self.current_manga = None
+            self.current_folder = None
+            self.current_image_index = 0
+            self.selected_images.clear()
+            self.editing_snapshot = None
             self._last_output_directory = None
             self.canvas.clear_cache()
             self.scan_result = ScanResult((), ())
@@ -1457,46 +1492,72 @@ class MainWindow(QMainWindow):
             )
             self.statusBar().showMessage("Library busy; try Rescan again shortly.", 8000)
             return False, None
-        except CompletionError as exc:
+        except (ExportRecoveryError, CompletionError) as exc:
             # A recovery failure means source/output paths may be between their
             # active and staged locations. Never scan or autosave against that
             # uncertain filesystem state.
             self._session_save_timer.stop()
-            self.current_volume = None
-            self.current_index = 0
-            self.selected_paths.clear()
+            self._pending_session_saves.clear()
+            self.current_manga = None
+            self.current_folder = None
+            self.current_image_index = 0
+            self.selected_images.clear()
+            self.editing_snapshot = None
             self._last_output_directory = None
             self.canvas.clear_cache()
             self.scan_result = ScanResult((), ())
+            operation = (
+                "export" if isinstance(exc, ExportRecoveryError) else "completion"
+            )
             self._clear_review_display(
-                "An interrupted manga completion could not be recovered safely."
+                f"An interrupted manga {operation} could not be recovered safely."
             )
             self._update_scan_issues()
             QMessageBox.critical(
                 self,
-                "Completion recovery failed",
+                f"{operation.title()} recovery failed",
                 f"{exc}\n\nThe library was not scanned because files may be in "
                 "transition. Close other Pocket Manga Editor windows, then use "
-                "Rescan. If the problem remains, inspect the '.pme-completion-' "
-                "recovery folder reported by the error.",
+                "Rescan. If the problem remains, inspect the transaction folder "
+                "reported by the error.",
             )
-            self.statusBar().showMessage(f"Completion recovery failed: {exc}", 15000)
+            self.statusBar().showMessage(
+                f"{operation.title()} recovery failed: {exc}", 15000
+            )
             return False, None
 
-        preferred_manga = self.current_volume.manga_name if self.current_volume else str(
-            self.settings.value("library/last_manga", "")
+        recovered_state = bool(
+            (export_recovery is not None and export_recovery.recovered_count)
+            or recovery.recovered_count
         )
-        preferred_volume = (
-            self.current_volume.number
-            if self.current_volume
-            else _setting_decimal(self.settings, "library/last_volume")
-        )
+        if recovered_state:
+            # The recovered files, not a snapshot captured before recovery,
+            # are authoritative.  Detach and discard every queued immutable
+            # save before loading them again below.
+            self._session_save_timer.stop()
+            self._pending_session_saves.clear()
+            self.current_manga = None
+            self.current_folder = None
+            self.current_image_index = 0
+            self.selected_images.clear()
+            self.editing_snapshot = None
+            self._last_output_directory = None
+            self.canvas.clear_cache()
+        else:
+            save_succeeded = self._save_session()
+            if require_save_success and not save_succeeded:
+                self.statusBar().showMessage(
+                    "Library scan stopped because review progress was not saved.", 10000
+                )
+                return False, None
 
         try:
             self.scan_result = scan_working_directory(self.working_directory)
         except ScanError as exc:
-            self.current_volume = None
-            self.selected_paths.clear()
+            self.current_manga = None
+            self.current_folder = None
+            self.selected_images.clear()
+            self.editing_snapshot = None
             self.scan_result = ScanResult((), ())
             self._clear_review_display(str(exc))
             self._update_scan_issues()
@@ -1505,14 +1566,34 @@ class MainWindow(QMainWindow):
             return False, recovery
 
         self._update_scan_issues()
-        self._populate_mangas(preferred_manga, preferred_volume)
+        self._populate_mangas(preferred_manga, preferred_folder)
         manga_count = len(self.scan_result.mangas)
-        volume_count = sum(len(manga.volumes) for manga in self.scan_result.mangas)
+        folder_count = sum(len(manga.folders) for manga in self.scan_result.mangas)
         self.statusBar().showMessage(
-            f"Found {manga_count} manga and {volume_count} volume(s).", 5000
+            f"Found {manga_count} manga and {folder_count} image folder(s).", 5000
         )
-        if show_recovery_dialog and (recovery.recovered_count or recovery.warnings):
+        export_recovered = bool(
+            export_recovery is not None and export_recovery.recovered_count
+        )
+        if show_recovery_dialog and (
+            export_recovered
+            or recovery.recovered_count
+            or recovery.warnings
+        ):
             recovery_lines: list[str] = []
+            if export_recovery is not None:
+                if export_recovery.committed_count:
+                    recovery_lines.append(
+                        f"Finished {export_recovery.committed_count} interrupted export(s)."
+                    )
+                if export_recovery.rolled_back_count:
+                    recovery_lines.append(
+                        f"Restored {export_recovery.rolled_back_count} interrupted export(s)."
+                    )
+                if export_recovery.discarded_count:
+                    recovery_lines.append(
+                        f"Removed {export_recovery.discarded_count} empty export journal(s)."
+                    )
             if recovery.rolled_back_count:
                 recovery_lines.append(
                     f"Restored {recovery.rolled_back_count} interrupted completion(s)."
@@ -1525,7 +1606,7 @@ class MainWindow(QMainWindow):
             recovery_lines.extend(recovery.warnings)
             QMessageBox.warning(
                 self,
-                "Interrupted completion recovered",
+                "Interrupted operation recovered",
                 "\n".join(recovery_lines)
                 + "\n\nReview the restored library before continuing.",
             )
@@ -1533,7 +1614,7 @@ class MainWindow(QMainWindow):
         return True, recovery
 
     def _populate_mangas(
-        self, preferred_manga: str, preferred_volume: Decimal | None
+        self, preferred_manga: str, preferred_folder: str | None
     ) -> None:
         self.manga_combo.blockSignals(True)
         self.manga_combo.clear()
@@ -1542,20 +1623,21 @@ class MainWindow(QMainWindow):
         self.manga_combo.blockSignals(False)
 
         if not self.scan_result.mangas:
-            self.current_volume = None
-            self.selected_paths.clear()
-            self.volume_combo.clear()
+            self.current_manga = None
+            self.current_folder = None
+            self.selected_images.clear()
+            self.editing_snapshot = None
+            self.folder_combo.clear()
             self.manga_combo.setEnabled(False)
-            self.volume_combo.setEnabled(False)
+            self.folder_combo.setEnabled(False)
             self.heading_label.setText("No manga found")
             self.progress_label.setText("— / —")
-            self.page_label.setText(
-                "Expected folders: Vol. 01, or Vol. 01 Ch. 001 "
-                "(chapter name optional)"
+            self.image_name_label.setText(
+                "Each manga needs a direct folder containing JPG or PNG images."
             )
             self.canvas.show_message(
-                "No matching manga chapters were found in this working folder.\n\n"
-                "Use Rescan after adding chapter folders."
+                "No image-bearing manga folders were found in this working folder.\n\n"
+                "Use Rescan after adding image folders."
             )
             self._set_review_enabled(False)
             return
@@ -1570,217 +1652,320 @@ class MainWindow(QMainWindow):
         self.manga_combo.blockSignals(False)
         self.manga_combo.setEnabled(True)
         manga = self.manga_combo.currentData()
-        self._populate_volumes(manga, preferred_volume)
+        self._populate_folders(manga, preferred_folder)
 
     def _on_manga_changed(self, _index: int) -> None:
         if not self._desktop_mutation_allowed(notify=False):
             return
+        self._save_session()
         manga = self.manga_combo.currentData()
         if not isinstance(manga, MangaRef):
             return
-        preferred_volume = (
-            _setting_decimal(self.settings, "library/last_volume")
-            if manga.name == str(self.settings.value("library/last_manga", ""))
-            else None
-        )
-        self._populate_volumes(manga, preferred_volume)
+        self._populate_folders(manga, None)
 
-    def _populate_volumes(
-        self, manga: MangaRef, preferred_volume: Decimal | None
+    def _populate_folders(
+        self, manga: MangaRef, preferred_folder: str | None
     ) -> None:
-        self.volume_combo.blockSignals(True)
-        self.volume_combo.clear()
-        for volume in manga.volumes:
-            self.volume_combo.addItem(
-                f"{volume.display_name}  ·  {len(volume.pages)} pages",
-                volume,
+        self._save_session()
+        self.current_manga = manga
+        self.current_folder = None
+        self.current_image_index = 0
+        self.selected_images.clear()
+        self.editing_snapshot = None
+
+        if self.editing_store is None:
+            self._set_review_enabled(False)
+            return
+        try:
+            snapshot = self.editing_store.load(manga)
+        except OSError as exc:
+            self.folder_combo.clear()
+            self.folder_combo.setEnabled(False)
+            self.canvas.show_message("Editing state for this manga could not be loaded safely.")
+            self.heading_label.setText(manga.name)
+            self.image_name_label.setText(str(exc))
+            self._set_review_enabled(False)
+            QMessageBox.critical(
+                self,
+                "Editing state needs attention",
+                f"{exc}\n\nExport and completion remain disabled for this manga so "
+                "saved output ownership is not lost.",
+            )
+            return
+
+        self.editing_snapshot = snapshot
+        target_name = preferred_folder or snapshot.last_folder
+        self.folder_combo.blockSignals(True)
+        self.folder_combo.clear()
+        for folder in manga.folders:
+            self.folder_combo.addItem(folder.name, folder)
+            self.folder_combo.setItemData(
+                self.folder_combo.count() - 1,
+                f"{len(folder.images)} images",
+                Qt.ItemDataRole.ToolTipRole,
             )
 
         preferred_index = 0
-        for index, volume in enumerate(manga.volumes):
-            if preferred_volume is not None and volume.number == preferred_volume:
+        for index, folder in enumerate(manga.folders):
+            if target_name and folder.name == target_name:
                 preferred_index = index
                 break
-        self.volume_combo.setCurrentIndex(preferred_index)
-        self.volume_combo.blockSignals(False)
-        self.volume_combo.setEnabled(bool(manga.volumes))
-        self._load_volume(self.volume_combo.currentData())
+        self.folder_combo.setCurrentIndex(preferred_index)
+        self.folder_combo.blockSignals(False)
+        self.folder_combo.setEnabled(bool(manga.folders))
+        self._load_folder(self.folder_combo.currentData(), snapshot=snapshot)
 
-    def _on_volume_changed(self, _index: int) -> None:
+    def _on_folder_changed(self, _index: int) -> None:
         if not self._desktop_mutation_allowed(notify=False):
             return
-        self._load_volume(self.volume_combo.currentData())
+        self._load_folder(self.folder_combo.currentData())
 
-    def _load_volume(self, volume: object) -> None:
+    def _load_folder(
+        self,
+        folder: object,
+        *,
+        snapshot: EditingSnapshot | None = None,
+    ) -> None:
         self._save_session()
-        if not isinstance(volume, VolumeRef) or self.session_store is None:
-            self.current_volume = None
+        manga = self.current_manga
+        if (
+            not isinstance(folder, FolderRef)
+            or manga is None
+            or self.editing_store is None
+        ):
+            self.current_folder = None
             self._set_review_enabled(False)
             return
 
-        self.current_volume = volume
+        if snapshot is None:
+            try:
+                snapshot = self.editing_store.load(manga)
+            except OSError as exc:
+                self.current_folder = None
+                self._set_review_enabled(False)
+                QMessageBox.critical(self, "Editing state needs attention", str(exc))
+                return
+
+        self.current_folder = folder
+        self.editing_snapshot = snapshot
         self.canvas.clear_cache()
-        snapshot = self.session_store.load(volume)
-        self.current_index = snapshot.current_index
-        self.selected_paths = set(snapshot.selected_paths)
-        self._last_output_directory = output_directory_for(volume)
+        folder_state = snapshot.folders.get(folder.name)
+        image_names = {image.name for image in folder.images}
+        current_name = folder_state.current_image if folder_state is not None else ""
+        self.current_image_index = next(
+            (
+                index
+                for index, image in enumerate(folder.images)
+                if image.name == current_name
+            ),
+            0,
+        )
+        self.selected_images = (
+            set(folder_state.selected_images) & image_names
+            if folder_state is not None
+            else set()
+        )
+        try:
+            self._last_output_directory = manga_output_directory(
+                self.working_directory, manga
+            )
+        except OSError as exc:
+            # Output ownership is irrelevant to position/selection editing.
+            # Keep review available and let Export/Complete report their
+            # stricter managed-output validation when invoked.
+            self._last_output_directory = None
+            self.statusBar().showMessage(
+                f"Output is unavailable for this manga: {exc}", 10000
+            )
         self._set_save_status(False, "Progress autosaves")
-        self.settings.setValue("library/last_manga", volume.manga_name)
-        self.settings.setValue("library/last_volume", volume.identity)
+        self.settings.setValue("library/last_manga", manga.name)
         self._set_review_enabled(True)
-        self._show_current_page()
+        self._show_current_image()
         self.canvas.setFocus(Qt.FocusReason.OtherFocusReason)
 
         if snapshot.warnings:
             self.statusBar().showMessage(" ".join(snapshot.warnings), 10000)
 
-    def _show_current_page(self) -> None:
-        volume = self.current_volume
-        if volume is None or not volume.pages:
+    def _show_current_image(self) -> None:
+        manga = self.current_manga
+        folder = self.current_folder
+        if manga is None or folder is None or not folder.images:
             return
 
-        self.current_index = min(max(self.current_index, 0), len(volume.pages) - 1)
-        page = volume.pages[self.current_index]
-        display_error = self.canvas.show_page(page.source_path)
-        self.canvas.set_selected(page.relative_path in self.selected_paths)
-        self.heading_label.setText(f"{volume.manga_name}  ·  {volume.display_name}")
-        self.progress_label.setText(f"{self.current_index + 1} / {len(volume.pages)}")
-        page_details: list[str] = []
-        if page.chapter_number is not None:
-            page_details.append(f"Ch. {page.chapter_label}")
-            if page.chapter_title:
-                page_details.append(page.chapter_title)
-        page_details.append(f"Page {page.page_label}")
-        page_details.append(page.source_path.name)
-        self.page_label.setText("  ·  ".join(page_details))
-        self.page_label.setToolTip(str(page.source_path))
+        self.current_image_index = min(
+            max(self.current_image_index, 0), len(folder.images) - 1
+        )
+        image = folder.images[self.current_image_index]
+        display_error = self.canvas.show_image(image.path)
+        self.canvas.set_selected(image.name in self.selected_images)
+        self.heading_label.setText(f"{manga.name}  ·  {folder.name}")
+        self.progress_label.setText(
+            f"{self.current_image_index + 1} / {len(folder.images)}"
+        )
+        self.image_name_label.setText(image.name)
+        self.image_name_label.setToolTip(str(image.path))
         self._refresh_selection_controls()
-        QTimer.singleShot(50, self._preload_neighbor_pages)
+        QTimer.singleShot(50, self._preload_neighbor_images)
 
         if display_error:
             self.statusBar().showMessage(
-                f"Could not display {page.relative_path}: {display_error}", 8000
+                f"Could not display {folder.name}/{image.name}: {display_error}", 8000
             )
 
-    def _preload_neighbor_pages(self) -> None:
-        volume = self.current_volume
-        if volume is None:
+    def _preload_neighbor_images(self) -> None:
+        folder = self.current_folder
+        if folder is None:
             return
         neighbor_paths = tuple(
-            volume.pages[index].source_path
-            for index in (self.current_index + 1, self.current_index - 1)
-            if 0 <= index < len(volume.pages)
+            folder.images[index].path
+            for index in (
+                self.current_image_index + 1,
+                self.current_image_index - 1,
+            )
+            if 0 <= index < len(folder.images)
         )
-        self.canvas.preload_pages(neighbor_paths)
+        self.canvas.preload_images(neighbor_paths)
 
     def _refresh_selection_controls(self) -> None:
-        volume = self.current_volume
-        if volume is None or not volume.pages:
+        folder = self.current_folder
+        if folder is None or not folder.images:
             return
 
-        page = volume.pages[self.current_index]
-        is_selected = page.relative_path in self.selected_paths
-        selected_count = len(self.selected_paths)
+        image = folder.images[self.current_image_index]
+        is_selected = image.name in self.selected_images
+        folder_selected_count = len(self.selected_images)
+        other_selected_count = 0
+        has_prior_exports = False
+        if self.editing_snapshot is not None:
+            other_selected_count = sum(
+                len(state.selected_images)
+                for name, state in self.editing_snapshot.folders.items()
+                if name != folder.name
+            )
+            has_prior_exports = bool(self.editing_snapshot.exports)
+        manga_selected_count = folder_selected_count + other_selected_count
         desktop_enabled = self._desktop_mutation_allowed(notify=False)
         self.canvas.set_selected(is_selected)
-        self.toggle_button.setText("Deselect Page" if is_selected else "Select Page")
+        self.toggle_button.setText(
+            "Deselect Image" if is_selected else "Select Image"
+        )
         self.selection_label.setText(
-            f"✓ {selected_count} selected" if selected_count else "0 selected"
+            (
+                f"✓ {folder_selected_count} in folder · {manga_selected_count} total"
+                if manga_selected_count
+                else "0 selected"
+            )
         )
         self.export_button.setText(
-            f"Export {selected_count} Selected" if selected_count else "Export Selected"
+            f"Export Manga · {manga_selected_count} Selected"
+            if manga_selected_count
+            else "Synchronize Manga Output"
         )
-        self.export_button.setEnabled(desktop_enabled and selected_count > 0)
-        self.export_action.setEnabled(desktop_enabled and selected_count > 0)
-        self.clear_action.setEnabled(desktop_enabled and selected_count > 0)
-        self.previous_selected_action.setEnabled(desktop_enabled and selected_count > 0)
-        self.next_selected_action.setEnabled(desktop_enabled and selected_count > 0)
-        self.next_selected_button.setEnabled(desktop_enabled and selected_count > 0)
+        can_export = desktop_enabled and (manga_selected_count > 0 or has_prior_exports)
+        self.export_button.setEnabled(can_export)
+        self.export_action.setEnabled(can_export)
+        self.clear_action.setEnabled(desktop_enabled and folder_selected_count > 0)
+        self.previous_selected_action.setEnabled(
+            desktop_enabled and folder_selected_count > 0
+        )
+        self.next_selected_action.setEnabled(
+            desktop_enabled and folder_selected_count > 0
+        )
+        self.next_selected_button.setEnabled(
+            desktop_enabled and folder_selected_count > 0
+        )
 
     def navigate(self, offset: int) -> None:
         if not self._desktop_mutation_allowed():
             return
-        if self.current_volume is None:
+        folder = self.current_folder
+        if folder is None:
             return
-        target = self.current_index + offset
+        target = self.current_image_index + offset
         if target < 0:
-            self.statusBar().showMessage("Already at the first page.", 2500)
+            self.statusBar().showMessage("Already at the first image.", 2500)
             return
-        if target >= len(self.current_volume.pages):
-            self.statusBar().showMessage("Already at the last page.", 2500)
+        if target >= len(folder.images):
+            self.statusBar().showMessage("Already at the last image.", 2500)
             return
-        self.current_index = target
+        self.current_image_index = target
         self._schedule_session_save()
-        self._show_current_page()
+        self._show_current_image()
 
     def go_to_index(self, index: int) -> None:
         if not self._desktop_mutation_allowed():
             return
-        if self.current_volume is None:
+        folder = self.current_folder
+        if folder is None:
             return
-        target = min(max(index, 0), len(self.current_volume.pages) - 1)
-        if target == self.current_index:
+        target = min(max(index, 0), len(folder.images) - 1)
+        if target == self.current_image_index:
             self.statusBar().showMessage(
-                "Already at the first page." if target == 0 else "Already on this page.", 2500
+                "Already at the first image." if target == 0 else "Already on this image.",
+                2500,
             )
             return
-        self.current_index = target
+        self.current_image_index = target
         self._schedule_session_save()
-        self._show_current_page()
+        self._show_current_image()
 
-    def go_to_last_page(self) -> None:
+    def go_to_last_image(self) -> None:
         if not self._desktop_mutation_allowed():
             return
-        if self.current_volume is not None:
-            self.go_to_index(len(self.current_volume.pages) - 1)
+        if self.current_folder is not None:
+            self.go_to_index(len(self.current_folder.images) - 1)
 
     def navigate_selected(self, direction: int) -> None:
-        """Jump among selected pages, wrapping at either end."""
+        """Jump among selected images in the current folder, wrapping at either end."""
 
         if not self._desktop_mutation_allowed():
             return
 
-        volume = self.current_volume
-        if volume is None or not self.selected_paths:
+        folder = self.current_folder
+        if folder is None or not self.selected_images:
             return
 
         selected_indices = [
             index
-            for index, page in enumerate(volume.pages)
-            if page.relative_path in self.selected_paths
+            for index, image in enumerate(folder.images)
+            if image.name in self.selected_images
         ]
         if not selected_indices:
             return
 
         if direction < 0:
-            candidates = [index for index in selected_indices if index < self.current_index]
+            candidates = [
+                index for index in selected_indices if index < self.current_image_index
+            ]
             target = candidates[-1] if candidates else selected_indices[-1]
             wrapped = not candidates
         else:
-            candidates = [index for index in selected_indices if index > self.current_index]
+            candidates = [
+                index for index in selected_indices if index > self.current_image_index
+            ]
             target = candidates[0] if candidates else selected_indices[0]
             wrapped = not candidates
 
-        self.current_index = target
+        self.current_image_index = target
         self._schedule_session_save()
-        self._show_current_page()
+        self._show_current_image()
         if wrapped and len(selected_indices) > 1:
             edge = "last" if direction < 0 else "first"
-            self.statusBar().showMessage(f"Wrapped to the {edge} selected page.", 2500)
+            self.statusBar().showMessage(f"Wrapped to the {edge} selected image.", 2500)
 
     def toggle_current_selection(self) -> None:
         if not self._desktop_mutation_allowed():
             return
-        volume = self.current_volume
-        if volume is None:
+        folder = self.current_folder
+        if folder is None:
             return
-        page = volume.pages[self.current_index]
-        if page.relative_path in self.selected_paths:
-            self.selected_paths.remove(page.relative_path)
-            message = f"Deselected {_page_description(page)}."
+        image = folder.images[self.current_image_index]
+        if image.name in self.selected_images:
+            self.selected_images.remove(image.name)
+            message = f"Deselected {image.name}."
         else:
-            self.selected_paths.add(page.relative_path)
-            message = f"Selected {_page_description(page)}."
+            self.selected_images.add(image.name)
+            message = f"Selected {image.name}."
         self._save_session()
         self._refresh_selection_controls()
         self.statusBar().showMessage(message, 2000)
@@ -1788,36 +1973,36 @@ class MainWindow(QMainWindow):
     def select_current_and_advance(self) -> None:
         if not self._desktop_mutation_allowed():
             return
-        volume = self.current_volume
-        if volume is None:
+        folder = self.current_folder
+        if folder is None:
             return
-        page = volume.pages[self.current_index]
-        self.selected_paths.add(page.relative_path)
-        if self.current_index < len(volume.pages) - 1:
-            self.current_index += 1
+        image = folder.images[self.current_image_index]
+        self.selected_images.add(image.name)
+        if self.current_image_index < len(folder.images) - 1:
+            self.current_image_index += 1
             self._save_session()
-            self._show_current_page()
+            self._show_current_image()
         else:
             self._save_session()
             self._refresh_selection_controls()
-            self.statusBar().showMessage("Selected the final page of this volume.", 3000)
+            self.statusBar().showMessage("Selected the final image in this folder.", 3000)
 
     def clear_selections(self) -> None:
         if not self._desktop_mutation_allowed():
             return
-        if not self.selected_paths or self.current_volume is None:
+        if not self.selected_images or self.current_folder is None:
             return
         answer = QMessageBox.question(
             self,
             "Clear selections",
-            f"Clear all {len(self.selected_paths)} selections in "
-            f"{self.current_volume.display_name}?\n\n"
-            "Previously exported files will not be removed.",
+            f"Clear all {len(self.selected_images)} selections in "
+            f"{self.current_folder.name}?\n\n"
+            "Previously exported files will be removed only after the next manga export.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
         if answer == QMessageBox.StandardButton.Yes:
-            self.selected_paths.clear()
+            self.selected_images.clear()
             self._save_session()
             self._refresh_selection_controls()
             self.statusBar().showMessage("Selections cleared.", 3000)
@@ -1825,18 +2010,60 @@ class MainWindow(QMainWindow):
     def export_selection(self) -> None:
         if not self._desktop_mutation_allowed():
             return
-        volume = self.current_volume
-        if volume is None or not self.selected_paths or self.working_directory is None:
+        manga = self.current_manga
+        if (
+            manga is None
+            or self.current_folder is None
+            or self.working_directory is None
+            or self.editing_store is None
+        ):
             return
 
-        self._save_session()
-        destination = output_directory_for(volume)
+        if not self._save_session() or self._pending_session_saves:
+            QMessageBox.warning(
+                self,
+                "Progress has not finished saving",
+                "Export was not started because the latest editing state could not "
+                "be saved safely. Wait for the active library operation and try again.",
+            )
+            return
+        try:
+            snapshot = self.editing_store.load(manga)
+        except OSError as exc:
+            QMessageBox.critical(self, "Export failed", str(exc))
+            return
+        selected_count = sum(
+            len(folder_state.selected_images)
+            for folder_state in snapshot.folders.values()
+        )
+        affected_folders = {
+            name
+            for name, folder_state in snapshot.folders.items()
+            if folder_state.selected_images
+        } | set(snapshot.exports)
+        if not selected_count and not snapshot.exports:
+            QMessageBox.warning(
+                self, "Nothing to export", "Select at least one image before exporting."
+            )
+            return
+
+        try:
+            destination = manga_output_directory(self.working_directory, manga)
+        except OSError as exc:
+            QMessageBox.critical(
+                self,
+                "Export failed",
+                f"The manga output path is not safe to use:\n\n{exc}",
+            )
+            self.statusBar().showMessage(f"Export failed: {exc}", 10000)
+            return
         answer = QMessageBox.question(
             self,
-            "Export selected pages",
-            f"Copy {len(self.selected_paths)} selected page(s) to:\n\n{destination}\n\n"
-            "A repeat export removes app-managed pages that are no longer selected. "
-            "Unrelated files are preserved.",
+            "Synchronize manga output",
+            f"Synchronize {selected_count} selected image(s) across "
+            f"{len(affected_folders)} folder(s) to:\n\n{destination}\n\n"
+            "The output will exactly match current selections: newly selected images "
+            "are added and stale app-managed images are removed. Untracked files are preserved.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel,
         )
@@ -1844,32 +2071,127 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            result = export_selected_pages(
-                self.working_directory, volume, frozenset(self.selected_paths)
+            result = export_manga(self.working_directory, manga)
+        except ExportBusyError as exc:
+            QMessageBox.warning(
+                self,
+                "Library busy",
+                f"{exc}\n\nNo export was started. Try again after the active "
+                "library operation finishes.",
             )
+            self.statusBar().showMessage("Library busy; export was not started.", 8000)
+            return
+        except ExportRecoveryError as exc:
+            # An incomplete rollback can leave output/editing.json in either
+            # their active or journal locations. Detach before recovery so an
+            # autosave cannot alter the evidence needed to reconcile them.
+            self._session_save_timer.stop()
+            self._discard_pending_session_saves(manga)
+            self.current_manga = None
+            self.current_folder = None
+            self.current_image_index = 0
+            self.selected_images.clear()
+            self.editing_snapshot = None
+            self._last_output_directory = None
+            self.canvas.clear_cache()
+            rescanned, _recovery = self._rescan(show_recovery_dialog=False)
+            follow_up = (
+                "Automatic recovery completed and the library was reloaded. Review "
+                "the manga output before exporting again."
+                if rescanned
+                else "The library remains detached. Resolve the reported recovery "
+                "problem, then use Rescan."
+            )
+            QMessageBox.critical(
+                self,
+                "Export needs attention",
+                f"{exc}\n\n{follow_up}",
+            )
+            self.statusBar().showMessage(
+                "Export rollback was incomplete; review the recovered library.", 15000
+            )
+            return
         except ExportError as exc:
             QMessageBox.critical(self, "Export failed", str(exc))
             self.statusBar().showMessage(f"Export failed: {exc}", 10000)
             return
 
-        self._last_output_directory = result.output_directory
-        self.open_output_button.setEnabled(True)
-        stale_text = (
-            f"\nRemoved {result.removed_count} previously exported page(s) "
-            "that are no longer selected."
-            if result.removed_count
-            else ""
+        export_message = (
+            f"Synchronized manga output at:\n\n{result.output_directory}\n\n"
+            f"Added or refreshed: {result.copied_count}\n"
+            f"Retained unchanged: {result.retained_count}\n"
+            f"Removed stale: {result.removed_count}"
         )
-        QMessageBox.information(
-            self,
-            "Export complete",
-            f"Exported {result.copied_count} page(s) to:\n\n"
-            f"{result.output_directory}{stale_text}",
-        )
+        if result.warnings:
+            # A committed transaction may still own cleanup payload. Recover
+            # it before any position autosave can change editing.json's digest.
+            self._session_save_timer.stop()
+            self._discard_pending_session_saves(manga)
+            self.current_manga = None
+            self.current_folder = None
+            self.current_image_index = 0
+            self.selected_images.clear()
+            self.editing_snapshot = None
+            self._last_output_directory = None
+            self.canvas.clear_cache()
+            rescanned, _recovery = self._rescan(show_recovery_dialog=False)
+            export_message += (
+                "\n\nThe export was committed, but temporary cleanup needs "
+                "attention:\n• " + "\n• ".join(result.warnings)
+            )
+            export_message += (
+                "\n\nAutomatic recovery completed and the library was reloaded."
+                if rescanned
+                else "\n\nFollow-up recovery failed, so the library remains detached. "
+                "Resolve the reported problem and use Rescan."
+            )
+            QMessageBox.warning(
+                self, "Export complete with a warning", export_message
+            )
+        else:
+            self._last_output_directory = result.output_directory
+            try:
+                self.editing_snapshot = self.editing_store.load(manga)
+            except OSError as exc:
+                self._session_save_timer.stop()
+                self._discard_pending_session_saves(manga)
+                self.current_manga = None
+                self.current_folder = None
+                self.current_image_index = 0
+                self.selected_images.clear()
+                self.editing_snapshot = None
+                self._last_output_directory = None
+                self.canvas.clear_cache()
+                rescanned, _recovery = self._rescan(show_recovery_dialog=False)
+                QMessageBox.warning(
+                    self,
+                    "Export complete; reload needed",
+                    f"{export_message}\n\nThe export committed, but editing state "
+                    f"could not be reloaded:\n{exc}\n\n"
+                    + (
+                        "The library was recovered and reloaded; review it before continuing."
+                        if rescanned
+                        else "The library remains detached. Resolve the reported problem, "
+                        "then use Rescan."
+                    ),
+                )
+                self.statusBar().showMessage(
+                    "Export committed, but editing state needs to be reloaded.", 10000
+                )
+                return
+            self.open_output_button.setEnabled(result.output_directory.is_dir())
+            QMessageBox.information(self, "Export complete", export_message)
         self.statusBar().showMessage(
-            f"Exported {result.copied_count} selected page(s).", 5000
+            (
+                "Export committed, but temporary cleanup needs attention."
+                if result.warnings
+                else f"Synchronized {selected_count} selected image(s) across the manga."
+            ),
+            10000 if result.warnings else 5000,
         )
-        self.canvas.setFocus(Qt.FocusReason.OtherFocusReason)
+        if self.current_folder is not None:
+            self._refresh_selection_controls()
+            self.canvas.setFocus(Qt.FocusReason.OtherFocusReason)
 
     def open_output_directory(self) -> None:
         if not self._desktop_mutation_allowed():
@@ -1896,7 +2218,14 @@ class MainWindow(QMainWindow):
 
         # Flush any pending review change so all of this manga's state can be
         # removed as one completion batch.
-        self._save_session()
+        if not self._save_session() or self._pending_session_saves:
+            QMessageBox.warning(
+                self,
+                "Progress has not finished saving",
+                "Completion was not started because the latest editing state could "
+                "not be saved safely. Wait for the active library operation and try again.",
+            )
+            return
         try:
             preview = analyze_completion(self.working_directory, manga)
         except CompletionError as exc:
@@ -1904,48 +2233,24 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Cannot complete manga: {exc}", 10000)
             return
 
-        allow_volume_mismatch = False
-        manga_scan_issues = _scan_issues_for_manga(
-            self.scan_result.issues, manga.path
+        prior_batch_text = (
+            f"{len(preview.existing_batches)} earlier completed batch(es) will remain unchanged."
+            if preview.existing_batches
+            else "This will be the first completed batch for this manga."
         )
-        if preview.has_volume_mismatch or manga_scan_issues:
-            warning_details: list[str] = []
-            if preview.has_volume_mismatch:
-                warning_details.append(_completion_mismatch_text(preview))
-            if manga_scan_issues:
-                warning_details.append(
-                    "Source items skipped during scanning:\n"
-                    + _format_scan_issues(manga_scan_issues)
-                )
-            answer = QMessageBox.warning(
-                self,
-                "Review source and output differences",
-                f"The current source and output for {manga.name} require review "
-                "before completion.\n\n"
-                + "\n\n".join(warning_details)
-                + "\n\n"
-                "Completing anyway will permanently delete the entire source manga, "
-                "including missing, malformed, or skipped source items.\n\n"
-                "Continue to the final confirmation?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-                QMessageBox.StandardButton.Cancel,
-            )
-            if answer != QMessageBox.StandardButton.Yes:
-                return
-            allow_volume_mismatch = preview.has_volume_mismatch
-
-        history_text = _completion_history_text(preview)
-        output_names = ", ".join(volume.name for volume in preview.output_volumes)
         answer = QMessageBox.warning(
             self,
             "Permanently complete manga",
             f"Complete {manga.name}?\n\n"
-            f"Current output: {preview.total_image_count} page(s) in {output_names}."
-            f"{history_text}\n\n"
-            "Only pages already in Output will be kept; current selections are not "
-            "exported automatically. The current output will be moved into the "
-            "Completed folder. Saved selections and export bookkeeping for this "
-            "manga will be removed.\n\n"
+            f"Source image folders: {preview.source_folder_count}\n"
+            f"Exported folders: {preview.exported_folder_count}\n"
+            f"Exported images: {preview.total_image_count}\n"
+            f"Destination batch: {preview.destination_batch.name}\n\n"
+            f"{prior_batch_text}\n\n"
+            "Only images already in Output will be kept; current selections are not "
+            "exported automatically. The entire current output will become the new "
+            "immutable completed batch. Reading progress, editing selections, and "
+            "export bookkeeping for this active source will be removed.\n\n"
             f"The source folder will be permanently deleted:\n{preview.source_directory}\n\n"
             "This cannot be undone through Pocket Manga Editor.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
@@ -1956,12 +2261,7 @@ class MainWindow(QMainWindow):
 
         self._session_save_timer.stop()
         try:
-            result = complete_manga(
-                self.working_directory,
-                manga,
-                preview,
-                allow_volume_mismatch=allow_volume_mismatch,
-            )
+            result = complete_manga(self.working_directory, manga, preview)
         except CompletionBusyError as exc:
             self._flush_pending_session_saves()
             QMessageBox.warning(
@@ -1985,7 +2285,7 @@ class MainWindow(QMainWindow):
                 "Completion needs attention",
                 f"{exc}\n\nThe library was rescanned because some files may have "
                 f"moved.{recovery_text}\n\nReview the source, output, completed folder, and any "
-                "'.pme-completion-' recovery folder before trying again.",
+                "transaction folder reported by the error before trying again.",
             )
             self.statusBar().showMessage(
                 "Completion could not be rolled back completely; review the library.",
@@ -2018,10 +2318,10 @@ class MainWindow(QMainWindow):
         recovery_text = _completion_recovery_result_text(recovery)
         message = (
             f"Completed {manga.name}.\n\n"
-            f"Moved {result.total_image_count} page(s) to:\n"
-            f"{result.completed_directory}\n\n"
-            "The source manga and its saved review data were removed. A completion "
-            f"entry was added to the log.{cleanup_text}{recovery_text}"
+            f"Moved {result.total_image_count} image(s) to:\n"
+            f"{result.batch_directory}\n\n"
+            "The source manga and its active reading/editing state were removed. "
+            f"Earlier completed batches were left unchanged.{cleanup_text}{recovery_text}"
         )
         has_warning = bool(result.cleanup_warnings) or not rescanned
         if has_warning:
@@ -2031,7 +2331,7 @@ class MainWindow(QMainWindow):
         status_text = (
             f"Completed {manga.name}, but the library needs attention."
             if has_warning
-            else f"Completed {manga.name} with {result.total_image_count} page(s)."
+            else f"Completed {manga.name} with {result.total_image_count} image(s)."
         )
         self.statusBar().showMessage(status_text, 15000 if has_warning else 8000)
 
@@ -2041,13 +2341,14 @@ class MainWindow(QMainWindow):
         """Prevent pending saves from recreating state after destructive moves."""
 
         self._session_save_timer.stop()
-        self.current_volume = None
-        self.current_index = 0
-        self.selected_paths.clear()
+        self.current_manga = None
+        self.current_folder = None
+        self.current_image_index = 0
+        self.selected_images.clear()
+        self.editing_snapshot = None
         self._last_output_directory = None
         self.canvas.clear_cache()
         self.settings.remove("library/last_manga")
-        self.settings.remove("library/last_volume")
         return self._rescan(show_recovery_dialog=show_recovery_dialog)
 
     def _schedule_session_save(self) -> None:
@@ -2061,43 +2362,61 @@ class MainWindow(QMainWindow):
         self._session_save_timer.stop()
         if not self._desktop_mutation_allowed(notify=False):
             return not self._pending_session_saves
-        if self.current_volume is not None and self.session_store is not None:
-            store = self.session_store
-            volume = self.current_volume
+        if (
+            self.current_manga is not None
+            and self.current_folder is not None
+            and self.editing_store is not None
+            and self.current_folder.images
+        ):
+            store = self.editing_store
+            manga = self.current_manga
+            folder = self.current_folder
+            index = min(
+                max(self.current_image_index, 0), len(folder.images) - 1
+            )
+            current_image = folder.images[index].name
             key = (
                 str(store.working_directory.resolve()),
-                volume.manga_name,
-                volume.identity,
+                manga.name,
+                folder.name,
             )
             self._pending_session_saves[key] = (
                 store,
-                volume,
-                self.current_index,
-                frozenset(self.selected_paths),
+                manga,
+                folder,
+                current_image,
+                frozenset(self.selected_images),
             )
         return self._flush_pending_session_saves()
 
     def _flush_pending_session_saves(self) -> bool:
         """Persist queued immutable snapshots without retargeting a busy retry."""
 
-        last_error: OSError | None = None
+        last_error: Exception | None = None
         while self._pending_session_saves:
             key = next(iter(self._pending_session_saves))
-            store, volume, current_index, selected_paths = self._pending_session_saves[
-                key
-            ]
+            store, manga, folder, current_image, selected_images = (
+                self._pending_session_saves[key]
+            )
             try:
-                store.save(volume, current_index, selected_paths)
+                snapshot = store.save_folder(
+                    manga,
+                    folder.name,
+                    current_image,
+                    selected_images,
+                )
             except LibraryBusyError as exc:
                 self._set_save_status(False, "Waiting to save…")
                 self.save_status_label.setToolTip(str(exc))
                 self._session_save_timer.start(750)
                 return False
-            except OSError as exc:
+            except (EditingStateError, OSError) as exc:
                 last_error = exc
                 self._pending_session_saves.pop(key)
             else:
                 self._pending_session_saves.pop(key)
+                if self.current_manga is not None and self.current_manga.path == manga.path:
+                    self.editing_snapshot = snapshot
 
         if last_error is not None:
             self._set_save_status(True, "⚠ Progress not saved")
@@ -2117,10 +2436,10 @@ class MainWindow(QMainWindow):
     def _discard_pending_session_saves(self, manga: MangaRef) -> None:
         """Drop snapshots whose source was just permanently completed."""
 
-        for key, (_store, volume, _index, _selected) in tuple(
+        for key, (_store, saved_manga, _folder, _image, _selected) in tuple(
             self._pending_session_saves.items()
         ):
-            if volume.manga_path == manga.path:
+            if saved_manga.path == manga.path:
                 self._pending_session_saves.pop(key)
 
     def _set_save_status(self, error: bool, text: str) -> None:
@@ -2146,13 +2465,23 @@ class MainWindow(QMainWindow):
 
         self.previous_button.setEnabled(enabled)
         self.next_button.setEnabled(enabled)
-        self.next_selected_button.setEnabled(enabled and bool(self.selected_paths))
+        self.next_selected_button.setEnabled(enabled and bool(self.selected_images))
         self.toggle_button.setEnabled(enabled)
         self.complete_button.setEnabled(enabled)
-        has_selection = enabled and bool(self.selected_paths)
-        self.export_action.setEnabled(has_selection)
-        self.export_button.setEnabled(has_selection)
-        self.clear_action.setEnabled(has_selection)
+        has_folder_selection = enabled and bool(self.selected_images)
+        total_selection_count = len(self.selected_images)
+        has_prior_exports = False
+        if self.editing_snapshot is not None:
+            total_selection_count += sum(
+                len(state.selected_images)
+                for name, state in self.editing_snapshot.folders.items()
+                if self.current_folder is None or name != self.current_folder.name
+            )
+            has_prior_exports = bool(self.editing_snapshot.exports)
+        can_export = enabled and (total_selection_count > 0 or has_prior_exports)
+        self.export_action.setEnabled(can_export)
+        self.export_button.setEnabled(can_export)
+        self.clear_action.setEnabled(has_folder_selection)
         self.open_output_button.setEnabled(
             enabled
             and self._last_output_directory is not None
@@ -2161,16 +2490,16 @@ class MainWindow(QMainWindow):
 
     def _clear_review_display(self, message: str) -> None:
         self.manga_combo.blockSignals(True)
-        self.volume_combo.blockSignals(True)
+        self.folder_combo.blockSignals(True)
         self.manga_combo.clear()
-        self.volume_combo.clear()
+        self.folder_combo.clear()
         self.manga_combo.blockSignals(False)
-        self.volume_combo.blockSignals(False)
+        self.folder_combo.blockSignals(False)
         self.manga_combo.setEnabled(False)
-        self.volume_combo.setEnabled(False)
-        self.heading_label.setText("No volume open")
+        self.folder_combo.setEnabled(False)
+        self.heading_label.setText("No image folder open")
         self.progress_label.setText("— / —")
-        self.page_label.setText("")
+        self.image_name_label.setText("")
         self.selection_label.setText("0 selected")
         self.canvas.show_message(message)
         self._set_review_enabled(False)
@@ -2190,7 +2519,7 @@ class MainWindow(QMainWindow):
             f"The scan completed with {len(self.scan_result.issues)} non-fatal issue(s)."
         )
         dialog.setInformativeText(
-            "Folders or files that did not match the expected structure were skipped."
+            "Unsafe, unreadable, or unsupported source items were skipped."
         )
         dialog.setDetailedText(_format_scan_issues(self.scan_result.issues))
         dialog.exec()
@@ -2201,21 +2530,21 @@ class MainWindow(QMainWindow):
             "Keyboard shortcuts",
             "<h3>Review controls</h3>"
             "<table cellspacing='8'>"
-            "<tr><td><b>← / →</b></td><td>Previous or next page</td></tr>"
-            "<tr><td><b>Ctrl+← / Ctrl+→</b></td><td>Previous or next selected page</td></tr>"
-            "<tr><td><b>Space</b></td><td>Select or deselect the current page</td></tr>"
-            "<tr><td><b>Enter</b></td><td>Select the current page and advance</td></tr>"
-            "<tr><td><b>Home / End</b></td><td>Go to the first or last page</td></tr>"
-            "<tr><td><b>Ctrl+S</b></td><td>Export the current selection</td></tr>"
+            "<tr><td><b>← / →</b></td><td>Previous or next image</td></tr>"
+            "<tr><td><b>Ctrl+← / Ctrl+→</b></td><td>Previous or next selected image</td></tr>"
+            "<tr><td><b>Space</b></td><td>Select or deselect the current image</td></tr>"
+            "<tr><td><b>Enter</b></td><td>Select the current image and advance</td></tr>"
+            "<tr><td><b>Home / End</b></td><td>Go to the first or last image</td></tr>"
+            "<tr><td><b>Ctrl+S</b></td><td>Synchronize all manga selections to output</td></tr>"
             "<tr><td><b>F5</b></td><td>Rescan the working folder</td></tr>"
             "<tr><td><b>? / F1</b></td><td>Show this help</td></tr>"
             "</table>"
-            "<p>Selections and the current position are saved automatically. "
-            "Source JPG and PNG files are copied only when you export. Complete Manga "
-            "permanently deletes the source folder after destructive confirmation.</p>"
+            "<p>Editing selections and the current folder/image are saved automatically. "
+            "One export synchronizes every selected image folder in the manga. Complete "
+            "Manga permanently deletes the source folder after destructive confirmation.</p>"
             "<p>Companion Mode transfers review ownership to one paired phone on "
-            "the same trusted network. Desktop mutation controls remain locked until "
-            "Companion Mode ends.</p>",
+            "the same trusted network for either independent reading or shared editing. "
+            "Desktop mutation controls remain locked until Companion Mode ends.</p>",
         )
 
     def show_about(self) -> None:
@@ -2223,9 +2552,9 @@ class MainWindow(QMainWindow):
             self,
             "About Pocket Manga Editor",
             "<h3>Pocket Manga Editor</h3>"
-            "<p>A keyboard-first tool for reviewing manga folders, selecting from a "
-            "local-network phone companion, and exporting selected pages.</p>"
-            "<p>Development version 0.1.0</p>",
+            "<p>A filesystem-faithful tool for reading on a local-network phone, "
+            "editing selections on phone or desktop, and synchronizing manga output.</p>"
+            "<p>Development version 0.2.0</p>",
         )
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt API name
@@ -2236,18 +2565,22 @@ class MainWindow(QMainWindow):
                 if state is CompanionState.COMPANION_ACTIVE:
                     context = coordinator.begin_exit()
                     self._remember_mobile_context(context)
-                    self.current_volume = None
-                    self.current_index = 0
-                    self.selected_paths.clear()
+                    self.current_manga = None
+                    self.current_folder = None
+                    self.current_image_index = 0
+                    self.selected_images.clear()
+                    self.editing_snapshot = None
                     coordinator.finish_exit()
                 elif state is CompanionState.EXITING_COMPANION:
                     self._remember_mobile_context(
                         self._pending_mobile_context
                         or coordinator.status().mobile_context
                     )
-                    self.current_volume = None
-                    self.current_index = 0
-                    self.selected_paths.clear()
+                    self.current_manga = None
+                    self.current_folder = None
+                    self.current_image_index = 0
+                    self.selected_images.clear()
+                    self.editing_snapshot = None
                     coordinator.finish_exit()
                 elif state is CompanionState.COMPANION_ERROR:
                     answer = QMessageBox.warning(
@@ -2264,9 +2597,11 @@ class MainWindow(QMainWindow):
                         return
                     context = coordinator.begin_recovery()
                     self._remember_mobile_context(context)
-                    self.current_volume = None
-                    self.current_index = 0
-                    self.selected_paths.clear()
+                    self.current_manga = None
+                    self.current_folder = None
+                    self.current_image_index = 0
+                    self.selected_images.clear()
+                    self.editing_snapshot = None
                     rescanned, _recovery = self._rescan(
                         show_recovery_dialog=False
                     )
@@ -2298,51 +2633,6 @@ class MainWindow(QMainWindow):
         self.settings.setValue("window/main_splitter", self.main_splitter.saveState())
         self.settings.sync()
         event.accept()
-
-
-def _completion_mismatch_text(preview: CompletionPreview) -> str:
-    """Describe the current-batch volume difference for a warning dialog."""
-
-    source_text = ", ".join(preview.source_volumes) or "none"
-    output_text = ", ".join(volume.name for volume in preview.output_volumes) or "none"
-    details = [f"Source volumes: {source_text}", f"Output volumes: {output_text}"]
-    if preview.missing_volumes:
-        details.append("Missing from output: " + ", ".join(preview.missing_volumes))
-    if preview.unexpected_volumes:
-        details.append(
-            "Only in output: " + ", ".join(preview.unexpected_volumes)
-        )
-    return "\n".join(details)
-
-
-def _scan_issues_for_manga(
-    issues: tuple[ScanIssue, ...], manga_path: Path
-) -> tuple[ScanIssue, ...]:
-    """Return scan problems whose contents will be deleted by completion."""
-
-    return tuple(
-        issue
-        for issue in issues
-        if issue.path == manga_path or issue.path.is_relative_to(manga_path)
-    )
-
-
-def _completion_history_text(preview: CompletionPreview) -> str:
-    """Summarize recent batches without treating them as current requirements."""
-
-    if not preview.previous_completions:
-        return ""
-
-    recent = preview.previous_completions[-3:]
-    lines: list[str] = []
-    for completion in recent:
-        date = completion.completed_at.split("T", 1)[0]
-        volumes = ", ".join(completion.output_volumes) or "no volume folders"
-        lines.append(f"• {date}: {volumes} ({completion.image_count} page(s))")
-    older_count = len(preview.previous_completions) - len(recent)
-    if older_count:
-        lines.insert(0, f"• {older_count} earlier completion batch(es)")
-    return "\n\nPrevious completion history:\n" + "\n".join(lines)
 
 
 def _completion_recovery_result_text(
@@ -2398,18 +2688,3 @@ def _shortcut_hint(keys: str, description: str) -> QWidget:
     layout.addWidget(description_label)
     layout.addStretch(1)
     return item
-
-
-def _setting_decimal(settings: QSettings, key: str) -> Decimal | None:
-    try:
-        return Decimal(str(settings.value(key, "")))
-    except (InvalidOperation, ValueError):
-        return None
-
-
-def _page_description(page: PageRef) -> str:
-    """Return a concise selection message for chapter or direct-volume pages."""
-
-    if page.chapter_number is None:
-        return f"page {page.page_label}"
-    return f"Ch. {page.chapter_label} page {page.page_label}"

@@ -1,120 +1,113 @@
 # Companion Mode
 
-Companion Mode is a local-network extension of Pocket Manga Editor. The desktop
-process remains the only filesystem authority while one paired browser controls
-review position and page selections through the same `SessionStore` JSON used by
-the desktop UI.
+Companion Mode is a trusted-local-network extension of Pocket Manga Editor. The
+desktop process remains the only filesystem authority while one paired Home
+Screen app owns the mobile controller lease.
 
-## Architecture decision
+## Read and Edit activities
 
-The initial server uses Python's standard-library `ThreadingHTTPServer` in a
-dedicated daemon thread. It was selected instead of FastAPI/Uvicorn because the
-repository otherwise has no web runtime dependencies, the required route set is
-small, and the standard server provides explicit bind, shutdown, and testable
-request-dispatch behavior. The API dispatcher and ownership coordinator remain
-framework-independent so the transport can be replaced later without changing
-the persistence boundary.
+Tapping a manga always opens an activity choice before metadata is loaded:
 
-The server starts after the per-user `QLockFile` singleton is acquired and stays
-available for the desktop process lifetime. Outside Companion Mode it serves
-only the installable shell, pairing state, and a minimal inactive status. Library
-names, metadata, and images require a paired credential and the active controller
-lease.
+- **Read** uses only the manga's `reading.json`. It remembers a last folder and
+  one exact current filename per visited folder. It contains no selected counts,
+  selection controls, indicators, or selection requests.
+- **Edit** uses the same `editing.json` as the desktop. It remembers editing
+  position, exact selected filenames, and output ownership records.
 
-## Ownership model
-
-The coordinator has five states: desktop active, entering Companion, Companion
-active, exiting Companion, and Companion error. Desktop mutation methods check
-the coordinator gate even if their buttons have already been disabled. Mobile
-writes require all of the following:
-
-- Companion Mode is active.
-- The persistent device credential is valid.
-- The browser instance owns the single live controller lease.
-- Every manga, volume, and page ID resolves through the active immutable
-  snapshot.
-- The live source file remains a regular JPG or PNG inside the expected manga
-  directory.
-
-Desktop autosaves are flushed before entry. Mobile selection and position
-commands are serialized and persisted before success is returned. Exit rejects
-new phone writes, drains the current command, discards the snapshot, rescans,
-and reloads `SessionStore` before desktop controls are enabled again.
-
-## Network setup
-
-1. Reserve the desktop PC's address in the router or DHCP server. An address such
-   as `192.168.1.20` is typical; use the value assigned by the user's own router.
-2. In Pocket Manga Editor's sidebar, find **Mobile Companion**, open
-   **Connection…**, enter that address, and choose a fixed port from `1024`
-   through `65535`.
-3. If the operating system asks whether Python may accept incoming connections,
-   permit it on private networks. Do not expose the port through router port
-   forwarding.
-4. Verify the displayed URL opens from Safari while the phone is on the same
-   Wi-Fi.
-5. Pair using the six-digit code displayed by the PC. The code expires after
-   five minutes and closes after repeated failed attempts.
-6. Add the stable page to the iPhone Home Screen. The manifest uses standalone
-   portrait mode, safe-area insets, and app icons included with the repository.
-
-The persistent browser credential is an HttpOnly, SameSite=Strict cookie. The PC
-stores only its SHA-256 verifier under the current user's application-data
-folder. A session-scoped client identity supports background reconnection, while
-a separate per-document claim prevents a duplicated tab from sharing the live
-controller lease. Protected requests carry both identities in
-`X-Companion-Instance` and `X-Companion-Page`; controller lifecycle requests
-also send them as `client_id` and `page_id`. Clearing Safari website data
-requires pairing again.
+Returning from the reader returns to the activity choice; returning again opens
+the manga library. Switching activity loads the other metadata document and
+does not carry position or selection presentation across the boundary.
 
 ## Reader controls
 
-The reader shows one contained page on a black viewport. In the middle reading
-band, the left 30% goes to the previous page, the center 40% sets selection, and
-the right 30% goes to the next page. Navigation never wraps. The lower band
-shows or hides the chrome; selection framing remains visible. The top controls
-return to the library or choose a volume, selected page, or any page. Only
-adjacent images are prefetched.
+Both activities show one contained image on a black viewport and prefetch only
+its adjacent images. In the middle band, the left 30% moves back, the center 40%
+shows or hides controls, and the right 30% moves forward. Navigation never wraps.
+In Edit, the lower band selects or deselects the image. In Read, that lower band
+is disabled and does not intercept taps.
+
+Folder and image pickers display exact source names. Edit also has a
+current-folder selected-image picker and the confirmed green frame/checkmark.
+There is no decorative navigation delay or routine Selected/Deselected message.
+
+## Ownership and persistence
+
+The coordinator retains its fail-closed desktop/Companion state machine. Before
+entry, desktop editing is saved and the library is rescanned into an immutable
+opaque-ID snapshot. While Companion is active, desktop navigation, selections,
+export, completion, rescan, and folder changes remain disabled for both Read
+and Edit.
+
+Every protected request requires:
+
+- active Companion ownership;
+- the paired-device credential;
+- the exact `(client_id, page_instance_id)` controller lease;
+- a current opaque manga, folder, and image ID;
+- a server-bound `read` or `edit` activity; and
+- a live regular JPG/PNG at the expected direct-child source path.
+
+The server rejects Edit selection calls while bound to Read before opening
+`editing.json`. Successful position and selection responses are returned only
+after the corresponding atomic JSON write succeeds. An Edit save failure keeps
+both writers blocked for recovery. A Read save failure keeps the last confirmed
+bookmark and never touches editing state.
+
+Ending Companion rejects new phone writes, drains the active request, rescans,
+and reloads desktop editing state before returning desktop authority. A final
+Read location does not move the desktop editor; a final Edit location does.
+
+## Network setup
+
+1. Reserve the PC's LAN address in the router or DHCP server.
+2. Under **Mobile Companion → Connection…**, enter that address and a fixed port
+   from `1024` through `65535`.
+3. Permit incoming private-network connections when the OS firewall asks. Never
+   expose the port through router forwarding.
+4. Open the displayed URL in Safari, pair with the six-digit code, then choose
+   **Share → Add to Home Screen**.
+
+The server runs in a dedicated standard-library HTTP thread after the desktop
+singleton is acquired. The persistent device credential is an HttpOnly,
+SameSite=Strict cookie; the PC stores only its SHA-256 verifier. Protected
+requests include `X-Companion-Instance` and `X-Companion-Page`. A separate
+per-document claim prevents a duplicated tab from sharing authority.
 
 ## Troubleshooting
 
 ### Connection refused
 
-Keep the desktop app running and awake. Confirm the phone is on the same LAN,
-the displayed IP still belongs to the PC, and the firewall permits the selected
-port. A loopback address such as `127.0.0.1` works only on the PC; configure the
-reserved LAN address for the phone.
+Keep the PC awake and the desktop app running. Confirm both devices are on the
+same LAN, the displayed address still belongs to the PC, and the firewall allows
+the chosen port. `127.0.0.1` is reachable only from the PC.
 
 ### Port already in use
 
-Desktop review remains usable. Open **Connection…**, choose another fixed port,
-save, and then update the Home Screen shortcut if its URL changed.
+Desktop editing remains available. Choose another fixed port under
+**Connection…** and update the Home Screen shortcut if the address changes.
 
 ### Pairing code rejected
 
-Generate a new code with **Pair Phone**. Codes expire and repeated incorrect
-attempts close the pairing window. If the phone was previously paired but its
-website data was cleared, use **Forget Phone** first and pair again.
+Generate a new code. Codes expire after five minutes and close after repeated
+failures. If Safari data was cleared, use **Forget Phone** and pair again.
 
 ### Companion is active elsewhere
 
-Only one browser instance may hold the controller lease. Return to the original
-Home Screen instance, wait through its reconnection grace period, or use
-**Disconnect Mobile Client** on the PC before retrying.
+Only one page instance may own the lease. Return to the original Home Screen
+instance, wait for its reclaim window to expire, or choose **Disconnect Mobile
+Client** on the PC.
 
 ### Desktop controls are disabled
 
-This is expected while Companion Mode owns review state. Use **End Companion
-Mode**. If an exit or save error is shown, correct the reported filesystem or
-lock issue and use the recovery/retry control; the coordinator deliberately
-keeps both writers blocked until the state is reconciled.
+This is expected during Companion ownership. Choose **End Companion Mode**. If
+an exit or Edit save error occurred, correct the reported filesystem/lock issue
+and use recovery; both writers stay blocked until the library is reconciled.
 
 ## Security boundary
 
-The initial release intentionally uses HTTP without transport encryption and is
-for a trusted local network only. Host and same-origin checks, short-lived
-pairing codes, a remembered device verifier, one-client leasing, opaque snapshot
-IDs, authenticated image routes, strict JSON writes, and path revalidation
-reduce accidental or cross-origin access. They do not make the service suitable
-for the public internet, hostile Wi-Fi, VPN publication, or router port
-forwarding.
+Companion deliberately uses unencrypted HTTP and is for a trusted LAN only.
+Host and same-origin validation, short-lived pairing, one-controller leasing,
+opaque snapshot IDs, activity authorization, strict JSON, authenticated image
+delivery, private media caching, and live path revalidation reduce accidental
+or cross-origin access. They do not make the service suitable for public Wi-Fi,
+the internet, VPN publication, or port forwarding.

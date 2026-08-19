@@ -23,7 +23,7 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setOrganizationName("Pocket Manga Editor")
     app.setApplicationName("Pocket Manga Editor")
-    app.setApplicationVersion("0.1.0")
+    app.setApplicationVersion("0.2.0")
     app.setStyle("Fusion")
 
     try:

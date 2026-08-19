@@ -13,6 +13,13 @@ class CompanionState(str, Enum):
     COMPANION_ERROR = "companion_error"
 
 
+class CompanionActivity(str, Enum):
+    """The metadata domain currently owned by the phone reader."""
+
+    READ = "read"
+    EDIT = "edit"
+
+
 class CompanionStateError(RuntimeError):
     """Base error for ownership or transition violations."""
 
@@ -29,6 +36,10 @@ class MobileAccessError(CompanionStateError):
 
 class ShutdownTransitionError(MobileAccessError):
     code = "shutdown_transition"
+
+
+class WrongActivityError(CompanionStateError):
+    code = "wrong_activity"
 
 
 _LEGAL_TRANSITIONS = {

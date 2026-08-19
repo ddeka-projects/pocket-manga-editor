@@ -9,6 +9,8 @@ from pathlib import Path
 import stat
 from typing import Iterator
 
+from .path_safety import is_link_or_reparse
+
 if os.name == "nt":  # pragma: no cover - exercised on Windows
     import msvcrt
 else:  # pragma: no cover - exercised on POSIX
@@ -31,8 +33,10 @@ def library_mutation_lock(working_directory: str | Path) -> Iterator[Path]:
     """Yield the resolved library root while holding its nonblocking lock."""
 
     raw_root = Path(working_directory).expanduser()
-    if raw_root.is_symlink():
-        raise LibraryLockError("The working directory cannot be a symbolic link.")
+    if is_link_or_reparse(raw_root):
+        raise LibraryLockError(
+            "The working directory cannot be a symbolic link or junction."
+        )
     try:
         root = raw_root.resolve(strict=True)
     except OSError as exc:
@@ -44,7 +48,7 @@ def library_mutation_lock(working_directory: str | Path) -> Iterator[Path]:
 
     metadata = root / ".pocket-manga-editor"
     if os.path.lexists(metadata):
-        if metadata.is_symlink() or not metadata.is_dir():
+        if is_link_or_reparse(metadata) or not metadata.is_dir():
             raise LibraryLockError("The app metadata folder is not a safe directory.")
         if not metadata.resolve().is_relative_to(root):
             raise LibraryLockError(
@@ -59,7 +63,7 @@ def library_mutation_lock(working_directory: str | Path) -> Iterator[Path]:
     descriptor: int | None = None
     try:
         if os.path.lexists(lock_path) and (
-            lock_path.is_symlink() or not lock_path.is_file()
+            is_link_or_reparse(lock_path) or not lock_path.is_file()
         ):
             raise LibraryLockError("The library mutation lock is not a safe file.")
         flags = os.O_RDWR | os.O_CREAT

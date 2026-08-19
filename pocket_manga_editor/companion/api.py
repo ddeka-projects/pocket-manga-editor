@@ -14,7 +14,7 @@ from pathlib import Path
 import socket
 import stat
 from typing import BinaryIO, Mapping
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 from .auth import (
     AuthenticationError,
@@ -24,9 +24,20 @@ from .auth import (
 )
 from .coordinator import CompanionCoordinator
 from .lease import LeaseConflictError, LeaseError, LeaseExpiredError
-from .review import ReviewError, ReviewMutation, ReviewSaveError
+from .review import (
+    PositionMutation,
+    ReviewError,
+    ReviewLoadError,
+    ReviewSaveError,
+    SelectionMutation,
+)
 from .snapshot import MissingImageError, SnapshotError
-from .state import CompanionState, CompanionStateError, ShutdownTransitionError
+from .state import (
+    CompanionActivity,
+    CompanionState,
+    CompanionStateError,
+    ShutdownTransitionError,
+)
 
 
 COOKIE_NAME = "pme_device"
@@ -118,7 +129,8 @@ class CompanionAPI:
         try:
             method = method.upper()
             self.validate_request(headers, mutating=method in {"POST", "PUT", "PATCH", "DELETE"})
-            path = urlsplit(target).path
+            parsed_target = urlsplit(target)
+            path = parsed_target.path
             segments = self._segments(path)
 
             if method == "GET" and segments == ["api", "status"]:
@@ -126,6 +138,7 @@ class CompanionAPI:
 
             if method == "POST" and segments == ["api", "pair"]:
                 payload = self._json_body(headers, body)
+                self._require_keys(payload, {"code"})
                 code = self._required_string(payload, "code", maximum=32)
                 credential = self.coordinator.pair(code)
                 cookie = (
@@ -140,6 +153,7 @@ class CompanionAPI:
 
             if method == "POST" and segments == ["api", "controller", "claim"]:
                 payload = self._json_body(headers, body)
+                self._require_keys(payload, {"client_id", "page_id"})
                 client_id = self._client_id_from_payload(payload)
                 page_instance_id = self._page_instance_id_from_payload(payload)
                 lease = self.coordinator.claim_controller(
@@ -160,6 +174,7 @@ class CompanionAPI:
 
             if method == "POST" and segments == ["api", "controller", "heartbeat"]:
                 payload = self._json_body(headers, body)
+                self._require_keys(payload, {"client_id", "page_id"})
                 client_id = self._client_id_from_payload(payload)
                 page_instance_id = self._page_instance_id_from_payload(payload)
                 lease = self.coordinator.heartbeat_controller(
@@ -180,6 +195,7 @@ class CompanionAPI:
 
             if method == "POST" and segments == ["api", "controller", "release"]:
                 payload = self._json_body(headers, body)
+                self._require_keys(payload, {"client_id", "page_id"})
                 client_id = self._client_id_from_payload(payload)
                 page_instance_id = self._page_instance_id_from_payload(payload)
                 self.coordinator.release_controller(
@@ -200,24 +216,40 @@ class CompanionAPI:
                 and len(segments) == 3
                 and segments[:2] == ["api", "manga"]
             )
-            is_volume = (
+            is_folder = (
                 method == "GET"
                 and len(segments) == 3
-                and segments[:2] == ["api", "volume"]
+                and segments[:2] == ["api", "folder"]
             )
             is_image = (
                 method == "GET"
-                and len(segments) == 4
-                and segments[:2] == ["api", "page"]
-                and segments[3] == "image"
+                and len(segments) == 3
+                and segments[:2] == ["api", "image"]
             )
-            is_volume_write = (
+            is_position_write = (
                 method == "PUT"
-                and len(segments) == 4
-                and segments[:2] == ["api", "volume"]
-                and segments[3] in {"position", "selection"}
+                and len(segments) == 5
+                and segments[0] == "api"
+                and segments[1] in {"read", "edit"}
+                and segments[2] == "folder"
+                and segments[4] == "position"
             )
-            if not any((is_library, is_manga, is_volume, is_image, is_volume_write)):
+            is_selection_write = (
+                method == "PUT"
+                and len(segments) == 5
+                and segments[:3] == ["api", "edit", "folder"]
+                and segments[4] == "selection"
+            )
+            if not any(
+                (
+                    is_library,
+                    is_manga,
+                    is_folder,
+                    is_image,
+                    is_position_write,
+                    is_selection_write,
+                )
+            ):
                 return self._error(
                     404, "not_found", "The requested API route does not exist."
                 )
@@ -231,17 +263,27 @@ class CompanionAPI:
                     ),
                 )
             if is_manga:
+                activity = self._activity_query(parsed_target.query)
                 return self._json(
                     200,
-                    self.coordinator.manga(
-                        credential, client_id, segments[2], page_instance_id
+                    self.coordinator.open_manga(
+                        credential,
+                        client_id,
+                        segments[2],
+                        activity,
+                        page_instance_id,
                     ),
                 )
-            if is_volume:
+            if is_folder:
+                activity = self._activity_query(parsed_target.query)
                 return self._json(
                     200,
-                    self.coordinator.volume(
-                        credential, client_id, segments[2], page_instance_id
+                    self.coordinator.folder(
+                        credential,
+                        client_id,
+                        segments[2],
+                        activity,
+                        page_instance_id,
                     ),
                 )
             if is_image:
@@ -252,16 +294,28 @@ class CompanionAPI:
                     segments[2],
                     headers,
                 )
-            if is_volume_write:
+            if is_position_write or is_selection_write:
                 payload = self._json_body(headers, body)
-                page_id = self._required_string(payload, "page_id", maximum=256)
-                if segments[3] == "position":
+                self._require_keys(
+                    payload,
+                    {"image_id"}
+                    if is_position_write
+                    else {"image_id", "selected"},
+                )
+                image_id = self._required_string(payload, "image_id", maximum=256)
+                folder_id = segments[3]
+                activity = CompanionActivity(segments[1])
+                if is_position_write:
                     mutation = self.coordinator.set_position(
                         credential,
                         client_id,
-                        segments[2],
-                        page_id,
+                        activity,
+                        folder_id,
+                        image_id,
                         page_instance_id,
+                    )
+                    return self._json(
+                        200, {"position": self._position(mutation)}
                     )
                 else:
                     selected = payload.get("selected")
@@ -270,12 +324,15 @@ class CompanionAPI:
                     mutation = self.coordinator.set_selection(
                         credential,
                         client_id,
-                        segments[2],
-                        page_id,
+                        activity,
+                        folder_id,
+                        image_id,
                         selected,
                         page_instance_id,
                     )
-                return self._json(200, {"review": self._mutation(mutation)})
+                    return self._json(
+                        200, {"selection": self._selection(mutation)}
+                    )
 
             return self._error(404, "not_found", "The requested API route does not exist.")
         except Exception as exc:
@@ -313,20 +370,20 @@ class CompanionAPI:
         credential: str | None,
         client_id: str,
         page_instance_id: str,
-        page_id: str,
+        image_id: str,
         headers: Mapping[str, str],
     ) -> APIResponse:
-        snapshot, page = self.coordinator.page_for_image(
-            credential, client_id, page_id, page_instance_id
+        snapshot, image = self.coordinator.image_for_delivery(
+            credential, client_id, image_id, page_instance_id
         )
-        source = Path(page.ref.source_path)
+        source = Path(image.ref.path)
         extension = source.suffix.casefold()
         if extension not in {".jpg", ".png"}:
             raise MissingImageError("The source image type is not supported.")
-        body, information = _open_validated_image(snapshot, page.id)
+        body, information = _open_validated_image(snapshot, image.id)
         mime = "image/jpeg" if extension == ".jpg" else "image/png"
         etag_value = hashlib.sha256(
-            f"{page.id}:{information.st_size}:{information.st_mtime_ns}".encode("ascii")
+            f"{image.id}:{information.st_size}:{information.st_mtime_ns}".encode("ascii")
         ).hexdigest()
         etag = f'"{etag_value}"'
         common = (
@@ -376,6 +433,24 @@ class CompanionAPI:
             raise RequestError("The request path is unsafe.")
         return segments
 
+    @staticmethod
+    def _activity_query(query: str) -> CompanionActivity:
+        try:
+            values = parse_qsl(
+                query,
+                keep_blank_values=True,
+                strict_parsing=True,
+                max_num_fields=2,
+            )
+        except ValueError as exc:
+            raise RequestError("The activity query is invalid.") from exc
+        if len(values) != 1 or values[0][0] != "activity":
+            raise RequestError("Exactly one activity query is required.")
+        try:
+            return CompanionActivity(values[0][1])
+        except ValueError as exc:
+            raise RequestError("activity must be read or edit.") from exc
+
     def _credential(self, headers: Mapping[str, str]) -> str | None:
         raw = self._header(headers, "Cookie")
         if not raw:
@@ -400,10 +475,18 @@ class CompanionAPI:
         return client_id, page_instance_id
 
     def _client_id_from_payload(self, payload: Mapping[str, object]) -> str:
-        value = payload.get("client_id", payload.get("instance_id"))
+        value = payload.get("client_id")
         if not isinstance(value, str) or not value:
             raise RequestError("client_id is required.")
         return value
+
+    @staticmethod
+    def _require_keys(
+        payload: Mapping[str, object], expected: set[str]
+    ) -> None:
+        if set(payload) != expected:
+            names = ", ".join(sorted(expected))
+            raise RequestError(f"The JSON body must contain exactly: {names}.")
 
     def _page_instance_id_from_payload(
         self, payload: Mapping[str, object]
@@ -461,11 +544,12 @@ class CompanionAPI:
         return ""
 
     @staticmethod
-    def _mutation(mutation: ReviewMutation) -> dict[str, object]:
-        payload = asdict(mutation)
-        if mutation.selected is None:
-            payload.pop("selected", None)
-        return payload
+    def _position(mutation: PositionMutation) -> dict[str, object]:
+        return asdict(mutation)
+
+    @staticmethod
+    def _selection(mutation: SelectionMutation) -> dict[str, object]:
+        return asdict(mutation)
 
     @staticmethod
     def _json(
@@ -529,6 +613,8 @@ class CompanionAPI:
                 exc.code,
                 "Review state could not be saved. Check Pocket Manga Editor on the PC.",
             )
+        if isinstance(exc, ReviewLoadError):
+            return self._error(409, exc.code, str(exc))
         if isinstance(exc, ReviewError):
             return self._error(400, exc.code, str(exc))
         if isinstance(exc, ShutdownTransitionError):
@@ -538,12 +624,12 @@ class CompanionAPI:
         return self._error(500, "internal_error", "The Companion service could not process this request.")
 
 
-def _open_validated_image(snapshot, page_id: str) -> tuple[StreamingBody, os.stat_result]:
-    """Open once, then prove the handle still names the validated mapped page."""
+def _open_validated_image(snapshot, image_id: str) -> tuple[StreamingBody, os.stat_result]:
+    """Open once, then prove the handle still names the validated mapped image."""
 
     try:
-        page = snapshot.validate_live_page(page_id)
-        source = Path(page.ref.source_path)
+        image = snapshot.validate_live_image(image_id)
+        source = Path(image.ref.path)
         resolved_source = source.resolve(strict=True)
         before = resolved_source.stat()
         flags = os.O_RDONLY
@@ -556,7 +642,7 @@ def _open_validated_image(snapshot, page_id: str) -> tuple[StreamingBody, os.sta
             opened = os.fstat(descriptor)
             if not stat.S_ISREG(opened.st_mode) or not os.path.samestat(before, opened):
                 raise OSError("source changed before it could be opened")
-            snapshot.validate_live_page(page_id)
+            snapshot.validate_live_image(image_id)
             after_path = source.resolve(strict=True)
             after = after_path.stat()
             if after_path != resolved_source or not os.path.samestat(opened, after):

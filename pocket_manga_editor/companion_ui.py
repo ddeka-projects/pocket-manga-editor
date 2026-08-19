@@ -123,12 +123,14 @@ class CompanionStatusPanel(QFrame):
         details.setHorizontalSpacing(16)
         details.setVerticalSpacing(12)
         details.setColumnStretch(1, 1)
-        self.url_label = self._add_detail(details, 0, "Mobile address", "Unavailable")
-        self.pairing_label = self._add_detail(details, 1, "Paired device", "None")
-        self.client_label = self._add_detail(details, 2, "Active controller", "None")
-        self.context_label = self._add_detail(details, 3, "Phone position", "Waiting")
-        self.selection_label = self._add_detail(details, 4, "Selected pages", "—")
-        self.code_label = self._add_detail(details, 5, "Pairing code", "Not open")
+        _, self.url_label = self._add_detail(details, 0, "Mobile address", "Unavailable")
+        _, self.pairing_label = self._add_detail(details, 1, "Paired device", "None")
+        _, self.client_label = self._add_detail(details, 2, "Active controller", "None")
+        _, self.context_label = self._add_detail(details, 3, "Phone position", "Waiting")
+        self.selection_title_label, self.selection_label = self._add_detail(
+            details, 4, "Selected images", "—"
+        )
+        _, self.code_label = self._add_detail(details, 5, "Pairing code", "Not open")
         self.url_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.code_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addLayout(details)
@@ -174,7 +176,7 @@ class CompanionStatusPanel(QFrame):
     @staticmethod
     def _add_detail(
         layout: QGridLayout, row: int, title: str, value: str
-    ) -> QLabel:
+    ) -> tuple[QLabel, QLabel]:
         title_label = QLabel(title)
         title_label.setObjectName("fieldLabel")
         title_label.setAlignment(Qt.AlignmentFlag.AlignTop)
@@ -183,7 +185,7 @@ class CompanionStatusPanel(QFrame):
         value_label.setWordWrap(True)
         layout.addWidget(title_label, row, 0)
         layout.addWidget(value_label, row, 1)
-        return value_label
+        return title_label, value_label
 
     def update_status(
         self,
@@ -208,6 +210,8 @@ class CompanionStatusPanel(QFrame):
         self.selection_label.setText(
             str(selected_count) if selected_count is not None else "—"
         )
+        self.selection_title_label.setVisible(selected_count is not None)
+        self.selection_label.setVisible(selected_count is not None)
         code_text = pairing_code or "Not open"
         if pairing_code and pairing_expires_text:
             code_text += f"  ·  expires {pairing_expires_text}"

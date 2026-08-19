@@ -8,7 +8,8 @@ import secrets
 from types import MappingProxyType
 from typing import Callable, Mapping
 
-from ..models import MangaRef, PageRef, ScanResult, VolumeRef
+from ..models import FolderRef, ImageRef, MangaRef, ScanResult
+from ..path_safety import is_link_or_reparse
 
 
 class SnapshotError(RuntimeError):
@@ -27,22 +28,22 @@ class MissingImageError(SnapshotError):
 class MangaSnapshotEntry:
     id: str
     ref: MangaRef
-    volume_ids: tuple[str, ...]
+    folder_ids: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
-class VolumeSnapshotEntry:
+class FolderSnapshotEntry:
     id: str
     manga_id: str
-    ref: VolumeRef
-    page_ids: tuple[str, ...]
+    ref: FolderRef
+    image_ids: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
-class PageSnapshotEntry:
+class ImageSnapshotEntry:
     id: str
-    volume_id: str
-    ref: PageRef
+    folder_id: str
+    ref: ImageRef
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,8 +55,8 @@ class LibrarySnapshot:
     issue_count: int
     mangas: tuple[MangaSnapshotEntry, ...]
     _manga_by_id: Mapping[str, MangaSnapshotEntry]
-    _volume_by_id: Mapping[str, VolumeSnapshotEntry]
-    _page_by_id: Mapping[str, PageSnapshotEntry]
+    _folder_by_id: Mapping[str, FolderSnapshotEntry]
+    _image_by_id: Mapping[str, ImageSnapshotEntry]
 
     @classmethod
     def build(
@@ -66,11 +67,12 @@ class LibrarySnapshot:
         id_factory: Callable[[], str] | None = None,
     ) -> "LibrarySnapshot":
         requested_root = Path(working_directory).expanduser()
-        if requested_root.is_symlink():
+        if is_link_or_reparse(requested_root):
             raise SnapshotError("The working directory is not a safe directory.")
         root = requested_root.resolve(strict=True)
         if not root.is_dir():
             raise SnapshotError("The working directory is not a safe directory.")
+
         make_id = id_factory or (lambda: secrets.token_urlsafe(18))
         used: set[str] = set()
 
@@ -89,12 +91,12 @@ class LibrarySnapshot:
 
         manga_entries: list[MangaSnapshotEntry] = []
         manga_map: dict[str, MangaSnapshotEntry] = {}
-        volume_map: dict[str, VolumeSnapshotEntry] = {}
-        page_map: dict[str, PageSnapshotEntry] = {}
+        folder_map: dict[str, FolderSnapshotEntry] = {}
+        image_map: dict[str, ImageSnapshotEntry] = {}
 
         for manga in scan_result.mangas:
             manga_path = Path(manga.path)
-            if manga_path.is_symlink() or not manga_path.is_dir():
+            if is_link_or_reparse(manga_path) or not manga_path.is_dir():
                 raise SnapshotError(f"Source manga no longer exists safely: {manga.name}")
             try:
                 resolved_manga = manga_path.resolve(strict=True)
@@ -102,34 +104,41 @@ class LibrarySnapshot:
                 raise SnapshotError(f"Could not resolve source manga '{manga.name}'.") from exc
             if resolved_manga.parent != root or resolved_manga.name != manga.name:
                 raise SnapshotError("A scanned manga is outside the working directory.")
+            if not manga.folders:
+                raise SnapshotError("A scanned manga has no readable image folders.")
 
             manga_id = opaque_id("m")
-            volume_ids: list[str] = []
-            if not manga.volumes:
-                raise SnapshotError("A scanned manga has no readable volumes.")
-            for volume in manga.volumes:
-                if volume.manga_name != manga.name or Path(volume.manga_path) != manga_path:
-                    raise SnapshotError("A scanned volume does not belong to its manga.")
-                volume_id = opaque_id("v")
-                volume_ids.append(volume_id)
-                page_ids: list[str] = []
-                if not volume.pages:
-                    raise SnapshotError("A scanned volume has no readable pages.")
-                for page in volume.pages:
-                    if (
-                        page.manga_name != manga.name
-                        or Path(page.manga_path) != manga_path
-                        or page.volume_number != volume.number
-                    ):
-                        raise SnapshotError("A scanned page does not belong to its volume.")
-                    _validate_page_path(root, resolved_manga, page)
-                    page_id = opaque_id("p")
-                    page_ids.append(page_id)
-                    page_map[page_id] = PageSnapshotEntry(page_id, volume_id, page)
-                volume_map[volume_id] = VolumeSnapshotEntry(
-                    volume_id, manga_id, volume, tuple(page_ids)
+            folder_ids: list[str] = []
+            for folder in manga.folders:
+                folder_path = Path(folder.path)
+                if folder_path.name != folder.name:
+                    raise SnapshotError("A scanned folder does not belong to its manga.")
+                resolved_folder = _validate_folder_path(
+                    root, resolved_manga, folder_path, folder.name
                 )
-            manga_entry = MangaSnapshotEntry(manga_id, manga, tuple(volume_ids))
+                if not folder.images:
+                    raise SnapshotError("A scanned folder has no readable images.")
+
+                folder_id = opaque_id("f")
+                folder_ids.append(folder_id)
+                image_ids: list[str] = []
+                for image in folder.images:
+                    if Path(image.path).parent != folder_path:
+                        raise SnapshotError("A scanned image does not belong to its folder.")
+                    _validate_image_path(
+                        root, resolved_manga, resolved_folder, image
+                    )
+                    image_id = opaque_id("i")
+                    image_ids.append(image_id)
+                    image_map[image_id] = ImageSnapshotEntry(
+                        image_id, folder_id, image
+                    )
+
+                folder_map[folder_id] = FolderSnapshotEntry(
+                    folder_id, manga_id, folder, tuple(image_ids)
+                )
+
+            manga_entry = MangaSnapshotEntry(manga_id, manga, tuple(folder_ids))
             manga_entries.append(manga_entry)
             manga_map[manga_id] = manga_entry
 
@@ -139,72 +148,117 @@ class LibrarySnapshot:
             len(scan_result.issues),
             tuple(manga_entries),
             MappingProxyType(manga_map),
-            MappingProxyType(volume_map),
-            MappingProxyType(page_map),
+            MappingProxyType(folder_map),
+            MappingProxyType(image_map),
         )
 
     def manga(self, manga_id: str) -> MangaSnapshotEntry:
         try:
             return self._manga_by_id[manga_id]
         except (KeyError, TypeError) as exc:
-            raise SnapshotLookupError("This manga ID is not in the active snapshot.") from exc
+            raise SnapshotLookupError(
+                "This manga ID is not in the active snapshot."
+            ) from exc
 
-    def volume(self, volume_id: str) -> VolumeSnapshotEntry:
+    def folder(self, folder_id: str) -> FolderSnapshotEntry:
         try:
-            return self._volume_by_id[volume_id]
+            return self._folder_by_id[folder_id]
         except (KeyError, TypeError) as exc:
-            raise SnapshotLookupError("This volume ID is not in the active snapshot.") from exc
+            raise SnapshotLookupError(
+                "This folder ID is not in the active snapshot."
+            ) from exc
 
-    def page(self, page_id: str) -> PageSnapshotEntry:
+    def image(self, image_id: str) -> ImageSnapshotEntry:
         try:
-            return self._page_by_id[page_id]
+            return self._image_by_id[image_id]
         except (KeyError, TypeError) as exc:
-            raise SnapshotLookupError("This page ID is not in the active snapshot.") from exc
+            raise SnapshotLookupError(
+                "This image ID is not in the active snapshot."
+            ) from exc
 
-    def page_in_volume(self, volume_id: str, page_id: str) -> PageSnapshotEntry:
-        volume = self.volume(volume_id)
-        page = self.page(page_id)
-        if page.volume_id != volume.id:
-            raise SnapshotLookupError("This page does not belong to the requested volume.")
-        return page
+    def image_in_folder(
+        self, folder_id: str, image_id: str
+    ) -> ImageSnapshotEntry:
+        folder = self.folder(folder_id)
+        image = self.image(image_id)
+        if image.folder_id != folder.id:
+            raise SnapshotLookupError(
+                "This image does not belong to the requested folder."
+            )
+        return image
 
-    def validate_live_page(self, page_id: str) -> PageSnapshotEntry:
-        page = self.page(page_id)
-        manga = Path(page.ref.manga_path)
+    def validate_live_image(self, image_id: str) -> ImageSnapshotEntry:
+        image = self.image(image_id)
+        folder = self.folder(image.folder_id)
+        manga = self.manga(folder.manga_id)
         try:
-            resolved_manga = manga.resolve(strict=True)
-        except OSError as exc:
-            raise SnapshotLookupError("The source manga is no longer available.") from exc
-        try:
-            _validate_page_path(self.working_directory, resolved_manga, page.ref)
-        except SnapshotError as exc:
+            manga_path = Path(manga.ref.path)
+            if is_link_or_reparse(manga_path):
+                raise SnapshotError("A source manga uses a linked path.")
+            resolved_manga = manga_path.resolve(strict=True)
+            resolved_folder = _validate_folder_path(
+                self.working_directory,
+                resolved_manga,
+                Path(folder.ref.path),
+                folder.ref.name,
+            )
+            _validate_image_path(
+                self.working_directory,
+                resolved_manga,
+                resolved_folder,
+                image.ref,
+            )
+        except (OSError, SnapshotError) as exc:
             raise MissingImageError(str(exc)) from exc
-        return page
+        return image
 
 
-def _validate_page_path(root: Path, resolved_manga: Path, page: PageRef) -> None:
-    manga = Path(page.manga_path)
-    source = Path(page.source_path)
-    if manga.is_symlink() or resolved_manga.parent != root:
-        raise SnapshotError("A source manga is no longer safely located.")
+def _validate_folder_path(
+    root: Path,
+    resolved_manga: Path,
+    folder_path: Path,
+    folder_name: str,
+) -> Path:
+    if is_link_or_reparse(folder_path):
+        raise SnapshotError("A source image folder uses a symlinked path.")
     try:
-        relative = source.relative_to(manga)
-    except ValueError as exc:
-        raise SnapshotError("A source page is outside its manga.") from exc
-    if page.relative_path != relative.as_posix():
-        raise SnapshotError("A source page has inconsistent relative metadata.")
-    candidate = manga
-    for part in relative.parts:
-        candidate = candidate / part
-        if candidate.is_symlink():
-            raise SnapshotError("A source page uses a symlinked path.")
+        resolved_folder = folder_path.resolve(strict=True)
+    except OSError as exc:
+        raise SnapshotError("A source image folder is no longer available.") from exc
+    if (
+        resolved_manga.parent != root
+        or not resolved_manga.is_dir()
+        or resolved_folder.parent != resolved_manga
+        or resolved_folder.name != folder_name
+        or not resolved_folder.is_dir()
+    ):
+        raise SnapshotError("A source image folder is not safely located.")
+    return resolved_folder
+
+
+def _validate_image_path(
+    root: Path,
+    resolved_manga: Path,
+    resolved_folder: Path,
+    image: ImageRef,
+) -> None:
+    source = Path(image.path)
+    if is_link_or_reparse(source):
+        raise SnapshotError("A source image uses a symlinked path.")
+    if (
+        resolved_manga.parent != root
+        or resolved_folder.parent != resolved_manga
+        or source.parent != resolved_folder
+        or source.name != image.name
+    ):
+        raise SnapshotError("A source image has inconsistent folder metadata.")
     try:
         resolved_source = source.resolve(strict=True)
     except OSError as exc:
-        raise SnapshotError("A source page is no longer available.") from exc
+        raise SnapshotError("A source image is no longer available.") from exc
     if (
-        not resolved_source.is_relative_to(resolved_manga)
+        resolved_source.parent != resolved_folder
         or not resolved_source.is_file()
         or resolved_source.suffix.casefold() not in {".jpg", ".png"}
     ):
-        raise SnapshotError("A source page is not a safe JPG or PNG.")
+        raise SnapshotError("A source image is not a safe JPG or PNG.")

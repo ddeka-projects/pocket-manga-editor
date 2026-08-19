@@ -4,6 +4,8 @@
   const HEARTBEAT_INTERVAL_MS = 12_000;
   const STATUS_POLL_INTERVAL_MS = 4_000;
   const REQUEST_TIMEOUT_MS = 15_000;
+  const READ = "read";
+  const EDIT = "edit";
 
   const ROUTES = Object.freeze({
     status: "/api/status",
@@ -12,11 +14,16 @@
     heartbeat: "/api/controller/heartbeat",
     release: "/api/controller/release",
     library: "/api/library",
-    manga: (id) => `/api/manga/${encodeURIComponent(id)}`,
-    volume: (id) => `/api/volume/${encodeURIComponent(id)}`,
-    image: (id) => `/api/page/${encodeURIComponent(id)}/image`,
-    position: (id) => `/api/volume/${encodeURIComponent(id)}/position`,
-    selection: (id) => `/api/volume/${encodeURIComponent(id)}/selection`,
+    manga: (id, activity) => (
+      `/api/manga/${encodeURIComponent(id)}?activity=${encodeURIComponent(activity)}`
+    ),
+    folder: (id, activity) => (
+      `/api/folder/${encodeURIComponent(id)}?activity=${encodeURIComponent(activity)}`
+    ),
+    image: (id) => `/api/image/${encodeURIComponent(id)}`,
+    readPosition: (id) => `/api/read/folder/${encodeURIComponent(id)}/position`,
+    editPosition: (id) => `/api/edit/folder/${encodeURIComponent(id)}/position`,
+    editSelection: (id) => `/api/edit/folder/${encodeURIComponent(id)}/selection`,
   });
 
   const element = (id) => document.getElementById(id);
@@ -39,9 +46,14 @@
     libraryList: element("library-list"),
     libraryEmpty: element("library-empty"),
     emptyRetry: element("empty-retry"),
+    activityScreen: element("activity-screen"),
+    activityTitle: element("activity-title"),
+    backToLibrary: element("back-to-library"),
+    chooseRead: element("choose-read"),
+    chooseEdit: element("choose-edit"),
     readerScreen: element("reader-screen"),
     readerStage: element("reader-stage"),
-    pageImage: element("page-image"),
+    imageDisplay: element("image-display"),
     selectionFrame: element("selection-frame"),
     selectionTab: element("selection-tab"),
     previousZone: element("previous-zone"),
@@ -49,12 +61,13 @@
     nextZone: element("next-zone"),
     chromeToggle: element("chrome-toggle"),
     topChrome: element("top-chrome"),
-    backToLibrary: element("back-to-library"),
-    volumePicker: element("volume-picker"),
+    backToActivities: element("back-to-activities"),
+    folderPicker: element("folder-picker"),
+    selectedPickerShell: element("selected-picker-shell"),
     selectedPicker: element("selected-picker"),
-    pagePicker: element("page-picker"),
-    bottomVolume: element("bottom-volume"),
-    bottomPage: element("bottom-page"),
+    imagePicker: element("image-picker"),
+    bottomFolder: element("bottom-folder"),
+    bottomPosition: element("bottom-position"),
     imageLoading: element("image-loading"),
     imageError: element("image-error"),
     imageRetry: element("image-retry"),
@@ -90,14 +103,16 @@
     stateAction: null,
     library: [],
     libraryIssueCount: 0,
-    libraryContext: null,
-    lastVolumeByManga: new Map(),
+    activityManga: null,
+    activity: null,
     currentManga: null,
-    currentVolume: null,
-    currentPageIndex: 0,
+    currentFolder: null,
+    currentImageIndex: 0,
     viewRequestToken: 0,
+    activityEpoch: 0,
     chromeVisible: true,
     selectionPending: new Map(),
+    selectionRequestTail: Promise.resolve(),
     actionRetry: null,
     toastTimer: 0,
     boundaryTimer: 0,
@@ -110,28 +125,28 @@
     prefetchedImages: new Map(),
     positionQueue: new Map(),
     positionFlushActive: false,
+    positionFlushPromise: Promise.resolve(),
+    mutationBarrierTail: Promise.resolve(),
+    activityOpening: false,
+    historyNavigationPending: false,
+    historyChangeToken: 0,
   };
 
   function getClientId() {
     const storageKey = "pocket-manga-companion-client";
-    // This stable identity supports background/reload reclaim. A separate
-    // in-memory pageInstanceId is included in every lease request so a copied
-    // sessionStorage value cannot let a duplicated tab share active authority.
     try {
       const existing = window.sessionStorage.getItem(storageKey);
       if (existing && /^[A-Za-z0-9._~-]{1,128}$/.test(existing)) {
         return existing;
       }
     } catch (_error) {
-      // Storage can be unavailable in privacy modes. The in-memory identity
-      // remains valid for this document lifetime.
+      // An in-memory identity remains valid when storage is unavailable.
     }
-
     const id = createOpaqueId();
     try {
       window.sessionStorage.setItem(storageKey, id);
     } catch (_error) {
-      // The in-memory identity remains usable.
+      // An in-memory identity remains valid for this document lifetime.
     }
     return id;
   }
@@ -154,25 +169,28 @@
     });
     elements.libraryRefresh.addEventListener("click", () => void loadLibrary());
     elements.emptyRetry.addEventListener("click", () => void loadLibrary());
-    elements.backToLibrary.addEventListener("click", showLibrary);
-    elements.volumePicker.addEventListener("change", (event) => {
-      const volumeId = event.currentTarget.value;
-      if (volumeId) {
-        void openVolume(volumeId);
+    elements.backToLibrary.addEventListener("click", navigateBackAfterMutations);
+    elements.chooseRead.addEventListener("click", () => void chooseActivity(READ));
+    elements.chooseEdit.addEventListener("click", () => void chooseActivity(EDIT));
+    elements.backToActivities.addEventListener("click", navigateBackAfterMutations);
+    elements.folderPicker.addEventListener("change", (event) => {
+      const folderId = event.currentTarget.value;
+      if (folderId) {
+        void openFolder(folderId, "", { persist: true });
       }
     });
     elements.selectedPicker.addEventListener("change", (event) => {
-      const pageId = event.currentTarget.value;
+      const imageId = event.currentTarget.value;
       event.currentTarget.value = "";
-      if (pageId) {
-        goToPageId(pageId);
+      if (imageId) {
+        goToImageId(imageId);
       }
     });
-    elements.pagePicker.addEventListener("change", (event) => {
-      goToPageId(event.currentTarget.value);
+    elements.imagePicker.addEventListener("change", (event) => {
+      goToImageId(event.currentTarget.value);
     });
-    elements.previousZone.addEventListener("click", () => navigatePage(-1));
-    elements.nextZone.addEventListener("click", () => navigatePage(1));
+    elements.previousZone.addEventListener("click", () => navigateImage(-1));
+    elements.nextZone.addEventListener("click", () => navigateImage(1));
     elements.selectionZone.addEventListener("click", toggleCurrentSelection);
     elements.chromeToggle.addEventListener("click", toggleChrome);
     elements.imageRetry.addEventListener("click", loadCurrentImage);
@@ -185,26 +203,23 @@
     });
     elements.actionErrorDismiss.addEventListener("click", hideActionError);
 
-    // Native controls sit above the reader gesture layer. Explicitly consuming
-    // their events protects against WebKit event retargeting around select menus.
-    for (const control of [elements.topChrome, elements.backToLibrary]) {
+    for (const control of [elements.topChrome, elements.backToActivities]) {
       for (const eventName of ["click", "pointerup", "touchend"]) {
         control.addEventListener(eventName, (event) => event.stopPropagation());
       }
     }
-
     for (const eventName of ["contextmenu", "dragstart", "dblclick", "selectstart"]) {
       elements.readerStage.addEventListener(eventName, (event) => event.preventDefault());
     }
 
-    elements.pageImage.addEventListener("load", pageImageLoaded);
-    elements.pageImage.addEventListener("error", pageImageFailed);
+    elements.imageDisplay.addEventListener("load", imageLoaded);
+    elements.imageDisplay.addEventListener("error", imageFailed);
     window.addEventListener("resize", syncSelectionFrame, { passive: true });
     window.addEventListener("orientationchange", () => window.setTimeout(syncSelectionFrame, 80));
     if (window.visualViewport) {
       window.visualViewport.addEventListener("resize", syncSelectionFrame, { passive: true });
     }
-
+    window.addEventListener("popstate", historyChanged);
     document.addEventListener("visibilitychange", visibilityChanged);
     window.addEventListener("pagehide", (event) => {
       if (!event.persisted) {
@@ -226,13 +241,11 @@
       headers.set("X-Companion-Instance", state.clientId);
       headers.set("X-Companion-Page", state.pageInstanceId);
     }
-
     let body;
     if (options.body !== undefined) {
       headers.set("Content-Type", "application/json");
       body = JSON.stringify(options.body);
     }
-
     try {
       const response = await fetch(path, {
         method: options.method || "GET",
@@ -243,10 +256,9 @@
         signal: options.signal || controller.signal,
       });
       const contentType = response.headers.get("content-type") || "";
-      let payload = null;
-      if (contentType.includes("application/json")) {
-        payload = await response.json();
-      }
+      const payload = contentType.includes("application/json")
+        ? await response.json()
+        : null;
       if (!response.ok || !payload || payload.ok === false) {
         const detail = payload && typeof payload.error === "object" ? payload.error : {};
         throw new ApiError(
@@ -261,20 +273,16 @@
       if (error instanceof ApiError || error.name === "AbortError") {
         throw error;
       }
-      throw new ApiError(
-        "network_error",
-        "Could not reach Pocket Manga Editor on this network.",
-        0,
-      );
+      throw new ApiError("network_error", "Could not reach Pocket Manga Editor on this network.");
     } finally {
       window.clearTimeout(timeout);
     }
   }
 
-  async function requestImage(pageId, signal) {
+  async function requestImage(imageId, signal) {
     let response;
     try {
-      response = await fetch(ROUTES.image(pageId), {
+      response = await fetch(ROUTES.image(imageId), {
         method: "GET",
         headers: {
           Accept: "image/avif,image/webp,image/png,image/jpeg,*/*;q=0.5",
@@ -289,9 +297,8 @@
       if (error.name === "AbortError") {
         throw error;
       }
-      throw new ApiError("network_error", "The page image could not be reached.");
+      throw new ApiError("network_error", "The image could not be reached.");
     }
-
     if (!response.ok) {
       let detail = null;
       try {
@@ -302,15 +309,14 @@
       const apiDetail = detail && typeof detail.error === "object" ? detail.error : {};
       throw new ApiError(
         apiDetail.code || `http_${response.status}`,
-        apiDetail.message || "The page image is unavailable.",
+        apiDetail.message || "The image is unavailable.",
         response.status,
         detail,
       );
     }
-
     const contentType = response.headers.get("content-type") || "";
     if (!contentType.startsWith("image/")) {
-      throw new ApiError("invalid_image", "The PC returned an invalid page image.");
+      throw new ApiError("invalid_image", "The PC returned an invalid image.");
     }
     return response.blob();
   }
@@ -324,13 +330,10 @@
       message: "Checking the local Companion service…",
       loading: true,
     });
-
     try {
       const payload = await requestJson(ROUTES.status, { controller: false });
-      // The nested envelope is canonical; accepting the earlier flat spike keeps
-      // a cached frontend usable while a desktop process is being upgraded.
-      const status = payload.status || payload;
-      if (status.server && status.server !== "available") {
+      const status = payload.status;
+      if (!status || status.server !== "available") {
         showUnavailable("Pocket Manga Editor reports that Companion is unavailable.");
         return;
       }
@@ -360,7 +363,6 @@
       elements.pairHint.textContent = "Enter the code shown on the PC.";
       return;
     }
-
     elements.pairSubmit.disabled = true;
     elements.pairSubmit.textContent = "Pairing…";
     elements.pairHint.textContent = "Confirming this iPhone with the PC…";
@@ -376,7 +378,7 @@
     } catch (error) {
       if (
         error instanceof ApiError
-        && isOneOf(error.code, "pairing_closed", "pairing_rate_limited")
+        && (error.code === "pairing_closed" || error.code === "pairing_rate_limited")
       ) {
         showPairing(false, friendlyMessage(error));
       } else {
@@ -401,7 +403,7 @@
         method: "POST",
         body: { client_id: state.clientId, page_id: state.pageInstanceId },
       });
-      state.leaseClaimed = Boolean(payload.controller && payload.controller.claimed !== false);
+      state.leaseClaimed = Boolean(payload.controller && payload.controller.claimed);
       state.snapshotId = payload.snapshot_id || null;
       startHeartbeat();
       await loadLibrary();
@@ -454,8 +456,6 @@
     }
     state.leaseClaimed = false;
     stopHeartbeat();
-    // Keepalive allows an orderly navigation/close to release immediately. If
-    // iOS terminates the page without this event, the server lease still expires.
     void fetch(ROUTES.release, {
       method: "POST",
       headers: {
@@ -497,18 +497,27 @@
         method: "POST",
         body: { client_id: state.clientId, page_id: state.pageInstanceId },
       });
-      state.leaseClaimed = Boolean(payload.controller && payload.controller.claimed !== false);
+      state.leaseClaimed = Boolean(payload.controller && payload.controller.claimed);
       state.snapshotId = payload.snapshot_id || null;
       startHeartbeat();
       if (!state.snapshotId || state.snapshotId !== previousSnapshotId) {
         await loadLibrary();
         return;
       }
-      if (state.currentVolume && state.currentManga) {
-        showReader();
-        showPage(state.currentPageIndex, { persist: false });
+      await drainPendingMutations();
+      if (
+        state.activity
+        && state.currentFolder
+        && state.currentManga
+        && state.activityManga
+      ) {
+        const activity = state.activity;
+        showActivityChoice(state.activityManga, { historyMode: "none" });
+        await chooseActivity(activity, { historyMode: "none" });
+      } else if (state.activityManga) {
+        showActivityChoice(state.activityManga, { historyMode: "none" });
       } else {
-        showLibrary();
+        showLibrary({ historyMode: "none" });
       }
       announce("Companion reconnected.");
     } catch (error) {
@@ -518,21 +527,19 @@
 
   function handleSessionError(error, retry) {
     const code = error instanceof ApiError ? error.code : "network_error";
-    if (isOneOf(code, "unpaired", "not_paired", "unauthorized", "authorization_required")) {
+    if (code === "unauthorized" || code === "unpaired") {
       showPairing(false, "This browser is not authorized. Open pairing on the PC to pair again.");
       return;
     }
-    if (isOneOf(code, "inactive", "companion_inactive", "mode_inactive", "inactive_mode", "not_active")) {
+    if (code === "inactive_mode") {
       showInactive();
       return;
     }
-    if (
-      isOneOf(code, "lease_occupied", "lease_conflict", "controller_conflict", "controller_occupied")
-    ) {
+    if (code === "lease_conflict") {
       showOccupied();
       return;
     }
-    if (isOneOf(code, "stale_snapshot", "invalid_snapshot")) {
+    if (code === "stale_snapshot" || code === "invalid_snapshot") {
       state.snapshotId = null;
       showUnavailable("The PC library changed. Reconnect to load the current snapshot.", bootstrap);
       return;
@@ -557,8 +564,7 @@
     });
     if (!pairingOpen) {
       scheduleStatusPoll();
-    }
-    if (pairingOpen) {
+    } else {
       window.setTimeout(() => elements.pairCode.focus(), 50);
     }
   }
@@ -610,6 +616,7 @@
     clearReaderMedia();
     elements.stateScreen.hidden = false;
     elements.libraryScreen.hidden = true;
+    elements.activityScreen.hidden = true;
     elements.readerScreen.hidden = true;
     elements.stateKicker.textContent = kicker;
     elements.stateTitle.textContent = title;
@@ -637,23 +644,36 @@
 
   async function loadLibrary() {
     clearStatusPoll();
+    await drainPendingMutations();
+    const requestToken = ++state.viewRequestToken;
+    const epoch = ++state.activityEpoch;
     try {
       const payload = await requestJson(ROUTES.library);
+      if (
+        requestToken !== state.viewRequestToken
+        || epoch !== state.activityEpoch
+      ) {
+        return;
+      }
       if (payload.snapshot_id) {
         state.snapshotId = payload.snapshot_id;
       }
       state.library = Array.isArray(payload.mangas)
         ? payload.mangas.map(normalizeMangaSummary).filter((manga) => manga.id)
         : [];
-      state.libraryContext = payload.context && typeof payload.context === "object"
-        ? payload.context
-        : null;
-      state.libraryIssueCount = nonNegativeInteger(
-        payload.issue_count ?? payload.scan_issue_count,
-      );
-      showLibrary();
+      state.libraryIssueCount = nonNegativeInteger(payload.issue_count);
+      state.activityManga = null;
+      state.activity = null;
+      state.currentManga = null;
+      state.currentFolder = null;
+      showLibrary({ historyMode: "replace" });
     } catch (error) {
-      handleSessionError(error, loadLibrary);
+      if (
+        requestToken === state.viewRequestToken
+        && epoch === state.activityEpoch
+      ) {
+        handleSessionError(error, loadLibrary);
+      }
     }
   }
 
@@ -661,25 +681,23 @@
     return {
       id: String(manga && manga.id || ""),
       name: String(manga && manga.name || "Untitled manga"),
-      volumeCount: nonNegativeInteger(manga && manga.volume_count),
-      selectedCount: nonNegativeInteger(manga && manga.selected_count),
+      folderCount: nonNegativeInteger(manga && manga.folder_count),
     };
   }
 
-  function renderLibrary(payload = {}) {
+  function renderLibrary() {
     elements.libraryList.replaceChildren();
-    let volumeCount = 0;
-    let selectedCount = 0;
+    let folderCount = 0;
     for (const manga of state.library) {
-      volumeCount += manga.volumeCount;
-      selectedCount += manga.selectedCount;
-
+      folderCount += manga.folderCount;
       const button = document.createElement("button");
       button.type = "button";
       button.className = "manga-card";
-      button.disabled = manga.volumeCount === 0;
+      button.disabled = manga.folderCount === 0;
       button.setAttribute("aria-label", mangaCardLabel(manga));
-      button.addEventListener("click", () => void openManga(manga.id));
+      button.addEventListener("click", () => {
+        showActivityChoice(manga, { historyMode: "push" });
+      });
 
       const text = document.createElement("span");
       const title = document.createElement("span");
@@ -702,315 +720,395 @@
     }
 
     const mangaText = `${state.library.length} manga`;
-    const volumeText = `${volumeCount} ${volumeCount === 1 ? "volume" : "volumes"}`;
-    const selectionText = `${selectedCount} selected ${selectedCount === 1 ? "page" : "pages"}`;
-    elements.librarySummary.textContent = `${mangaText} · ${volumeText} · ${selectionText}`;
+    const folderText = `${folderCount} ${folderCount === 1 ? "folder" : "folders"}`;
+    elements.librarySummary.textContent = `${mangaText} · ${folderText}`;
     elements.libraryEmpty.hidden = state.library.length > 0;
     elements.libraryList.hidden = state.library.length === 0;
-
-    const issueCount = nonNegativeInteger(
-      payload.issue_count ?? payload.scan_issue_count ?? state.libraryIssueCount,
-    );
-    state.libraryIssueCount = issueCount;
-    elements.libraryNotice.hidden = issueCount === 0;
-    if (issueCount) {
-      elements.libraryNotice.textContent = `${issueCount} source ${issueCount === 1 ? "item was" : "items were"} skipped by the PC scan.`;
+    elements.libraryNotice.hidden = state.libraryIssueCount === 0;
+    if (state.libraryIssueCount) {
+      elements.libraryNotice.textContent = `${state.libraryIssueCount} source ${state.libraryIssueCount === 1 ? "item was" : "items were"} skipped by the PC scan.`;
     }
   }
 
   function mangaCardMeta(manga) {
-    if (!manga.volumeCount) {
-      return "No readable volumes";
+    if (!manga.folderCount) {
+      return "No readable image folders";
     }
-    return `${plural(manga.volumeCount, "1 volume", `${manga.volumeCount} volumes`)} · ${plural(manga.selectedCount, "1 selected", `${manga.selectedCount} selected`)}`;
+    return plural(manga.folderCount, "1 image folder", `${manga.folderCount} image folders`);
   }
 
   function mangaCardLabel(manga) {
     return `${manga.name}, ${mangaCardMeta(manga)}`;
   }
 
-  function showLibrary() {
+  function showLibrary({ historyMode = "none" } = {}) {
     hideActionError();
-    renderLibrary({ issue_count: state.libraryIssueCount });
+    clearReaderFeedback();
+    state.viewRequestToken += 1;
+    state.activityEpoch += 1;
+    state.activityManga = null;
+    state.activity = null;
+    state.currentManga = null;
+    state.currentFolder = null;
+    renderLibrary();
     elements.stateScreen.hidden = true;
+    elements.activityScreen.hidden = true;
     elements.readerScreen.hidden = true;
     elements.libraryScreen.hidden = false;
     document.title = "Library · Pocket Manga";
     clearReaderMedia();
+    setHistory({ view: "library" }, historyMode);
   }
 
-  function clearReaderMedia() {
-    state.imageRequestToken += 1;
-    if (state.imageController) {
-      state.imageController.abort();
-      state.imageController = null;
+  function showActivityChoice(manga, { historyMode = "none" } = {}) {
+    if (!manga) {
+      showLibrary({ historyMode });
+      return;
     }
-    if (state.currentImageUrl) {
-      URL.revokeObjectURL(state.currentImageUrl);
-      state.currentImageUrl = null;
-      elements.pageImage.removeAttribute("src");
-    }
-    cancelPrefetch();
+    hideActionError();
+    clearReaderFeedback();
+    clearReaderMedia();
+    state.viewRequestToken += 1;
+    state.activityEpoch += 1;
+    state.activityManga = manga;
+    state.activity = null;
+    state.currentManga = null;
+    state.currentFolder = null;
+    elements.activityTitle.textContent = manga.name;
+    elements.stateScreen.hidden = true;
+    elements.libraryScreen.hidden = true;
+    elements.readerScreen.hidden = true;
+    elements.activityScreen.hidden = false;
+    document.title = `${manga.name} · Pocket Manga`;
+    setHistory({ view: "activity", manga_id: manga.id }, historyMode);
+    window.setTimeout(() => elements.activityTitle.focus(), 20);
   }
 
-  async function openManga(mangaId) {
-    showToast("Opening manga…", 1_500);
+  async function chooseActivity(activity, { historyMode = "push" } = {}) {
+    const manga = state.activityManga;
+    if (
+      !manga
+      || (activity !== READ && activity !== EDIT)
+      || state.activityOpening
+    ) {
+      return;
+    }
+    state.activityOpening = true;
+    elements.chooseRead.disabled = true;
+    elements.chooseEdit.disabled = true;
+    await drainPendingMutations();
+    if (state.activityManga !== manga) {
+      state.activityOpening = false;
+      elements.chooseRead.disabled = false;
+      elements.chooseEdit.disabled = false;
+      return;
+    }
     const requestToken = ++state.viewRequestToken;
+    const epoch = ++state.activityEpoch;
+    showToast(activity === READ ? "Opening reader…" : "Opening editor…", 1_200);
     try {
-      const payload = await requestJson(ROUTES.manga(mangaId));
-      if (requestToken !== state.viewRequestToken) {
+      const payload = await requestJson(ROUTES.manga(manga.id, activity));
+      if (requestToken !== state.viewRequestToken || epoch !== state.activityEpoch) {
         return;
+      }
+      if (payload.activity !== activity) {
+        throw new ApiError("wrong_activity", "The PC opened a different activity.");
       }
       if (payload.snapshot_id) {
         state.snapshotId = payload.snapshot_id;
       }
       const raw = payload.manga || {};
-      const volumes = Array.isArray(raw.volumes)
-        ? raw.volumes.map(normalizeVolumeSummary).filter((volume) => volume.id)
+      const folders = Array.isArray(raw.folders)
+        ? raw.folders.map((folder) => normalizeFolderSummary(folder, activity)).filter((folder) => folder.id)
         : [];
-      state.currentManga = {
-        id: String(raw.id || mangaId),
-        name: String(raw.name || "Untitled manga"),
-        volumes,
+      state.activity = activity;
+      const currentManga = {
+        id: String(raw.id || manga.id),
+        name: String(raw.name || manga.name),
+        currentFolderId: String(raw.current_folder_id || ""),
+        folders,
       };
-      if (!volumes.length) {
+      if (activity === EDIT) {
+        currentManga.selectedCount = nonNegativeInteger(raw.selected_count);
+      }
+      state.currentManga = currentManga;
+      if (!folders.length) {
         showActionError(
-          "No readable volume",
-          "This manga no longer has a readable volume in the active snapshot.",
-          () => openManga(mangaId),
+          "No readable image folder",
+          "This manga no longer has a readable image folder in the active snapshot.",
+          () => chooseActivity(activity, { historyMode: "none" }),
         );
         return;
       }
-
-      populateVolumePicker(volumes);
-      const context = state.libraryContext || {};
-      const contextVolume = String(context.manga_id || "") === state.currentManga.id
-        ? String(context.volume_id || "")
-        : "";
-      const rememberedVolume = state.lastVolumeByManga.get(state.currentManga.id) || "";
-      const preferred = volumes.find((volume) => volume.id === contextVolume)
-        || volumes.find((volume) => volume.id === rememberedVolume)
-        || volumes.find((volume) => volume.id === String(raw.current_volume_id || raw.last_volume_id || ""))
-        || volumes[0];
-      const preferredPage = preferred.id === contextVolume ? String(context.page_id || "") : "";
-      await openVolume(preferred.id, preferredPage);
+      populateFolderPicker(folders);
+      const preferred = folders.find((folder) => folder.id === state.currentManga.currentFolderId)
+        || folders[0];
+      await openFolder(preferred.id, preferred.currentImageId, {
+        persist: false,
+        historyMode,
+        requestEpoch: epoch,
+      });
+      showWarnings(payload.warnings);
     } catch (error) {
-      if (requestToken === state.viewRequestToken) {
+      if (requestToken === state.viewRequestToken && epoch === state.activityEpoch) {
         if (isSessionGateError(error)) {
-          handleSessionError(error, () => openManga(mangaId));
+          handleSessionError(error, () => chooseActivity(activity, { historyMode: "none" }));
         } else {
-          showActionError("Couldn’t open manga", friendlyMessage(error), () => openManga(mangaId));
+          showActionError(
+            `Couldn’t open ${activity === READ ? "reader" : "editor"}`,
+            friendlyMessage(error),
+            () => chooseActivity(activity, { historyMode: "none" }),
+          );
         }
       }
+    } finally {
+      state.activityOpening = false;
+      elements.chooseRead.disabled = false;
+      elements.chooseEdit.disabled = false;
     }
   }
 
-  function normalizeVolumeSummary(volume) {
-    return {
-      id: String(volume && volume.id || ""),
-      label: String(volume && (volume.display_name || volume.label) || "Volume"),
-      pageCount: nonNegativeInteger(volume && volume.page_count),
-      selectedCount: nonNegativeInteger(volume && volume.selected_count),
-      currentPageId: String(volume && volume.current_page_id || ""),
+  function normalizeFolderSummary(folder, activity) {
+    const normalized = {
+      id: String(folder && folder.id || ""),
+      name: String(folder && folder.name || "Untitled folder"),
+      imageCount: nonNegativeInteger(folder && folder.image_count),
+      currentImageId: String(folder && folder.current_image_id || ""),
     };
+    if (activity === EDIT) {
+      normalized.selectedCount = nonNegativeInteger(folder && folder.selected_count);
+    }
+    return normalized;
   }
 
-  async function openVolume(volumeId, preferredPageId = "") {
+  async function openFolder(
+    folderId,
+    preferredImageId = "",
+    { persist = false, historyMode = "none", requestEpoch = state.activityEpoch } = {},
+  ) {
+    const activity = state.activity;
+    if (!activity) {
+      return;
+    }
     const requestToken = ++state.viewRequestToken;
-    showToast("Loading volume…", 1_200);
     try {
-      const payload = await requestJson(ROUTES.volume(volumeId));
-      if (requestToken !== state.viewRequestToken) {
+      const payload = await requestJson(ROUTES.folder(folderId, activity));
+      if (
+        requestToken !== state.viewRequestToken
+        || requestEpoch !== state.activityEpoch
+        || state.activity !== activity
+      ) {
         return;
       }
-      if (payload.snapshot_id) {
-        state.snapshotId = payload.snapshot_id;
+      if (payload.activity !== activity) {
+        throw new ApiError("wrong_activity", "The PC returned the wrong activity.");
       }
-      const raw = payload.volume || {};
-      const pages = Array.isArray(raw.pages)
-        ? raw.pages.map(normalizePage).filter((page) => page.id)
+      const raw = payload.folder || {};
+      const images = Array.isArray(raw.images)
+        ? raw.images.map((image) => normalizeImage(image, activity)).filter((image) => image.id)
         : [];
-      state.currentVolume = {
-        id: String(raw.id || volumeId),
+      const currentFolder = {
+        id: String(raw.id || folderId),
         mangaId: String(raw.manga_id || (state.currentManga && state.currentManga.id) || ""),
-        label: String(raw.display_name || raw.label || "Volume"),
-        currentPageId: String(raw.current_page_id || ""),
-        currentIndex: nonNegativeInteger(raw.current_index),
-        selectedCount: nonNegativeInteger(raw.selected_count),
+        name: String(raw.name || "Untitled folder"),
+        currentImageId: String(raw.current_image_id || ""),
         revision: nonNegativeInteger(raw.revision),
-        pages,
+        images,
       };
-      if (state.currentVolume.mangaId) {
-        state.lastVolumeByManga.set(
-          state.currentVolume.mangaId,
-          state.currentVolume.id,
-        );
+      if (activity === EDIT) {
+        currentFolder.selectedCount = nonNegativeInteger(raw.selected_count);
+        currentFolder.mangaSelectedCount = nonNegativeInteger(raw.manga_selected_count);
       }
-      updateVolumeSummary(state.currentVolume);
-      elements.volumePicker.value = state.currentVolume.id;
-      populatePagePickers();
+      state.currentFolder = currentFolder;
+      updateFolderSummary(state.currentFolder);
+      elements.folderPicker.value = state.currentFolder.id;
+      populateImagePickers();
       showReader();
+      setHistory(
+        {
+          view: "reader",
+          manga_id: state.currentManga ? state.currentManga.id : "",
+          activity,
+        },
+        historyMode,
+      );
 
-      if (!pages.length) {
+      if (!images.length) {
         elements.imageLoading.hidden = true;
         elements.imageError.hidden = false;
-        elements.imageError.querySelector("p").textContent = "This volume has no readable pages.";
+        elements.imageError.querySelector("p").textContent = "This folder has no readable images.";
         updateReaderLabels();
         return;
       }
-
-      const requestedIndex = pages.findIndex((page) => page.id === preferredPageId);
-      const savedIndex = pages.findIndex((page) => page.id === state.currentVolume.currentPageId);
-      const index = requestedIndex >= 0
-        ? requestedIndex
-        : savedIndex >= 0
-          ? savedIndex
-          : Math.min(state.currentVolume.currentIndex, pages.length - 1);
-      showPage(index, { persist: false });
+      const requestedIndex = images.findIndex((image) => image.id === preferredImageId);
+      const savedIndex = images.findIndex((image) => image.id === state.currentFolder.currentImageId);
+      const index = requestedIndex >= 0 ? requestedIndex : savedIndex >= 0 ? savedIndex : 0;
+      showImage(index, { persist: false });
+      if (persist) {
+        queuePosition(activity, state.currentFolder.id, images[index].id, requestEpoch);
+      }
+      showWarnings(payload.warnings);
     } catch (error) {
-      if (requestToken === state.viewRequestToken) {
-        if (state.currentVolume) {
-          elements.volumePicker.value = state.currentVolume.id;
+      if (requestToken === state.viewRequestToken && requestEpoch === state.activityEpoch) {
+        if (state.currentFolder) {
+          elements.folderPicker.value = state.currentFolder.id;
         }
         if (isSessionGateError(error)) {
-          handleSessionError(error, () => openVolume(volumeId, preferredPageId));
+          handleSessionError(error, () => openFolder(folderId, preferredImageId, { persist, requestEpoch }));
         } else {
-          showActionError("Couldn’t open volume", friendlyMessage(error), () => openVolume(volumeId, preferredPageId));
+          showActionError(
+            "Couldn’t open folder",
+            friendlyMessage(error),
+            () => openFolder(folderId, preferredImageId, { persist, requestEpoch }),
+          );
         }
       }
     }
   }
 
-  function normalizePage(page, index) {
-    return {
-      id: String(page && page.id || ""),
-      pageLabel: String(page && page.page_label || index + 1),
-      chapterLabel: page && page.chapter_label != null ? String(page.chapter_label) : "",
-      chapterTitle: page && page.chapter_title != null ? String(page.chapter_title) : "",
-      selected: Boolean(page && page.selected),
+  function normalizeImage(image, activity) {
+    const normalized = {
+      id: String(image && image.id || ""),
+      name: String(image && image.name || "Untitled image"),
     };
+    if (activity === EDIT) {
+      normalized.selected = Boolean(image && image.selected);
+    }
+    return normalized;
   }
 
-  function populateVolumePicker(volumes) {
-    elements.volumePicker.replaceChildren();
-    for (const volume of volumes) {
+  function populateFolderPicker(folders) {
+    elements.folderPicker.replaceChildren();
+    for (const folder of folders) {
       const option = document.createElement("option");
-      option.value = volume.id;
-      option.textContent = volume.label;
-      elements.volumePicker.append(option);
+      option.value = folder.id;
+      option.textContent = folder.name;
+      elements.folderPicker.append(option);
     }
   }
 
-  function populatePagePickers() {
-    const volume = state.currentVolume;
-    elements.pagePicker.replaceChildren();
+  function populateImagePickers() {
+    const folder = state.currentFolder;
+    elements.imagePicker.replaceChildren();
     elements.selectedPicker.replaceChildren();
-    if (!volume) {
+    if (!folder) {
       return;
     }
-
-    const selectedPages = volume.pages.filter((page) => page.selected);
-    const selectedLabel = document.createElement("option");
-    selectedLabel.value = "";
-    selectedLabel.textContent = `Selected · ${selectedPages.length}`;
-    elements.selectedPicker.append(selectedLabel);
-    for (const [index, page] of volume.pages.entries()) {
-      const pageOption = document.createElement("option");
-      pageOption.value = page.id;
-      pageOption.textContent = pickerPageLabel(page, index);
-      elements.pagePicker.append(pageOption);
-      if (page.selected) {
-        const selectedOption = pageOption.cloneNode(true);
-        elements.selectedPicker.append(selectedOption);
+    const selectedImages = state.activity === EDIT
+      ? folder.images.filter((image) => image.selected)
+      : [];
+    if (state.activity === EDIT) {
+      const selectedLabel = document.createElement("option");
+      selectedLabel.value = "";
+      selectedLabel.textContent = `Selected · ${selectedImages.length}`;
+      elements.selectedPicker.append(selectedLabel);
+    }
+    for (const image of folder.images) {
+      const option = document.createElement("option");
+      option.value = image.id;
+      option.textContent = image.name;
+      elements.imagePicker.append(option);
+      if (state.activity === EDIT && image.selected) {
+        elements.selectedPicker.append(option.cloneNode(true));
       }
     }
-    elements.selectedPicker.disabled = selectedPages.length === 0;
+    elements.selectedPicker.disabled = state.activity !== EDIT || selectedImages.length === 0;
     elements.selectedPicker.value = "";
-  }
-
-  function pickerPageLabel(page, index) {
-    const chapter = page.chapterLabel ? `Ch. ${page.chapterLabel} · ` : "";
-    return `${chapter}Page ${page.pageLabel || index + 1}`;
   }
 
   function showReader() {
     hideActionError();
+    clearReaderFeedback();
     elements.stateScreen.hidden = true;
     elements.libraryScreen.hidden = true;
+    elements.activityScreen.hidden = true;
     elements.readerScreen.hidden = false;
+    elements.readerScreen.dataset.activity = state.activity || "";
+    const editing = state.activity === EDIT;
+    elements.selectionFrame.hidden = !editing;
+    elements.selectionZone.hidden = !editing;
+    elements.selectionZone.disabled = !editing;
+    elements.selectedPickerShell.hidden = !editing;
     state.chromeVisible = true;
     elements.readerScreen.classList.remove("chrome-hidden");
     elements.chromeToggle.setAttribute("aria-pressed", "false");
     elements.chromeToggle.setAttribute("aria-label", "Hide reader controls");
+    if (!editing) {
+      clearSelectionPresentation();
+    }
     const mangaName = state.currentManga ? state.currentManga.name : "Reader";
-    document.title = `${mangaName} · Pocket Manga`;
+    document.title = `${mangaName} · ${editing ? "Edit" : "Read"} · Pocket Manga`;
   }
 
-  function showPage(index, { persist = true } = {}) {
-    const volume = state.currentVolume;
-    if (!volume || !volume.pages.length) {
+  function showImage(index, { persist = true } = {}) {
+    const folder = state.currentFolder;
+    if (!folder || !folder.images.length) {
       return;
     }
-    const bounded = Math.max(0, Math.min(index, volume.pages.length - 1));
-    state.currentPageIndex = bounded;
-    const page = volume.pages[bounded];
-    state.libraryContext = {
-      manga_id: state.currentManga ? state.currentManga.id : volume.mangaId,
-      volume_id: volume.id,
-      page_id: page.id,
-    };
-    elements.pagePicker.value = page.id;
+    const bounded = Math.max(0, Math.min(index, folder.images.length - 1));
+    state.currentImageIndex = bounded;
+    const image = folder.images[bounded];
+    elements.imagePicker.value = image.id;
     updateReaderLabels();
-    renderSelectionState(page);
+    if (state.activity === EDIT) {
+      renderSelectionState(image);
+    } else {
+      clearSelectionPresentation();
+    }
     loadCurrentImage();
-    if (persist) {
-      queuePosition(volume.id, page.id);
+    if (persist && state.activity) {
+      queuePosition(
+        state.activity,
+        folder.id,
+        image.id,
+        state.activityEpoch,
+      );
     }
   }
 
-  function goToPageId(pageId) {
-    const volume = state.currentVolume;
-    if (!volume) {
+  function goToImageId(imageId) {
+    const folder = state.currentFolder;
+    if (!folder) {
       return;
     }
-    const index = volume.pages.findIndex((page) => page.id === pageId);
-    if (index >= 0 && index !== state.currentPageIndex) {
-      showPage(index);
+    const index = folder.images.findIndex((image) => image.id === imageId);
+    if (index >= 0 && index !== state.currentImageIndex) {
+      showImage(index);
     }
   }
 
-  function navigatePage(direction) {
-    const volume = state.currentVolume;
-    if (!volume || !volume.pages.length) {
+  function navigateImage(direction) {
+    const folder = state.currentFolder;
+    if (!folder || !folder.images.length) {
       return;
     }
-    const target = state.currentPageIndex + direction;
+    const target = state.currentImageIndex + direction;
     if (target < 0) {
-      showBoundaryCue("First page", "left");
+      showBoundaryCue("First image", "left");
       return;
     }
-    if (target >= volume.pages.length) {
-      showBoundaryCue("Last page", "right");
+    if (target >= folder.images.length) {
+      showBoundaryCue("Last image", "right");
       return;
     }
-    showPage(target);
+    showImage(target);
   }
 
   function updateReaderLabels() {
-    const volume = state.currentVolume;
-    if (!volume || !volume.pages.length) {
-      elements.bottomVolume.textContent = volume ? volume.label : "—";
-      elements.bottomPage.textContent = "No pages";
+    const folder = state.currentFolder;
+    if (!folder || !folder.images.length) {
+      elements.bottomFolder.textContent = folder ? folder.name : "—";
+      elements.bottomPosition.textContent = "No images";
       elements.selectionZone.disabled = true;
       elements.previousZone.disabled = true;
       elements.nextZone.disabled = true;
       return;
     }
-    const page = volume.pages[state.currentPageIndex];
-    elements.bottomVolume.textContent = volume.label;
-    elements.bottomPage.textContent = `${state.currentPageIndex + 1} of ${volume.pages.length}`;
-    elements.pageImage.alt = `${state.currentManga ? state.currentManga.name : "Manga"}, ${volume.label}, page ${page.pageLabel}`;
-    elements.selectionZone.disabled = false;
+    const image = folder.images[state.currentImageIndex];
+    elements.bottomFolder.textContent = folder.name;
+    elements.bottomPosition.textContent = `${state.currentImageIndex + 1} of ${folder.images.length}`;
+    elements.imageDisplay.alt = `${state.currentManga ? state.currentManga.name : "Manga"}, ${folder.name}, ${image.name}`;
+    elements.selectionZone.disabled = state.activity !== EDIT;
     elements.previousZone.disabled = false;
     elements.nextZone.disabled = false;
   }
@@ -1035,115 +1133,153 @@
     }, 850);
   }
 
-  function currentPage() {
-    const volume = state.currentVolume;
-    return volume && volume.pages[state.currentPageIndex] || null;
+  function currentImage() {
+    const folder = state.currentFolder;
+    return folder && folder.images[state.currentImageIndex] || null;
   }
 
   function toggleCurrentSelection() {
-    const page = currentPage();
-    const volume = state.currentVolume;
-    if (!page || !volume || state.selectionPending.has(page.id)) {
+    if (state.activity !== EDIT) {
       return;
     }
-    void setSelection(volume, page, !page.selected);
+    const image = currentImage();
+    const folder = state.currentFolder;
+    if (!image || !folder || state.selectionPending.has(image.id)) {
+      return;
+    }
+    void setSelection(folder, image, !image.selected, state.activityEpoch);
   }
 
-  async function setSelection(volume, page, desired) {
-    if (state.selectionPending.has(page.id)) {
+  async function setSelection(folder, image, desired, epoch) {
+    if (state.activity !== EDIT || state.selectionPending.has(image.id)) {
       return;
     }
-    state.selectionPending.set(page.id, { desired, volumeId: volume.id });
-    if (
-      state.currentVolume
-      && state.currentVolume.id === volume.id
-      && currentPage()
-      && currentPage().id === page.id
-    ) {
-      renderSelectionState(currentPage());
+    state.selectionPending.set(image.id, { desired, folderId: folder.id, epoch });
+    if (isCurrentImage(folder.id, image.id, epoch)) {
+      renderSelectionState(currentImage());
     }
-
     try {
-      const payload = await requestJson(ROUTES.selection(volume.id), {
-        method: "PUT",
-        body: { page_id: page.id, selected: desired },
-      });
-      const review = payload.review || {};
-      const confirmed = typeof review.selected === "boolean" ? review.selected : desired;
-      const previous = page.selected;
-      const responseRevision = nonNegativeInteger(review.revision ?? volume.revision);
-      const liveVolume = state.currentVolume && state.currentVolume.id === volume.id
-        ? state.currentVolume
+      const payload = await queueSelectionRequest(folder, image, desired, epoch);
+      const selection = payload.selection || {};
+      const confirmed = typeof selection.selected === "boolean" ? selection.selected : desired;
+      const responseRevision = nonNegativeInteger(selection.revision ?? folder.revision);
+      const capturedAggregateAccepted = applySelectionConfirmation(
+        folder,
+        image,
+        confirmed,
+        selection,
+        responseRevision,
+      );
+      state.selectionPending.delete(image.id);
+
+      const editingSameManga = (
+        state.activity === EDIT
+        && state.currentManga
+        && state.currentManga.id === folder.mangaId
+      );
+      const liveFolder = editingSameManga
+        && state.currentFolder
+        && state.currentFolder.id === folder.id
+        ? state.currentFolder
         : null;
-      const livePage = liveVolume
-        ? liveVolume.pages.find((candidate) => candidate.id === page.id) || null
+      const liveImage = liveFolder
+        ? liveFolder.images.find((candidate) => candidate.id === image.id) || null
         : null;
-      applySelectionConfirmation(volume, page, confirmed, review, responseRevision);
-      if (liveVolume && livePage && liveVolume !== volume) {
-        applySelectionConfirmation(
-          liveVolume,
-          livePage,
+      let currentAggregateAccepted = capturedAggregateAccepted;
+      if (liveFolder && liveImage && (liveFolder !== folder || liveImage !== image)) {
+        currentAggregateAccepted = applySelectionConfirmation(
+          liveFolder,
+          liveImage,
           confirmed,
-          review,
+          selection,
           responseRevision,
         );
       }
-      state.selectionPending.delete(page.id);
-      const displayedVolume = liveVolume || volume;
-      updateVolumeSummary(displayedVolume);
-      if (state.currentManga && state.currentManga.id === volume.mangaId) {
-        syncLibrarySelectionCount(volume.mangaId);
-      } else {
-        updateLibrarySelectionCount(
-          volume.mangaId,
-          confirmed === previous ? 0 : confirmed ? 1 : -1,
-        );
+      if (editingSameManga) {
+        updateFolderSummary(liveFolder || folder);
+        if (
+          currentAggregateAccepted
+          && Number.isInteger(selection.manga_selected_count)
+        ) {
+          state.currentManga.selectedCount = Math.max(0, selection.manga_selected_count);
+        }
       }
-
-      if (liveVolume) {
-        populatePagePickers();
-        elements.pagePicker.value = currentPage() ? currentPage().id : "";
-        if (currentPage() && currentPage().id === page.id) {
-          renderSelectionState(currentPage());
+      if (liveFolder && epoch === state.activityEpoch && state.activity === EDIT) {
+        populateImagePickers();
+        elements.imagePicker.value = currentImage() ? currentImage().id : "";
+        if (currentImage() && currentImage().id === image.id) {
+          renderSelectionState(currentImage());
           pulseSelection("selection-pulse");
         }
       }
     } catch (error) {
-      state.selectionPending.delete(page.id);
-      if (
-        state.currentVolume
-        && state.currentVolume.id === volume.id
-        && currentPage()
-        && currentPage().id === page.id
-      ) {
-        renderSelectionState(currentPage());
+      state.selectionPending.delete(image.id);
+      const failureStillRelevant = (
+        epoch === state.activityEpoch
+        && state.activity === EDIT
+      );
+      const failedCurrentImage = isCurrentImage(folder.id, image.id, epoch);
+      if (failedCurrentImage && state.activity === EDIT) {
+        renderSelectionState(currentImage());
         pulseSelection("selection-failed");
         showReaderFeedback("Selection not saved", "error", 2_100);
       }
-      const retry = isSessionGateError(error)
-        ? bootstrap
-        : () => setSelection(volume, page, desired);
-      showActionError(
-        "Selection not saved",
-        friendlyMessage(error, "The page remains in its last confirmed state."),
-        retry,
-      );
+      if (failureStillRelevant) {
+        showActionError(
+          "Selection not saved",
+          friendlyMessage(
+            error,
+            failedCurrentImage
+              ? "The image remains in its last confirmed state."
+              : "The prior folder retains its last confirmed selection state.",
+          ),
+          isSessionGateError(error)
+            ? bootstrap
+            : () => setSelection(folder, image, desired, epoch),
+        );
+      }
     }
   }
 
-  function applySelectionConfirmation(volume, page, confirmed, review, responseRevision) {
-    page.selected = confirmed;
-    if (responseRevision >= volume.revision && Number.isInteger(review.selected_count)) {
-      volume.selectedCount = Math.max(0, review.selected_count);
+  function queueSelectionRequest(folder, image, desired, epoch) {
+    const request = state.selectionRequestTail.then(() => {
+      if (epoch !== state.activityEpoch || state.activity !== EDIT) {
+        throw new ApiError(
+          "activity_changed",
+          "The activity changed before this selection could be saved.",
+        );
+      }
+      return requestJson(ROUTES.editSelection(folder.id), {
+        method: "PUT",
+        body: { image_id: image.id, selected: desired },
+      });
+    });
+    state.selectionRequestTail = request.catch(() => {});
+    return request;
+  }
+
+  function applySelectionConfirmation(folder, image, confirmed, selection, responseRevision) {
+    const aggregateAccepted = responseRevision >= folder.revision;
+    image.selected = confirmed;
+    if (aggregateAccepted && Number.isInteger(selection.folder_selected_count)) {
+      folder.selectedCount = Math.max(0, selection.folder_selected_count);
     } else {
-      volume.selectedCount = volume.pages.filter((candidate) => candidate.selected).length;
+      folder.selectedCount = folder.images.filter((candidate) => candidate.selected).length;
     }
-    volume.revision = Math.max(volume.revision, responseRevision);
+    if (aggregateAccepted && Number.isInteger(selection.manga_selected_count)) {
+      folder.mangaSelectedCount = Math.max(0, selection.manga_selected_count);
+    }
+    folder.revision = Math.max(folder.revision, responseRevision);
+    return aggregateAccepted;
   }
 
-  function renderSelectionState(page) {
-    const pending = page ? state.selectionPending.get(page.id) : null;
-    const confirmed = Boolean(page && page.selected);
+  function renderSelectionState(image) {
+    if (state.activity !== EDIT) {
+      clearSelectionPresentation();
+      return;
+    }
+    const pending = image ? state.selectionPending.get(image.id) : null;
+    const confirmed = Boolean(image && image.selected);
     elements.readerScreen.classList.toggle("is-selected", confirmed);
     elements.readerScreen.classList.toggle("selection-pending-add", Boolean(pending && pending.desired));
     elements.readerScreen.classList.toggle("selection-pending-remove", Boolean(pending && !pending.desired));
@@ -1154,17 +1290,28 @@
       pending
         ? "Selection save pending"
         : confirmed
-          ? "Deselect this page"
-          : "Select this page",
+          ? "Deselect this image"
+          : "Select this image",
     );
     elements.selectionZone.setAttribute("aria-busy", String(Boolean(pending)));
     syncSelectionFrame();
   }
 
+  function clearSelectionPresentation() {
+    elements.readerScreen.classList.remove(
+      "is-selected",
+      "selection-pending-add",
+      "selection-pending-remove",
+      "selection-pulse",
+      "selection-failed",
+    );
+    elements.selectionZone.setAttribute("aria-pressed", "false");
+    elements.selectionZone.setAttribute("aria-busy", "false");
+  }
+
   function pulseSelection(className) {
     window.clearTimeout(state.animationTimer);
     elements.readerScreen.classList.remove("selection-pulse", "selection-failed");
-    // Force a style boundary so consecutive confirmations replay the pulse.
     void elements.readerScreen.offsetWidth;
     elements.readerScreen.classList.add(className);
     state.animationTimer = window.setTimeout(() => {
@@ -1182,100 +1329,123 @@
     }, duration);
   }
 
-  function updateVolumeSummary(volume) {
-    if (!state.currentManga || !volume) {
+  function clearReaderFeedback() {
+    window.clearTimeout(state.feedbackTimer);
+    state.feedbackTimer = 0;
+    elements.readerFeedback.textContent = "";
+    elements.readerFeedback.classList.remove(
+      "is-visible",
+      "is-success",
+      "is-neutral",
+      "is-error",
+    );
+  }
+
+  function updateFolderSummary(folder) {
+    if (!state.currentManga || !folder) {
       return;
     }
-    const summary = state.currentManga.volumes.find((candidate) => candidate.id === volume.id);
+    const summary = state.currentManga.folders.find((candidate) => candidate.id === folder.id);
     if (summary) {
-      summary.selectedCount = volume.selectedCount;
-      summary.currentPageId = volume.currentPageId;
+      summary.currentImageId = folder.currentImageId;
+      if (state.activity === EDIT) {
+        summary.selectedCount = folder.selectedCount;
+      }
+    }
+    if (state.activity === EDIT && Number.isInteger(folder.mangaSelectedCount)) {
+      state.currentManga.selectedCount = folder.mangaSelectedCount;
     }
   }
 
-  function updateLibrarySelectionCount(mangaId, delta) {
-    if (!delta) {
-      return;
-    }
-    const manga = state.library.find((candidate) => candidate.id === mangaId);
-    if (manga) {
-      manga.selectedCount = Math.max(0, manga.selectedCount + delta);
-    }
+  function queuePosition(activity, folderId, imageId, epoch) {
+    const key = `${activity}:${folderId}`;
+    state.positionQueue.set(key, { activity, folderId, imageId, epoch });
+    ensurePositionFlush();
   }
 
-  function syncLibrarySelectionCount(mangaId) {
-    if (!state.currentManga || state.currentManga.id !== mangaId) {
-      return;
+  function ensurePositionFlush() {
+    if (!state.positionFlushActive && state.positionQueue.size) {
+      state.positionFlushPromise = flushPositionQueue().catch(() => {});
     }
-    const manga = state.library.find((candidate) => candidate.id === mangaId);
-    if (manga) {
-      manga.selectedCount = state.currentManga.volumes.reduce(
-        (total, volume) => total + volume.selectedCount,
-        0,
-      );
-    }
-  }
-
-  function queuePosition(volumeId, pageId) {
-    state.positionQueue.set(volumeId, pageId);
-    void flushPositionQueue();
+    return state.positionFlushPromise;
   }
 
   async function flushPositionQueue() {
     if (state.positionFlushActive) {
-      return;
+      return state.positionFlushPromise;
     }
     state.positionFlushActive = true;
     try {
       while (state.positionQueue.size) {
-        const [volumeId, pageId] = state.positionQueue.entries().next().value;
-        state.positionQueue.delete(volumeId);
+        const [key, pending] = state.positionQueue.entries().next().value;
+        state.positionQueue.delete(key);
+        const route = pending.activity === READ
+          ? ROUTES.readPosition(pending.folderId)
+          : ROUTES.editPosition(pending.folderId);
         try {
-          const payload = await requestJson(ROUTES.position(volumeId), {
+          const payload = await requestJson(route, {
             method: "PUT",
-            body: { page_id: pageId },
+            body: { image_id: pending.imageId },
           });
-          const review = payload.review || {};
-          if (state.currentVolume && state.currentVolume.id === volumeId) {
-            state.currentVolume.currentPageId = String(review.current_page_id || pageId);
-            const confirmedIndex = state.currentVolume.pages.findIndex(
-              (page) => page.id === state.currentVolume.currentPageId,
+          const position = payload.position || {};
+          if (
+            state.activity === pending.activity
+            && pending.epoch === state.activityEpoch
+            && state.currentFolder
+            && state.currentFolder.id === pending.folderId
+          ) {
+            state.currentFolder.currentImageId = String(
+              position.current_image_id || pending.imageId,
             );
-            if (confirmedIndex >= 0) {
-              state.currentVolume.currentIndex = confirmedIndex;
-            }
-            state.currentVolume.revision = nonNegativeInteger(review.revision ?? state.currentVolume.revision);
-            updateVolumeSummary(state.currentVolume);
+            state.currentFolder.revision = nonNegativeInteger(
+              position.revision ?? state.currentFolder.revision,
+            );
+            updateFolderSummary(state.currentFolder);
           }
         } catch (error) {
-          // If a newer page is already queued for the same volume, that request
-          // is the useful retry and should not be replaced with stale position.
-          if (!state.positionQueue.has(volumeId)) {
-            let failedIndex = -1;
-            if (state.currentVolume && state.currentVolume.id === volumeId) {
-              failedIndex = state.currentVolume.pages.findIndex((page) => page.id === pageId);
-              const confirmedIndex = state.currentVolume.pages.findIndex(
-                (page) => page.id === state.currentVolume.currentPageId,
-              );
-              if (confirmedIndex >= 0) {
-                showPage(confirmedIndex, { persist: false });
-                showReaderFeedback("Position not saved · restored", "error", 2_100);
-              }
+          const failureStillRelevant = (
+            !state.positionQueue.has(key)
+            && state.activity === pending.activity
+            && pending.epoch === state.activityEpoch
+          );
+          const failedCurrentFolder = Boolean(
+            failureStillRelevant
+            && state.currentFolder
+            && state.currentFolder.id === pending.folderId
+          );
+          let failedIndex = -1;
+          if (failedCurrentFolder) {
+            failedIndex = state.currentFolder.images.findIndex(
+              (image) => image.id === pending.imageId,
+            );
+            const confirmedIndex = state.currentFolder.images.findIndex(
+              (image) => image.id === state.currentFolder.currentImageId,
+            );
+            if (confirmedIndex >= 0) {
+              showImage(confirmedIndex, { persist: false });
+              showReaderFeedback("Position not saved · restored", "error", 2_100);
             }
+          }
+          if (failureStillRelevant) {
             showActionError(
               "Position not saved",
-              friendlyMessage(error, "The reader returned to the last confirmed page."),
+              friendlyMessage(
+                error,
+                failedCurrentFolder
+                  ? "The reader returned to the last confirmed image."
+                  : "The prior folder retains its last confirmed reading position.",
+              ),
               () => {
-                if (
-                  failedIndex >= 0
-                  && state.currentVolume
-                  && state.currentVolume.id === volumeId
-                ) {
-                  showPage(failedIndex);
-                  return;
+                if (failedIndex >= 0 && state.currentFolder && state.currentFolder.id === pending.folderId) {
+                  showImage(failedIndex);
+                } else {
+                  queuePosition(
+                    pending.activity,
+                    pending.folderId,
+                    pending.imageId,
+                    pending.epoch,
+                  );
                 }
-                state.positionQueue.set(volumeId, pageId);
-                void flushPositionQueue();
               },
             );
           }
@@ -1286,9 +1456,43 @@
     }
   }
 
+  function drainPendingMutations() {
+    const drain = state.mutationBarrierTail.then(async () => {
+      while (true) {
+        const positionTail = ensurePositionFlush();
+        const selectionTail = state.selectionRequestTail;
+        await Promise.allSettled([positionTail, selectionTail]);
+        // Allow setSelection's confirmation/failure continuation to clear its
+        // pending marker after the serialized request tail settles.
+        await Promise.resolve();
+        if (
+          positionTail === state.positionFlushPromise
+          && selectionTail === state.selectionRequestTail
+          && !state.positionFlushActive
+          && state.positionQueue.size === 0
+          && state.selectionPending.size === 0
+        ) {
+          return;
+        }
+      }
+    });
+    state.mutationBarrierTail = drain.catch(() => {});
+    return drain;
+  }
+
+  function isCurrentImage(folderId, imageId, epoch) {
+    return (
+      epoch === state.activityEpoch
+      && state.currentFolder
+      && state.currentFolder.id === folderId
+      && currentImage()
+      && currentImage().id === imageId
+    );
+  }
+
   function loadCurrentImage() {
-    const page = currentPage();
-    if (!page) {
+    const image = currentImage();
+    if (!image) {
       return;
     }
     const token = ++state.imageRequestToken;
@@ -1296,32 +1500,32 @@
       state.imageController.abort();
     }
     state.imageController = new AbortController();
-    cancelPrefetch(page.id);
+    cancelPrefetch(image.id);
     elements.imageError.hidden = true;
     elements.imageLoading.hidden = false;
-    elements.pageImage.classList.add("is-loading");
+    elements.imageDisplay.classList.add("is-loading");
 
-    const prefetched = state.prefetchedImages.get(page.id);
+    const prefetched = state.prefetchedImages.get(image.id);
     if (prefetched) {
-      state.prefetchedImages.delete(page.id);
+      state.prefetchedImages.delete(image.id);
       installImageUrl(prefetched);
       return;
     }
-
-    requestImage(page.id, state.imageController.signal)
+    requestImage(image.id, state.imageController.signal)
       .then((blob) => {
-        if (token !== state.imageRequestToken) {
-          return;
+        if (token === state.imageRequestToken) {
+          installImageUrl(URL.createObjectURL(blob));
         }
-        installImageUrl(URL.createObjectURL(blob));
       })
       .catch((error) => {
         if (error.name !== "AbortError" && token === state.imageRequestToken) {
           elements.imageLoading.hidden = true;
-          elements.pageImage.classList.add("is-loading");
+          elements.imageDisplay.classList.add("is-loading");
           elements.imageError.hidden = false;
-          const message = elements.imageError.querySelector("p");
-          message.textContent = friendlyMessage(error, "This page image could not be loaded.");
+          elements.imageError.querySelector("p").textContent = friendlyMessage(
+            error,
+            "This image could not be loaded.",
+          );
         }
       });
   }
@@ -1331,76 +1535,142 @@
       URL.revokeObjectURL(state.currentImageUrl);
     }
     state.currentImageUrl = url;
-    elements.pageImage.src = url;
+    elements.imageDisplay.src = url;
   }
 
-  function pageImageLoaded() {
+  function imageLoaded() {
     elements.imageLoading.hidden = true;
     elements.imageError.hidden = true;
-    elements.pageImage.classList.remove("is-loading");
+    elements.imageDisplay.classList.remove("is-loading");
     syncSelectionFrame();
-    prefetchAdjacentPages();
+    prefetchAdjacentImages();
   }
 
-  function pageImageFailed() {
+  function imageFailed() {
     elements.imageLoading.hidden = true;
-    elements.pageImage.classList.add("is-loading");
+    elements.imageDisplay.classList.add("is-loading");
     elements.imageError.hidden = false;
   }
 
   function syncSelectionFrame() {
-    if (elements.readerScreen.hidden || !elements.pageImage.complete || !elements.pageImage.naturalWidth) {
+    if (
+      state.activity !== EDIT
+      || elements.readerScreen.hidden
+      || !elements.imageDisplay.complete
+      || !elements.imageDisplay.naturalWidth
+    ) {
       return;
     }
     const stageRect = elements.readerStage.getBoundingClientRect();
-    const imageRect = elements.pageImage.getBoundingClientRect();
+    const imageRect = elements.imageDisplay.getBoundingClientRect();
     elements.selectionFrame.style.setProperty("--frame-left", `${imageRect.left - stageRect.left}px`);
     elements.selectionFrame.style.setProperty("--frame-top", `${imageRect.top - stageRect.top}px`);
     elements.selectionFrame.style.setProperty("--frame-width", `${imageRect.width}px`);
     elements.selectionFrame.style.setProperty("--frame-height", `${imageRect.height}px`);
   }
 
-  function prefetchAdjacentPages() {
-    const volume = state.currentVolume;
-    if (!volume) {
+  function prefetchAdjacentImages() {
+    const folder = state.currentFolder;
+    if (!folder) {
       return;
     }
     cancelPrefetch();
-    const neighbors = [state.currentPageIndex - 1, state.currentPageIndex + 1]
-      .filter((index) => index >= 0 && index < volume.pages.length)
-      .map((index) => volume.pages[index]);
+    const neighbors = [state.currentImageIndex - 1, state.currentImageIndex + 1]
+      .filter((index) => index >= 0 && index < folder.images.length)
+      .map((index) => folder.images[index]);
     if (!neighbors.length) {
       return;
     }
     state.prefetchController = new AbortController();
     const signal = state.prefetchController.signal;
-    for (const page of neighbors) {
-      requestImage(page.id, signal)
+    for (const image of neighbors) {
+      requestImage(image.id, signal)
         .then((blob) => {
           if (!signal.aborted) {
-            const prior = state.prefetchedImages.get(page.id);
+            const prior = state.prefetchedImages.get(image.id);
             if (prior) {
               URL.revokeObjectURL(prior);
             }
-            state.prefetchedImages.set(page.id, URL.createObjectURL(blob));
+            state.prefetchedImages.set(image.id, URL.createObjectURL(blob));
           }
         })
         .catch(() => {
-          // Prefetch is opportunistic; current-page loading owns visible errors.
+          // Prefetch is opportunistic; current-image loading owns visible errors.
         });
     }
   }
 
-  function cancelPrefetch(keepPageId = "") {
+  function cancelPrefetch(keepImageId = "") {
     if (state.prefetchController) {
       state.prefetchController.abort();
       state.prefetchController = null;
     }
-    for (const [pageId, url] of state.prefetchedImages) {
-      if (pageId !== keepPageId) {
+    for (const [imageId, url] of state.prefetchedImages) {
+      if (imageId !== keepImageId) {
         URL.revokeObjectURL(url);
-        state.prefetchedImages.delete(pageId);
+        state.prefetchedImages.delete(imageId);
       }
+    }
+  }
+
+  function clearReaderMedia() {
+    state.imageRequestToken += 1;
+    if (state.imageController) {
+      state.imageController.abort();
+      state.imageController = null;
+    }
+    if (state.currentImageUrl) {
+      URL.revokeObjectURL(state.currentImageUrl);
+      state.currentImageUrl = null;
+      elements.imageDisplay.removeAttribute("src");
+    }
+    cancelPrefetch();
+  }
+
+  async function navigateBackAfterMutations() {
+    if (state.historyNavigationPending) {
+      return;
+    }
+    state.historyNavigationPending = true;
+    await drainPendingMutations();
+    window.history.back();
+    window.setTimeout(() => {
+      state.historyNavigationPending = false;
+    }, 500);
+  }
+
+  async function historyChanged(event) {
+    const changeToken = ++state.historyChangeToken;
+    await drainPendingMutations();
+    if (changeToken !== state.historyChangeToken) {
+      return;
+    }
+    state.historyNavigationPending = false;
+    const historyState = event.state && typeof event.state === "object" ? event.state : {};
+    if (historyState.view === "activity") {
+      const manga = state.library.find((candidate) => candidate.id === String(historyState.manga_id || ""));
+      showActivityChoice(manga || state.activityManga, { historyMode: "none" });
+      return;
+    }
+    if (historyState.view === "reader") {
+      const manga = state.library.find((candidate) => candidate.id === String(historyState.manga_id || ""));
+      showActivityChoice(manga || state.activityManga, { historyMode: "replace" });
+      return;
+    }
+    showLibrary({ historyMode: "none" });
+  }
+
+  function setHistory(historyState, mode) {
+    if (mode === "push") {
+      window.history.pushState(historyState, "", window.location.pathname);
+    } else if (mode === "replace") {
+      window.history.replaceState(historyState, "", window.location.pathname);
+    }
+  }
+
+  function showWarnings(warnings) {
+    if (Array.isArray(warnings) && warnings.length) {
+      showToast(String(warnings[0]), 3_000);
     }
   }
 
@@ -1447,34 +1717,16 @@
     if (!(error instanceof ApiError)) {
       return false;
     }
-    return isOneOf(
-      error.code,
-      "unpaired",
-      "not_paired",
+    return [
       "unauthorized",
-      "authorization_required",
-      "inactive",
-      "companion_inactive",
-      "mode_inactive",
+      "unpaired",
       "inactive_mode",
-      "not_active",
-      "lease_occupied",
       "lease_conflict",
-      "controller_conflict",
-      "controller_occupied",
-      "lease_lost",
       "lease_expired",
-      "not_controller",
       "stale_snapshot",
       "invalid_snapshot",
-      "shutdown",
-      "shutting_down",
       "shutdown_transition",
-    );
-  }
-
-  function isOneOf(value, ...choices) {
-    return choices.includes(String(value || "").toLowerCase());
+    ].includes(error.code);
   }
 
   function nonNegativeInteger(value) {
@@ -1483,7 +1735,7 @@
   }
 
   function plural(count, singular, pluralValue) {
-    return count === 1 ? singular : typeof pluralValue === "string" ? pluralValue : `${count} ${pluralValue}`;
+    return count === 1 ? singular : pluralValue;
   }
 
   bindEvents();

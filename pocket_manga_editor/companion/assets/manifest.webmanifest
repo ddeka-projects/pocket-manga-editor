@@ -2,7 +2,7 @@
   "id": "/",
   "name": "Pocket Manga Companion",
   "short_name": "Pocket Manga",
-  "description": "Read and select manga pages from Pocket Manga Editor on your local network.",
+  "description": "Read manga or edit image selections from Pocket Manga Editor on your local network.",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",

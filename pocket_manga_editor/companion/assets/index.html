@@ -89,90 +89,123 @@
           <div id="library-empty" class="empty-state" hidden>
             <span class="empty-glyph" aria-hidden="true">&#9638;</span>
             <h2>No manga available</h2>
-            <p>The current Companion snapshot does not contain a readable volume.</p>
+            <p>The current Companion snapshot does not contain a readable image folder.</p>
             <button id="empty-retry" class="secondary-button" type="button">Check again</button>
+          </div>
+        </section>
+
+        <section
+          id="activity-screen"
+          class="screen activity-screen"
+          hidden
+          aria-labelledby="activity-title"
+        >
+          <div class="activity-card">
+            <button
+              id="back-to-library"
+              class="activity-back secondary-button"
+              type="button"
+              aria-label="Back to library"
+            >
+              <span aria-hidden="true">&larr;</span>
+              Library
+            </button>
+            <p class="eyebrow">Choose an activity</p>
+            <h1 id="activity-title" tabindex="-1">Manga</h1>
+            <div class="activity-actions">
+              <button id="choose-read" class="activity-button" type="button">
+                <strong>Read</strong>
+                <span>Read without image-selection controls.</span>
+              </button>
+              <button id="choose-edit" class="activity-button" type="button">
+                <strong>Edit</strong>
+                <span>Review and select images for export.</span>
+              </button>
+            </div>
           </div>
         </section>
 
         <section id="reader-screen" class="screen reader-screen" hidden aria-label="Manga reader">
           <div id="reader-stage" class="reader-stage">
             <img
-              id="page-image"
-              class="page-image"
+              id="image-display"
+              class="image-display"
               alt=""
               draggable="false"
               decoding="async"
             >
 
-            <div id="selection-frame" class="selection-frame" aria-hidden="true">
+            <div id="selection-frame" class="selection-frame" hidden aria-hidden="true">
               <span id="selection-tab" class="selection-tab">&#10003;</span>
             </div>
 
             <div id="top-inert-band" class="top-inert-band" aria-hidden="true"></div>
 
             <div id="tap-zones" class="tap-zones" aria-label="Reader tap controls">
-              <button id="previous-zone" class="tap-zone previous-zone" type="button" aria-label="Previous page">
-                <span class="sr-only">Previous page</span>
+              <button id="previous-zone" class="tap-zone previous-zone" type="button" aria-label="Previous image">
+                <span class="sr-only">Previous image</span>
               </button>
               <button id="chrome-toggle" class="tap-zone chrome-toggle-zone" type="button" aria-label="Hide reader controls" aria-pressed="false">
                 <span class="sr-only">Show or hide reader controls</span>
               </button>
-              <button id="next-zone" class="tap-zone next-zone" type="button" aria-label="Next page">
-                <span class="sr-only">Next page</span>
+              <button id="next-zone" class="tap-zone next-zone" type="button" aria-label="Next image">
+                <span class="sr-only">Next image</span>
               </button>
             </div>
 
             <button
               id="selection-zone"
-              class="bottom-selection-zone chrome-toggle"
+              class="bottom-selection-zone"
               type="button"
-              aria-label="Select this page"
+              aria-label="Select this image"
               aria-pressed="false"
+              hidden
+              disabled
             >
-              <span class="sr-only">Select or deselect this page</span>
+              <span class="sr-only">Select or deselect this image</span>
             </button>
 
             <div id="top-chrome" class="top-chrome reader-chrome">
-              <div class="volume-control control-cluster">
-                <button id="back-to-library" class="reader-button back-button" type="button" aria-label="Back to library">
+              <div class="folder-control control-cluster">
+                <button id="back-to-activities" class="reader-button back-button" type="button" aria-label="Back to activity choice">
                   <svg viewBox="0 0 24 24" aria-hidden="true">
                     <path d="m15 18-6-6 6-6" />
                   </svg>
                 </button>
-                <label class="picker-shell volume-picker-shell">
-                  <span class="sr-only">Volume</span>
-                  <select id="volume-picker" aria-label="Choose volume"></select>
+                <label class="picker-shell folder-picker-shell">
+                  <span class="sr-only">Image folder</span>
+                  <select id="folder-picker" aria-label="Choose image folder"></select>
                   <span class="picker-chevron" aria-hidden="true"></span>
                 </label>
               </div>
 
-              <label class="picker-shell selected-picker-shell">
-                <span class="sr-only">Selected pages</span>
-                <select id="selected-picker" aria-label="Go to a selected page" disabled>
+              <label id="selected-picker-shell" class="picker-shell selected-picker-shell" hidden>
+                <span class="sr-only">Selected images</span>
+                <select id="selected-picker" aria-label="Go to a selected image" disabled>
                   <option value="">Selected &middot; 0</option>
                 </select>
                 <span class="picker-chevron" aria-hidden="true"></span>
               </label>
 
-              <label class="picker-shell page-picker-shell">
-                <span class="sr-only">Go to page</span>
-                <select id="page-picker" aria-label="Go to page"></select>
+              <label class="picker-shell image-picker-shell">
+                <span class="sr-only">Go to image</span>
+                <select id="image-picker" aria-label="Go to image"></select>
                 <span class="picker-chevron" aria-hidden="true"></span>
               </label>
             </div>
 
             <div id="bottom-chrome" class="bottom-chrome reader-chrome" aria-hidden="true">
-              <span id="bottom-volume">&mdash;</span>
-              <span id="bottom-page">&mdash;</span>
+              <span id="bottom-folder">&mdash;</span>
+              <span id="bottom-position">&mdash;</span>
             </div>
 
             <div id="image-loading" class="image-loading" role="status" hidden>
               <span class="loading-dot"></span>
-              <span class="sr-only">Loading page</span>
+              <span class="sr-only">Loading image</span>
             </div>
 
             <div id="image-error" class="image-error" role="alert" hidden>
-              <p>This page image could not be loaded.</p>
+              <p>This image could not be loaded.</p>
               <button id="image-retry" class="secondary-button" type="button">Retry image</button>
             </div>
 

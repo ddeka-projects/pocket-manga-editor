@@ -1,51 +1,58 @@
 # Pocket Manga Editor
 
-Pocket Manga Editor is a development-stage, keyboard-first desktop tool for reviewing manga JPG and PNG images and exporting a hand-picked set of pages. It reads chapter folders directly, so it does not need a separate volume-preparation phase. Reviewing and exporting do not modify source images; the explicitly confirmed **Complete Manga** operation permanently deletes the completed source folder.
+Pocket Manga Editor is a development-stage desktop editor with an iPhone Home
+Screen companion. It follows the source filesystem directly: a manga contains
+arbitrarily named image folders, and each folder contains JPG or PNG images.
+The app does not parse volumes or chapters and never combines folders into a
+constructed reading unit.
 
-The desktop application is implemented in the `pocket_manga_editor` Python package.
+Desktop and phone **Edit** share selections and editing position. Phone
+**Read** keeps a separate bookmark and has no selection behavior. Reviewing,
+reading, editing, and export do not modify source images. The explicitly
+confirmed **Complete Manga** operation permanently deletes its source folder.
 
-## Expected folders
+## Source library
 
 Choose a working directory containing one or more manga folders:
 
 ```text
 Working Directory/
-└── Manga Name/
-    ├── Vol. 01 Ch. 000.01/
-    │   ├── 001.jpg
-    │   ├── 002.png
-    │   └── 003.jpg
-    ├── Vol. 01 Ch. 001 - Another title/
-        ├── 001.jpg
-        └── 002.jpg
-    └── Vol. 02.5/
-        ├── 001.jpg
-        ├── 002.png
-        └── 054.18.png
+└── Kimi wa 08/
+    ├── V1_C01 - First Day/
+    │   ├── 1.jpg
+    │   ├── 2.png
+    │   └── 10.jpg
+    ├── Volume Two - Ch 12/
+    │   ├── page 1.png
+    │   └── page 2.png
+    └── Bonus artwork/
+        └── extra-cover.JPG
 ```
 
-Folder and page numbers are parsed numerically. The current development version intentionally accepts only these conventions:
+- Every normal direct child of the working directory is a manga, except
+  `.pocket-manga-editor`. The exact manga name `.library-mutation.lock` is also
+  reserved for the cross-process library lock.
+- Every direct child of a manga containing at least one direct `.jpg` or `.png`
+  file is an image folder.
+- Extensions are case-insensitive and exact folder names and complete image
+  filenames are preserved.
+- Folders and filenames use deterministic, case-insensitive natural ordering,
+  so `1.jpg`, `2.jpg`, and `10.jpg` appear in that order.
+- Nested folders, images directly in the manga root, JPEG files using `.jpeg`,
+  archives, PDFs, symlinks, and other formats are not included.
 
-- Required chapter folder portion: `Vol. <digits> Ch. <digits or decimal>`
-- Optional suffix: ` - <chapter name>`
-- Direct volume folder: `Vol. <digits or decimal>`
-- Page file: `<3 digits>[.<decimal digits>].jpg` or `.png`, such as `054.png` or `054.18.png` (extensions are case-insensitive)
-
-All matching chapters for one volume appear in the viewer as a single continuous virtual volume. A direct volume folder is already one volume, so its pages are read directly without a preparation step. The two storage styles can be mixed for different volumes in one manga. If the same numeric volume appears in both styles, that volume is skipped and reported as a scan issue rather than being combined ambiguously.
-
-Volume, chapter, and page identifiers are sorted numerically, including decimals. The optional chapter name has no effect on sorting or export. Original number spelling is preserved for display and generated paths. Numerically equivalent identifiers such as `000.1` and `000.10` are reported as an ambiguous duplicate instead of being silently combined.
+Renaming an image or folder creates a new identity. Stale saved references are
+ignored; the app does not infer renames.
 
 ## Development setup
 
-Python 3.10 or newer is required. From the repository root on Windows:
+Python 3.10 or newer is required. On Windows:
 
 ```powershell
 py -m venv .venv
 .venv\Scripts\python -m pip install -r requirements.txt
 .venv\Scripts\python run.py
 ```
-
-The package entry point also works: `.venv\Scripts\python -m pocket_manga_editor`.
 
 On macOS:
 
@@ -55,113 +62,126 @@ python3 -m venv .venv
 .venv/bin/python run.py
 ```
 
-Packaging is deliberately out of scope during this development phase.
+Packaging remains out of scope during development.
 
-## Review controls
+## Desktop editing
 
-The viewer gives portrait pages most of the window while library controls, page
-details, review actions, and export controls stay together in a scrollable
-sidebar on the right. Essential keycap hints remain pinned at the bottom. Drag
-the divider to resize either side; the chosen split is remembered. Press `?` or
-`F1` at any time to see the complete help dialog.
+The desktop is always an editing surface. Choose a manga and an exact source
+folder, then review and select images. Progress and selections autosave.
 
 | Key | Action |
 | --- | --- |
-| `←` / `→` | Previous or next page |
-| `Ctrl+←` / `Ctrl+→` | Previous or next selected page |
-| `Space` | Select or deselect the current page |
-| `Enter` | Select the current page and advance |
-| `Home` / `End` | First or last page |
-| `Ctrl+S` | Export selected pages |
+| `←` / `→` | Previous or next image |
+| `Ctrl+←` / `Ctrl+→` | Previous or next selected image in the folder |
+| `Space` | Select or deselect the current image |
+| `Enter` | Select the current image and advance |
+| `Home` / `End` | First or last image |
+| `Ctrl+S` | Synchronize the current manga output |
 | `F5` | Rescan the working directory |
 | `?` / `F1` | Show keyboard help |
 
-The same primary actions are available as buttons. A selected page is indicated with a green border, a checkmark badge, and an updated selected count.
+## App-managed workspace
 
-## Saved progress and export
-
-Selection changes and the current page are saved automatically as relative paths under:
+Each manga has an isolated workspace:
 
 ```text
-<working-directory>/.pocket-manga-editor/selections/
+Working Directory/.pocket-manga-editor/
+└── Kimi wa 08/
+    ├── reading.json
+    ├── editing.json
+    ├── output/
+    │   └── V1_C01 - First Day/
+    │       └── V1_C01 - First Day__2.png
+    ├── completed/
+    │   ├── batch-0001/
+    │   └── batch-0002/
+    └── .transactions/
 ```
 
-Choosing **Export Selected** copies the current selection to:
+`reading.json` contains only phone reading bookmarks. `editing.json` contains
+desktop/phone editing positions, exact selected filenames, and output ownership
+records. The files are written atomically while holding the cross-process
+library mutation lock.
 
-```text
-<working-directory>/.pocket-manga-editor/output/<manga-name>/Vol.01/
-```
+This is an application-owned directory. Do not manually edit active JSON or
+managed output. The exporter nevertheless preserves untracked files and refuses
+to overwrite or remove a managed file whose bytes changed after export.
 
-This keeps selections, export bookkeeping, and exported images together under
-`.pocket-manga-editor`; source manga folders are not given generated `Output`
-subdirectories.
+This release is a clean development-stage break. It does not read or migrate
+the former global `selections`, `exports`, `output`, `completed`, or completion
+log layout. Remove the old `.pocket-manga-editor` directory before testing this
+model if the workspace was created by an earlier build.
 
-For chapter-based sources, exported names include both chapter and page numbers, such as `C002_P017.jpg`. Direct-volume pages use names such as `P017.png`. The source image format is preserved. Repeat exports remove only stale files recorded as app-created; unrelated files in the output folder are preserved. If an exported image has been edited since the last export, the app refuses to overwrite or remove it. Selections remain available after export until the user explicitly clears them.
+## Whole-manga export
+
+One **Export Manga** action reconciles every edited folder in the current manga.
+After success, each app-managed output folder exactly represents that folder's
+current selections:
+
+- newly selected images are copied;
+- unchanged selected images are retained and verified;
+- deselected managed images are removed;
+- a managed folder with no selections is removed only if it becomes empty;
+- unrelated files are preserved; and
+- modified managed files or name/path collisions stop the export before data is
+  overwritten.
+
+Exported names are `<exact folder name>__<exact image filename>` and retain the
+original image bytes and extension. The multi-folder operation is transactional;
+failed or interrupted work is rolled back or recovered before new mutations.
 
 ## Completing a manga
 
-After all desired volumes have been exported, **Complete Manga** moves that
-manga's entire output folder to:
+**Complete Manga** requires at least one verified app-managed exported image.
+After destructive confirmation, it moves the complete active output into the
+next immutable per-manga batch, such as:
 
 ```text
-<working-directory>/.pocket-manga-editor/completed/<manga-name>/
+.pocket-manga-editor/Kimi wa 08/completed/batch-0001/
 ```
 
-Completion then permanently deletes the source manga folder along with its
-saved selections and export bookkeeping. The app always asks for destructive
-confirmation, and shows an additional warning when the current source and
-output volume folders do not match. Completion is refused when there are no
-exported pages or when a folder with the same manga name already exists in
-`completed`.
-
-Each successful batch is appended to
-`.pocket-manga-editor/completed/completion-log.json`, including its timestamp,
-source and output volumes, and exported page names. The completed manga folder
-can be moved elsewhere while the log remains in place. This allows a later
-batch of newly released volumes for the same ongoing manga to be completed and
-recorded separately. Completion is journaled, and an interrupted batch is
-automatically rolled back or cleaned up before the next library scan.
+It then permanently deletes the source manga and removes active `reading.json`
+and `editing.json`. Earlier batches remain unchanged. A later same-name source
+manga reuses the workspace and can create `batch-0002`. No global completion
+log or source/output coverage comparison is used; source folders without
+selections are valid. Completion is journaled and recovered before scanning.
 
 ## Mobile Companion Mode
 
-Companion Mode serves a private mobile reader from the desktop application over
-the local network. One paired phone can browse the complete scanned library,
-read pages, change selections, and update the saved current page. Export,
-completion, deletion, folder changes, and rescanning remain desktop-only.
+Companion Mode serves an installable reader/editor over the trusted local
+network. After tapping a manga, the phone always asks:
 
-To set it up:
+- **Read** — selection-free reading using only `reading.json`.
+- **Edit** — shared desktop/mobile position and selections using `editing.json`.
 
-1. Reserve a stable IP address for the PC in the router's DHCP settings.
-2. In the sidebar's **Mobile Companion** card, open **Connection…** and enter
-   that address and a fixed port. The default port is `8765`.
-3. Allow the Python application through the Windows or macOS firewall if the OS
-   prompts on the first server start.
-4. Choose **Pair Phone**, open the displayed `http://<reserved-ip>:<port>/`
-   address on the iPhone, and enter the one-time code.
-5. In Safari, use **Share → Add to Home Screen** for the stable standalone app.
-6. Choose **Start Companion Mode** on the PC whenever the phone should own
-   review progress. Choose **End Companion Mode** to reload the confirmed mobile
-   selections and position on the desktop.
+Returning from the reader goes back to this choice. Read and Edit can resume at
+different folders and images. Export, completion, deletion, rescanning, and
+working-directory changes remain desktop-only.
 
-Only one Pocket Manga Editor desktop process and one mobile controller are
-allowed. Pairing is remembered until **Forget Phone** is used. A disconnected
-phone does not end Companion Mode; use **Disconnect Mobile Client** to release a
-stale lease or **End Companion Mode** to return ownership to the PC.
+Setup:
 
-Companion traffic uses unencrypted HTTP and is intended only for a trusted home
-LAN. It is not an internet-access or cloud feature. The PC must remain awake,
-the desktop application must remain running, and the phone must be able to reach
-the reserved PC address. See [Companion Mode setup and troubleshooting](docs/companion-mode.md)
-for architecture, security boundaries, and common connection failures.
+1. Reserve a stable IP address for the PC in the router.
+2. Open **Connection…** in the desktop Mobile Companion card and enter that
+   address and a fixed port (`8765` by default).
+3. Permit the application on private networks if the firewall prompts.
+4. Choose **Pair Phone**, open the displayed address, and enter the one-time code.
+5. In Safari, choose **Share → Add to Home Screen**.
+6. Use **Start Companion Mode** and **End Companion Mode** to transfer exclusive
+   review ownership safely.
 
-## Run tests
+Only one desktop process and one mobile controller are allowed. Companion uses
+unencrypted HTTP and is intended only for a trusted home LAN; do not expose it
+with port forwarding. See [Companion Mode](docs/companion-mode.md) for details.
 
-The test suite covers scanning, saved sessions, exporting, completion and crash
-recovery, singleton and cross-process mutation locking, Companion authorization,
-API/media security, mobile asset contracts, and the responsive desktop layout.
-Install the development requirements first; the GUI checks use PySide6's
-offscreen platform and do not open a window:
+## Tests
+
+Install the development requirements, then run:
 
 ```powershell
 py -m unittest discover -s tests -v
 ```
+
+The suite covers discovery and natural ordering, independent metadata,
+transactional export and completion, crash recovery, singleton and mutation
+locks, Companion authorization/activity isolation, authenticated images,
+mobile asset contracts, and the desktop layout.

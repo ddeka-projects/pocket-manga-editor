@@ -47,24 +47,29 @@ class CompanionAssetContractTests(unittest.TestCase):
         self.parser = _DocumentContractParser()
         self.parser.feed(self.html)
 
-    def test_shell_has_unique_state_library_and_reader_controls(self) -> None:
+    def test_shell_has_unique_library_activity_and_reader_controls(self) -> None:
         self.assertEqual(len(self.parser.ids), len(set(self.parser.ids)))
         required_ids = {
             "state-screen",
             "pair-form",
             "library-screen",
             "library-list",
+            "activity-screen",
+            "activity-title",
+            "back-to-library",
+            "choose-read",
+            "choose-edit",
             "reader-screen",
-            "page-image",
+            "image-display",
             "selection-frame",
             "previous-zone",
             "selection-zone",
             "next-zone",
             "chrome-toggle",
-            "back-to-library",
-            "volume-picker",
+            "back-to-activities",
+            "folder-picker",
             "selected-picker",
-            "page-picker",
+            "image-picker",
             "action-error-retry",
         }
         self.assertTrue(required_ids.issubset(self.parser.ids))
@@ -99,25 +104,48 @@ class CompanionAssetContractTests(unittest.TestCase):
         self.assertIn("prefers-reduced-motion: reduce", self.css)
         self.assertIn("-webkit-touch-callout: none", self.css)
         self.assertIn('target < 0', self.javascript)
-        self.assertIn('target >= volume.pages.length', self.javascript)
-        self.assertIn("prefetchAdjacentPages", self.javascript)
-        self.assertIn("lastVolumeByManga", self.javascript)
+        self.assertIn('target >= folder.images.length', self.javascript)
+        self.assertIn("prefetchAdjacentImages", self.javascript)
         self.assertIn("selection-pending-add", self.javascript)
         self.assertIn("selection-failed", self.javascript)
-        self.assertIn("responseRevision >= volume.revision", self.javascript)
+        self.assertIn("responseRevision >= folder.revision", self.javascript)
+        self.assertIn("selectionRequestTail: Promise.resolve()", self.javascript)
+        self.assertIn(
+            "state.selectionRequestTail = request.catch(() => {})",
+            self.javascript,
+        )
+        self.assertIn(
+            "aggregateAccepted && Number.isInteger(selection.manga_selected_count)",
+            self.javascript,
+        )
+        self.assertIn(
+            "The prior folder retains its last confirmed reading position.",
+            self.javascript,
+        )
+        self.assertIn(
+            "The prior folder retains its last confirmed selection state.",
+            self.javascript,
+        )
         self.assertIn("applySelectionConfirmation", self.javascript)
         self.assertIn(
             'id="chrome-toggle" class="tap-zone chrome-toggle-zone"',
             self.html,
         )
         self.assertIn(
-            'class="bottom-selection-zone chrome-toggle"',
+            'class="bottom-selection-zone"',
             self.html,
         )
+        self.assertIn('id="selection-frame" class="selection-frame" hidden', self.html)
+        self.assertIn('state.activity !== EDIT', self.javascript)
+        self.assertIn('elements.selectionZone.hidden = !editing', self.javascript)
         self.assertNotIn("Saving selection…", self.javascript)
         self.assertNotIn("Saving deselection…", self.javascript)
         self.assertNotIn("Selected ✓", self.javascript)
         self.assertNotIn('showReaderFeedback(confirmed ? "Selected', self.javascript)
+        show_reader = self.javascript.split("function showReader() {", 1)[1].split(
+            "function showImage", 1
+        )[0]
+        self.assertIn("clearReaderFeedback()", show_reader)
 
     def test_javascript_uses_only_the_companion_api_and_exact_write_payloads(self) -> None:
         required_routes = {
@@ -127,9 +155,12 @@ class CompanionAssetContractTests(unittest.TestCase):
             'heartbeat: "/api/controller/heartbeat"',
             'release: "/api/controller/release"',
             'library: "/api/library"',
-            "`/api/manga/${encodeURIComponent(id)}`",
-            "`/api/volume/${encodeURIComponent(id)}`",
-            "`/api/page/${encodeURIComponent(id)}/image`",
+            "`/api/manga/${encodeURIComponent(id)}?activity=${encodeURIComponent(activity)}`",
+            "`/api/folder/${encodeURIComponent(id)}?activity=${encodeURIComponent(activity)}`",
+            "`/api/image/${encodeURIComponent(id)}`",
+            "`/api/read/folder/${encodeURIComponent(id)}/position`",
+            "`/api/edit/folder/${encodeURIComponent(id)}/position`",
+            "`/api/edit/folder/${encodeURIComponent(id)}/selection`",
         }
         for route in required_routes:
             with self.subTest(route=route):
@@ -139,20 +170,85 @@ class CompanionAssetContractTests(unittest.TestCase):
             'body: { client_id: state.clientId, page_id: state.pageInstanceId }',
             self.javascript,
         )
-        self.assertIn('body: { page_id: page.id, selected: desired }', self.javascript)
-        self.assertIn('body: { page_id: pageId }', self.javascript)
-        self.assertIn('const status = payload.status || payload', self.javascript)
+        self.assertIn('body: { image_id: image.id, selected: desired }', self.javascript)
+        self.assertIn('body: { image_id: pending.imageId }', self.javascript)
+        self.assertIn('const status = payload.status;', self.javascript)
         self.assertIn('"X-Companion-Instance": state.clientId', self.javascript)
         self.assertIn('"X-Companion-Page": state.pageInstanceId', self.javascript)
         self.assertIn("window.sessionStorage.getItem", self.javascript)
         self.assertIn("pageInstanceId: createOpaqueId()", self.javascript)
         self.assertIn(
-            "showPage(confirmedIndex, { persist: false })",
+            "showImage(confirmedIndex, { persist: false })",
             self.javascript,
         )
+        self.assertIn('view: "activity"', self.javascript)
+        self.assertIn('view: "reader"', self.javascript)
+        self.assertIn("window.addEventListener(\"popstate\"", self.javascript)
         self.assertNotIn("innerHTML", self.javascript)
         self.assertNotIn("/api/export", self.javascript)
         self.assertNotIn("/api/complete", self.javascript)
+        self.assertNotIn("/api/volume", self.javascript)
+        self.assertNotIn("/api/page", self.javascript)
+        self.assertNotIn("chapterLabel", self.javascript)
+
+    def test_activity_choice_is_explicit_neutral_and_accessible(self) -> None:
+        self.assertIn("Choose an activity", self.html)
+        self.assertIn("Read without image-selection controls.", self.html)
+        self.assertIn("Review and select images for export.", self.html)
+        self.assertIn('id="activity-title" tabindex="-1"', self.html)
+        self.assertIn('aria-label="Back to library"', self.html)
+        self.assertIn("showActivityChoice(manga", self.javascript)
+        self.assertIn("chooseActivity(READ)", self.javascript)
+        self.assertIn("chooseActivity(EDIT)", self.javascript)
+        self.assertNotIn("selectedCount: nonNegativeInteger(manga", self.javascript)
+        self.assertNotIn("selectedCount: activity === EDIT", self.javascript)
+        self.assertNotIn("mangaSelectedCount: activity === EDIT", self.javascript)
+
+        show_library = self.javascript.split(
+            'function showLibrary({ historyMode = "none" } = {}) {', 1
+        )[1].split("function showActivityChoice", 1)[0]
+        self.assertIn("state.viewRequestToken += 1", show_library)
+        self.assertIn("state.activityEpoch += 1", show_library)
+        self.assertIn("state.activity = null", show_library)
+        self.assertIn("state.currentFolder = null", show_library)
+        self.assertIn(
+            'await chooseActivity(activity, { historyMode: "none" })',
+            self.javascript,
+        )
+
+    def test_activity_changes_drain_confirmed_mutations_before_rebinding(self) -> None:
+        self.assertIn("positionFlushPromise: Promise.resolve()", self.javascript)
+        self.assertIn("mutationBarrierTail: Promise.resolve()", self.javascript)
+        self.assertIn("function drainPendingMutations()", self.javascript)
+        self.assertIn(
+            "await Promise.allSettled([positionTail, selectionTail])",
+            self.javascript,
+        )
+        self.assertIn(
+            'elements.backToActivities.addEventListener("click", navigateBackAfterMutations)',
+            self.javascript,
+        )
+
+        choose_activity = self.javascript.split(
+            'async function chooseActivity(activity, { historyMode = "push" } = {}) {',
+            1,
+        )[1].split("function normalizeFolderSummary", 1)[0]
+        self.assertLess(
+            choose_activity.index("await drainPendingMutations()"),
+            choose_activity.index("const requestToken = ++state.viewRequestToken"),
+        )
+        self.assertLess(
+            choose_activity.index("await drainPendingMutations()"),
+            choose_activity.index("requestJson(ROUTES.manga"),
+        )
+
+        history_change = self.javascript.split(
+            "async function historyChanged(event) {", 1
+        )[1].split("function setHistory", 1)[0]
+        self.assertLess(
+            history_change.index("await drainPendingMutations()"),
+            history_change.index('historyState.view === "activity"'),
+        )
 
     def test_manifest_and_code_native_icons_are_installable(self) -> None:
         manifest = json.loads(

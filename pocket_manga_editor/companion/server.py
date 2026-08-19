@@ -14,6 +14,7 @@ import threading
 import time
 from urllib.parse import urlsplit
 
+from ..path_safety import is_link_or_reparse
 from .api import (
     APIResponse,
     CompanionAPI,
@@ -26,7 +27,7 @@ from .coordinator import CompanionCoordinator
 
 DEFAULT_PORT = 8765
 MAX_HTTP_WORKERS = 16
-_CLIENT_PROTOCOL_ASSET_VERSION = "page-lease-v2"
+_CLIENT_PROTOCOL_ASSET_VERSION = "filesystem-activity-v1"
 _HOSTNAME = re.compile(
     r"^(?=.{1,253}\.?$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*"
     r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.?$"
@@ -406,7 +407,7 @@ class CompanionHTTPService:
                 if name is None or name not in _ASSET_NAMES:
                     return api._error(404, "not_found", "The requested asset does not exist.")
                 source = assets_root / name
-                if source.is_symlink() or not source.is_file():
+                if is_link_or_reparse(source) or not source.is_file():
                     if name == "index.html":
                         body = (
                             b"<!doctype html><html><head><meta charset=utf-8>"
@@ -435,6 +436,15 @@ class CompanionHTTPService:
                         ),
                         1,
                     )
+                    body = body.replace(
+                        b'href="/assets/styles.css"',
+                        (
+                            b'href="/assets/styles.css?v='
+                            + _CLIENT_PROTOCOL_ASSET_VERSION.encode("ascii")
+                            + b'"'
+                        ),
+                        1,
+                    )
                 content_type = {
                     ".webmanifest": "application/manifest+json",
                     ".svg": "image/svg+xml",
@@ -450,7 +460,7 @@ class CompanionHTTPService:
                         (
                             "Cache-Control",
                             "no-cache"
-                            if name in {"index.html", "app.js"}
+                            if name in {"index.html", "app.js", "styles.css"}
                             else "public, max-age=3600",
                         ),
                     ),

@@ -14,11 +14,12 @@ from .coordinator import (
 )
 from .server import CompanionHTTPService, HTTPServiceStatus
 from .snapshot import LibrarySnapshot
-from .state import CompanionState
+from .state import CompanionActivity, CompanionState
 
 __all__ = [
     "CompanionCoordinator",
     "CompanionHTTPService",
+    "CompanionActivity",
     "CompanionState",
     "CoordinatorStatus",
     "CredentialPersistenceError",
