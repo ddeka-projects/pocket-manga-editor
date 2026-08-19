@@ -241,6 +241,27 @@ class FilesystemOperationTests(RepositoryFixture):
 
         self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep")
 
+    def test_windows_file_sync_uses_writable_descriptor_and_restores_mode(self) -> None:
+        staged = self.root / "staged.jpg"
+        staged.write_bytes(b"staged")
+        staged.chmod(stat.S_IRUSR)
+        opened_flags: list[int] = []
+        real_open = os.open
+
+        def record_open(path, flags, *args, **kwargs):
+            opened_flags.append(flags)
+            return real_open(path, flags, *args, **kwargs)
+
+        with patch.object(exporter_module, "_WINDOWS_FILE_SYNC", True), patch.object(
+            exporter_module.os, "open", side_effect=record_open
+        ), patch.object(exporter_module.os, "fsync") as fsync:
+            exporter_module._fsync_file(staged)
+
+        self.assertEqual(len(opened_flags), 1)
+        self.assertEqual(opened_flags[0] & os.O_ACCMODE, os.O_RDWR)
+        fsync.assert_called_once()
+        self.assertFalse(stat.S_IMODE(staged.stat().st_mode) & stat.S_IWRITE)
+
     def test_managed_removal_refuses_a_mounted_root_before_deletion(self) -> None:
         tree = self.root / "tree"
         tree.mkdir()

@@ -47,6 +47,7 @@ _EXPORT_TRANSACTION_PREFIX = "export-"
 _RETIRED_EXPORT_TRANSACTION_PREFIX = ".retired-export-"
 _JOURNAL_NAME = "transaction.json"
 _DIGEST = re.compile(r"[0-9a-f]{64}")
+_WINDOWS_FILE_SYNC = os.name == "nt"
 
 
 class ExportError(RuntimeError):
@@ -1110,11 +1111,32 @@ def _fsync_tree(path: Path) -> None:
 
 
 def _fsync_file(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
+    # On Windows os.fsync() calls the CRT _commit(), which rejects a
+    # read-only descriptor with EBADF.  Staged copies may also retain a
+    # read-only attribute, so make only the staged file temporarily writable
+    # and restore its original mode after the flush.
+    original_mode: int | None = None
+    if _WINDOWS_FILE_SYNC:
+        information = path.stat(follow_symlinks=False)
+        current_mode = stat.S_IMODE(information.st_mode)
+        if not current_mode & stat.S_IWRITE:
+            original_mode = current_mode
+            os.chmod(path, current_mode | stat.S_IWRITE)
+
+    flags = os.O_RDWR if _WINDOWS_FILE_SYNC else os.O_RDONLY
+    if _WINDOWS_FILE_SYNC and hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
+    descriptor = -1
     try:
+        descriptor = os.open(path, flags)
         os.fsync(descriptor)
     finally:
-        os.close(descriptor)
+        try:
+            if descriptor >= 0:
+                os.close(descriptor)
+        finally:
+            if original_mode is not None:
+                os.chmod(path, original_mode)
 
 
 def _tree_matches(path: Path, expected_digest: object) -> bool:
