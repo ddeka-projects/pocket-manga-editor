@@ -128,6 +128,8 @@
     positionFlushPromise: Promise.resolve(),
     mutationBarrierTail: Promise.resolve(),
     activityOpening: false,
+    entryNavigationPending: false,
+    entryNavigationToken: 0,
     historyNavigationPending: false,
     historyChangeToken: 0,
   };
@@ -750,6 +752,8 @@
     state.activity = null;
     state.currentManga = null;
     state.currentFolder = null;
+    state.entryNavigationPending = false;
+    state.entryNavigationToken += 1;
     renderLibrary();
     elements.stateScreen.hidden = true;
     elements.activityScreen.hidden = true;
@@ -774,6 +778,8 @@
     state.activity = null;
     state.currentManga = null;
     state.currentFolder = null;
+    state.entryNavigationPending = false;
+    state.entryNavigationToken += 1;
     elements.activityTitle.textContent = manga.name;
     elements.stateScreen.hidden = true;
     elements.libraryScreen.hidden = true;
@@ -884,7 +890,12 @@
   async function openFolder(
     folderId,
     preferredImageId = "",
-    { persist = false, historyMode = "none", requestEpoch = state.activityEpoch } = {},
+    {
+      persist = false,
+      historyMode = "none",
+      requestEpoch = state.activityEpoch,
+      startAtFirst = false,
+    } = {},
   ) {
     const activity = state.activity;
     if (!activity) {
@@ -942,7 +953,13 @@
       }
       const requestedIndex = images.findIndex((image) => image.id === preferredImageId);
       const savedIndex = images.findIndex((image) => image.id === state.currentFolder.currentImageId);
-      const index = requestedIndex >= 0 ? requestedIndex : savedIndex >= 0 ? savedIndex : 0;
+      const index = startAtFirst
+        ? 0
+        : requestedIndex >= 0
+          ? requestedIndex
+          : savedIndex >= 0
+            ? savedIndex
+            : 0;
       showImage(index, { persist: false });
       if (persist) {
         queuePosition(activity, state.currentFolder.id, images[index].id, requestEpoch);
@@ -954,12 +971,23 @@
           elements.folderPicker.value = state.currentFolder.id;
         }
         if (isSessionGateError(error)) {
-          handleSessionError(error, () => openFolder(folderId, preferredImageId, { persist, requestEpoch }));
+          handleSessionError(
+            error,
+            () => openFolder(
+              folderId,
+              preferredImageId,
+              { persist, requestEpoch, startAtFirst },
+            ),
+          );
         } else {
           showActionError(
             "Couldn’t open folder",
             friendlyMessage(error),
-            () => openFolder(folderId, preferredImageId, { persist, requestEpoch }),
+            () => openFolder(
+              folderId,
+              preferredImageId,
+              { persist, requestEpoch, startAtFirst },
+            ),
           );
         }
       }
@@ -1078,20 +1106,66 @@
   }
 
   function navigateImage(direction) {
+    if (state.entryNavigationPending) {
+      return;
+    }
     const folder = state.currentFolder;
     if (!folder || !folder.images.length) {
       return;
     }
     const target = state.currentImageIndex + direction;
     if (target < 0) {
-      showBoundaryCue("First image", "left");
+      void navigateAdjacentEntry(-1);
       return;
     }
     if (target >= folder.images.length) {
-      showBoundaryCue("Last image", "right");
+      void navigateAdjacentEntry(1);
       return;
     }
     showImage(target);
+  }
+
+  async function navigateAdjacentEntry(direction) {
+    const manga = state.currentManga;
+    const folder = state.currentFolder;
+    const step = direction < 0 ? -1 : 1;
+    const edge = step < 0 ? "left" : "right";
+    if (!manga || !folder || state.entryNavigationPending) {
+      return;
+    }
+    const currentFolderIndex = manga.folders.findIndex(
+      (candidate) => candidate.id === folder.id,
+    );
+    if (currentFolderIndex < 0) {
+      showBoundaryCue(step < 0 ? "No Previous Entry" : "No Next Entry", edge);
+      return;
+    }
+    const targetFolderIndex = currentFolderIndex + step;
+    if (targetFolderIndex < 0) {
+      showBoundaryCue("No Previous Entry", edge);
+      return;
+    }
+    if (targetFolderIndex >= manga.folders.length) {
+      showBoundaryCue("No Next Entry", edge);
+      return;
+    }
+
+    const targetFolder = manga.folders[targetFolderIndex];
+    const requestEpoch = state.activityEpoch;
+    const navigationToken = ++state.entryNavigationToken;
+    state.entryNavigationPending = true;
+    showBoundaryCue(step < 0 ? "Previous Entry" : "Next Entry", edge);
+    try {
+      await openFolder(targetFolder.id, "", {
+        persist: true,
+        requestEpoch,
+        startAtFirst: true,
+      });
+    } finally {
+      if (navigationToken === state.entryNavigationToken) {
+        state.entryNavigationPending = false;
+      }
+    }
   }
 
   function updateReaderLabels() {

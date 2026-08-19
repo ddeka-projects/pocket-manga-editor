@@ -105,6 +105,8 @@ class CompanionAssetContractTests(unittest.TestCase):
         self.assertIn("-webkit-touch-callout: none", self.css)
         self.assertIn('target < 0', self.javascript)
         self.assertIn('target >= folder.images.length', self.javascript)
+        self.assertIn('void navigateAdjacentEntry(-1)', self.javascript)
+        self.assertIn('void navigateAdjacentEntry(1)', self.javascript)
         self.assertIn("prefetchAdjacentImages", self.javascript)
         self.assertIn("selection-pending-add", self.javascript)
         self.assertIn("selection-failed", self.javascript)
@@ -146,6 +148,32 @@ class CompanionAssetContractTests(unittest.TestCase):
             "function showImage", 1
         )[0]
         self.assertIn("clearReaderFeedback()", show_reader)
+
+    def test_reader_boundaries_open_adjacent_entries_at_the_first_image(self) -> None:
+        navigation = self.javascript.split(
+            "async function navigateAdjacentEntry(direction) {", 1
+        )[1].split("function updateReaderLabels", 1)[0]
+        self.assertIn("const targetFolderIndex = currentFolderIndex + step", navigation)
+        self.assertIn('showBoundaryCue("No Previous Entry", edge)', navigation)
+        self.assertIn('showBoundaryCue("No Next Entry", edge)', navigation)
+        self.assertIn('step < 0 ? "Previous Entry" : "Next Entry"', navigation)
+        self.assertIn("startAtFirst: true", navigation)
+        self.assertIn("persist: true", navigation)
+        self.assertNotIn('showBoundaryCue("First image"', self.javascript)
+        self.assertNotIn('showBoundaryCue("Last image"', self.javascript)
+
+        open_folder = self.javascript.split(
+            "async function openFolder(", 1
+        )[1].split("function normalizeImage", 1)[0]
+        self.assertIn("startAtFirst = false", open_folder)
+        self.assertIn("const index = startAtFirst", open_folder)
+        self.assertLess(open_folder.index("? 0"), open_folder.index("savedIndex >= 0"))
+
+        folder_change = self.javascript.split(
+            'elements.folderPicker.addEventListener("change", (event) => {', 1
+        )[1].split("elements.selectedPicker", 1)[0]
+        self.assertIn('openFolder(folderId, "", { persist: true })', folder_change)
+        self.assertNotIn("startAtFirst", folder_change)
 
     def test_javascript_uses_only_the_companion_api_and_exact_write_payloads(self) -> None:
         required_routes = {
