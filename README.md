@@ -166,8 +166,10 @@ Setup:
 3. Permit the application on private networks if the firewall prompts.
 4. Choose **Pair Phone**, open the displayed address, and enter the one-time code.
 5. In Safari, choose **Share → Add to Home Screen**.
-6. Use **Start Companion Mode** and **End Companion Mode** to transfer exclusive
-   review ownership safely.
+6. On later launches, a remembered paired phone automatically puts the app into
+   Companion Mode when the saved library and Companion server are available.
+7. Use **End Companion Mode** to return ownership to the desktop. **Start
+   Companion Mode** remains available for manual entry when no phone is remembered.
 
 Only one desktop process and one mobile controller are allowed. Companion uses
 unencrypted HTTP and is intended only for a trusted home LAN; do not expose it

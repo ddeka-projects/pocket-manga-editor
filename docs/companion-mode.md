@@ -76,6 +76,12 @@ SameSite=Strict cookie; the PC stores only its SHA-256 verifier. Protected
 requests include `X-Companion-Instance` and `X-Companion-Page`. A separate
 per-document claim prevents a duplicated tab from sharing authority.
 
+After a phone has been paired, launching the desktop application automatically
+enters Companion Mode when its saved working folder scans successfully and the
+Companion server is running. The phone does not need to be online at that moment;
+it can reconnect later. Missing credentials, an unavailable server, or an empty
+or invalid saved library leave the application in desktop mode instead.
+
 ## Troubleshooting
 
 ### Connection refused

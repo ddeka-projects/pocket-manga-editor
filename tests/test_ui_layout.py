@@ -20,6 +20,7 @@ from pocket_manga_editor.companion import (  # noqa: E402
     CompanionActivity,
     CompanionCoordinator,
     CompanionState,
+    CredentialVerifierStore,
 )
 from pocket_manga_editor.exporter import (  # noqa: E402
     MangaExportResult,
@@ -527,6 +528,51 @@ class FilesystemLayoutTests(unittest.TestCase):
         self.assertFalse(
             (self.root / ".pocket-manga-editor" / manga.name / "completed").exists()
         )
+
+    def test_remembered_phone_enters_companion_mode_at_startup(self) -> None:
+        self.window.close()
+        self.window.deleteLater()
+        QApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        self.app.processEvents()
+
+        credential_store = CredentialVerifierStore(
+            self.root / ".test-companion-device.json"
+        )
+        pairing_coordinator = CompanionCoordinator(
+            credential_store=credential_store
+        )
+        pairing = pairing_coordinator.start_pairing()
+        pairing_coordinator.pair(pairing.code)
+        coordinator = CompanionCoordinator(credential_store=credential_store)
+        server = FakeCompanionServer()
+        with patch.object(QMessageBox, "question") as question:
+            self.window = MainWindow(
+                companion_coordinator=coordinator,
+                companion_server=server,  # type: ignore[arg-type]
+            )
+            self.app.processEvents()
+
+        self.assertEqual(
+            coordinator.status().state, CompanionState.COMPANION_ACTIVE
+        )
+        self.assertTrue(self.window._companion_ui_active)
+        self.assertIs(
+            self.window.viewer_stack.currentWidget(),
+            self.window.companion_status_panel,
+        )
+        self.assertFalse(self.window.folder_combo.isEnabled())
+        self.assertIn("started automatically", self.window.statusBar().currentMessage())
+        question.assert_not_called()
+
+    def test_unpaired_phone_keeps_desktop_mode_at_startup(self) -> None:
+        coordinator, _server = self._replace_window_with_companion()
+        self.app.processEvents()
+
+        self.assertEqual(
+            coordinator.status().state, CompanionState.DESKTOP_ACTIVE
+        )
+        self.assertFalse(self.window._companion_ui_active)
+        self.assertTrue(self.window.folder_combo.isEnabled())
 
     def test_companion_edit_reloads_shared_position_and_selection(self) -> None:
         coordinator, _server = self._replace_window_with_companion()

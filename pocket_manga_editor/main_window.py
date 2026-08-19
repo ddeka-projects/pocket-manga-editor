@@ -238,6 +238,11 @@ class MainWindow(QMainWindow):
         self._companion_status_timer = QTimer(self)
         self._companion_status_timer.setInterval(750)
         self._companion_status_timer.timeout.connect(self._refresh_companion_status)
+        self._companion_startup_timer = QTimer(self)
+        self._companion_startup_timer.setSingleShot(True)
+        self._companion_startup_timer.timeout.connect(
+            self._start_companion_mode_at_startup
+        )
 
         self._create_actions()
         self._build_interface()
@@ -262,6 +267,11 @@ class MainWindow(QMainWindow):
                 "confirmed Complete Manga operation permanently deletes its source folder."
             )
             QTimer.singleShot(0, self.choose_working_directory)
+        if (
+            self.companion_coordinator is not None
+            and self.companion_coordinator.status().paired
+        ):
+            self._companion_startup_timer.start(0)
 
     def _create_actions(self) -> None:
         self.choose_folder_action = QAction("Choose Working Folder…", self)
@@ -911,28 +921,54 @@ class MainWindow(QMainWindow):
     def start_companion_mode(self) -> None:
         """Flush desktop state and transfer review ownership to the HTTP service."""
 
+        self._enter_companion_mode(automatic=False)
+
+    def _start_companion_mode_at_startup(self) -> None:
+        """Enter Companion ownership when a remembered phone is available."""
+
         coordinator = self.companion_coordinator
         server = self.companion_server
         if coordinator is None or server is None:
-            QMessageBox.warning(
-                self,
-                "Companion unavailable",
-                "The Companion service was not initialized for this application run.",
-            )
             return
+        status = coordinator.status()
+        if (
+            not status.paired
+            or status.last_error is not None
+            or status.state is not CompanionState.DESKTOP_ACTIVE
+            or self.working_directory is None
+            or not self.scan_result.mangas
+            or not server.running
+        ):
+            return
+        self._enter_companion_mode(automatic=True)
+
+    def _enter_companion_mode(self, *, automatic: bool) -> bool:
+        """Run the shared safe handoff for manual and automatic entry."""
+
+        coordinator = self.companion_coordinator
+        server = self.companion_server
+        if coordinator is None or server is None:
+            if not automatic:
+                QMessageBox.warning(
+                    self,
+                    "Companion unavailable",
+                    "The Companion service was not initialized for this application run.",
+                )
+            return False
         state = coordinator.status().state
         if state is CompanionState.COMPANION_ACTIVE:
             self.viewer_stack.setCurrentWidget(self.companion_status_panel)
-            return
+            return True
         if state is not CompanionState.DESKTOP_ACTIVE:
-            QMessageBox.warning(
-                self,
-                "Companion needs attention",
-                "Companion Mode is in a transition or error state. Use the status "
-                "panel to finish or recover the handoff before trying again.",
-            )
+            if not automatic:
+                QMessageBox.warning(
+                    self,
+                    "Companion needs attention",
+                    "Companion Mode is in a transition or error state. Use the status "
+                    "panel to finish or recover the handoff before trying again.",
+                )
             self._set_companion_ui(True)
-            return
+            return False
         if (
             self.working_directory is None
             or not self.scan_result.mangas
@@ -943,44 +979,58 @@ class MainWindow(QMainWindow):
                 if not self.scan_result.mangas
                 else "Start or retry the Companion server first."
             )
-            QMessageBox.warning(self, "Cannot start Companion Mode", detail)
-            return
+            if automatic:
+                self.statusBar().showMessage(
+                    f"Automatic Companion Mode was not started: {detail}", 10000
+                )
+            else:
+                QMessageBox.warning(self, "Cannot start Companion Mode", detail)
+            return False
 
-        answer = QMessageBox.question(
-            self,
-            "Start Companion Mode",
-            "Transfer review control to one paired phone?\n\n"
-            "Desktop navigation, selections, export, completion, rescan, and "
-            "working-folder changes will be locked until Companion Mode ends.\n\n"
-            f"Mobile address:\n{server.url}"
-            + (
-                "\n\nOnly a PC-local address was detected. Configure this PC's "
-                "reserved LAN address under Connection… before opening it on the phone."
-                if not server.status().lan_address_available
-                else ""
-            ),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Cancel,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
-            return
+        if not automatic:
+            answer = QMessageBox.question(
+                self,
+                "Start Companion Mode",
+                "Transfer review control to one paired phone?\n\n"
+                "Desktop navigation, selections, export, completion, rescan, and "
+                "working-folder changes will be locked until Companion Mode ends.\n\n"
+                f"Mobile address:\n{server.url}"
+                + (
+                    "\n\nOnly a PC-local address was detected. Configure this PC's "
+                    "reserved LAN address under Connection… before opening it on the phone."
+                    if not server.status().lan_address_available
+                    else ""
+                ),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return False
 
         if not self._save_session() or self._pending_session_saves:
-            QMessageBox.warning(
-                self,
-                "Progress has not finished saving",
+            detail = (
                 "Companion Mode was not started because desktop progress could not "
-                "be saved safely. Wait for the current library operation and try again.",
+                "be saved safely. Wait for the current library operation and try again."
             )
-            return
+            if automatic:
+                self.statusBar().showMessage(detail, 10000)
+            else:
+                QMessageBox.warning(
+                    self,
+                    "Progress has not finished saving",
+                    detail,
+                )
+            return False
         rescanned, _recovery = self._rescan(require_save_success=True)
         if not rescanned or not self.scan_result.mangas:
-            QMessageBox.warning(
-                self,
-                "Cannot start Companion Mode",
-                "The library could not be refreshed into a non-empty snapshot.",
-            )
-            return
+            detail = "The library could not be refreshed into a non-empty snapshot."
+            if automatic:
+                self.statusBar().showMessage(
+                    f"Automatic Companion Mode was not started: {detail}", 10000
+                )
+            else:
+                QMessageBox.warning(self, "Cannot start Companion Mode", detail)
+            return False
 
         try:
             coordinator.enter_companion(self.working_directory, self.scan_result)
@@ -992,7 +1042,7 @@ class MainWindow(QMainWindow):
                 "Companion handoff failed",
                 f"Desktop and mobile writes remain blocked until recovery.\n\n{exc}",
             )
-            return
+            return False
 
         self._session_save_timer.stop()
         self._set_companion_ui(True)
@@ -1000,8 +1050,14 @@ class MainWindow(QMainWindow):
         if not coordinator.status().paired:
             self.start_pairing()
         self.statusBar().showMessage(
-            "Companion Mode active; review ownership is on the phone.", 8000
+            (
+                "Companion Mode started automatically; review ownership is on the phone."
+                if automatic
+                else "Companion Mode active; review ownership is on the phone."
+            ),
+            8000,
         )
+        return True
 
     def end_companion_mode(self) -> None:
         """Drain mobile writes, reload editing state, then restore desktop ownership."""
