@@ -62,7 +62,47 @@ python3 -m venv .venv
 .venv/bin/python run.py
 ```
 
-Packaging remains out of scope during development.
+## Building the Windows portable application
+
+Build the Windows application on Windows itself; PyInstaller does not
+cross-compile Windows executables from macOS or Linux.
+
+Double-click `build-windows.cmd`, or run it from PowerShell/Command Prompt:
+
+```powershell
+.\build-windows.cmd
+```
+
+The first build creates an isolated `.build-venv` and installs the build
+dependencies. Every build installs any changed requirements, runs the complete
+test suite, recreates the application, and produces:
+
+```text
+release/
+├── Pocket Manga Editor/
+│   ├── Pocket Manga Editor.exe
+│   ├── PORTABLE-README.txt
+│   └── _internal/
+└── Pocket-Manga-Editor-Windows-<architecture>.zip
+```
+
+Distribute the ZIP or the entire `Pocket Manga Editor` folder. The executable
+depends on `_internal`, so do not move the EXE out of that folder. Generated
+build environments and output are ignored by Git; the build launcher, PowerShell
+script, PyInstaller specification, and build requirements are tracked.
+
+For a quicker local packaging pass after tests have already run, use:
+
+```powershell
+.\build-windows.cmd -SkipTests
+```
+
+Use `-FreshEnvironment` if the isolated build environment ever needs to be
+recreated.
+
+These are unsigned local builds. Windows may show a SmartScreen warning on a
+newly downloaded ZIP; code signing can be added later if the application is
+distributed beyond your own machines.
 
 ## Desktop editing
 

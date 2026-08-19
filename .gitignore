@@ -1,6 +1,10 @@
 __pycache__/
 *.py[cod]
 .venv/
+/.build-venv/
+/build/
+/dist/
+/release/
 .pytest_cache/
 .idea/
 .vscode/
