@@ -894,7 +894,7 @@
       persist = false,
       historyMode = "none",
       requestEpoch = state.activityEpoch,
-      startAtFirst = false,
+      entryEdge = "",
     } = {},
   ) {
     const activity = state.activity;
@@ -953,13 +953,15 @@
       }
       const requestedIndex = images.findIndex((image) => image.id === preferredImageId);
       const savedIndex = images.findIndex((image) => image.id === state.currentFolder.currentImageId);
-      const index = startAtFirst
+      const index = entryEdge === "first"
         ? 0
-        : requestedIndex >= 0
-          ? requestedIndex
-          : savedIndex >= 0
-            ? savedIndex
-            : 0;
+        : entryEdge === "last"
+          ? images.length - 1
+          : requestedIndex >= 0
+            ? requestedIndex
+            : savedIndex >= 0
+              ? savedIndex
+              : 0;
       showImage(index, { persist: false });
       if (persist) {
         queuePosition(activity, state.currentFolder.id, images[index].id, requestEpoch);
@@ -976,7 +978,7 @@
             () => openFolder(
               folderId,
               preferredImageId,
-              { persist, requestEpoch, startAtFirst },
+              { persist, requestEpoch, entryEdge },
             ),
           );
         } else {
@@ -986,7 +988,7 @@
             () => openFolder(
               folderId,
               preferredImageId,
-              { persist, requestEpoch, startAtFirst },
+              { persist, requestEpoch, entryEdge },
             ),
           );
         }
@@ -1159,7 +1161,7 @@
       await openFolder(targetFolder.id, "", {
         persist: true,
         requestEpoch,
-        startAtFirst: true,
+        entryEdge: step < 0 ? "last" : "first",
       });
     } finally {
       if (navigationToken === state.entryNavigationToken) {

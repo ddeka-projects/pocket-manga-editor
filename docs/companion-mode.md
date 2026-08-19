@@ -23,11 +23,11 @@ does not carry position or selection presentation across the boundary.
 Both activities show one contained image on a black viewport and prefetch only
 its adjacent images. In the middle band, the left 30% moves back, the center 40%
 shows or hides controls, and the right 30% moves forward. At a folder boundary,
-back or forward opens the adjacent folder at its first image; navigation stops
-only at the first or last folder in the manga. Choosing a folder from the picker
-instead resumes that folder's saved image. In Edit, the lower band selects or
-deselects the image. In Read, that lower band is disabled and does not intercept
-taps.
+forward opens the next folder's first image, while back opens the previous
+folder's last image. Navigation stops only at the first or last folder in the
+manga. Choosing a folder from the picker instead resumes that folder's saved
+image. In Edit, the lower band selects or deselects the image. In Read, that
+lower band is disabled and does not intercept taps.
 
 Folder and image pickers display exact source names. Edit also has a
 current-folder selected-image picker and the confirmed green frame/checkmark.
