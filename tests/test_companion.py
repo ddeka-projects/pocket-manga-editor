@@ -52,7 +52,6 @@ from pocket_manga_editor.companion.state import (
 from pocket_manga_editor.scanner import scan_working_directory
 from pocket_manga_editor.storage import (
     EditingStore,
-    ReadingFolderState,
     ReadingSnapshot,
     ReadingStore,
 )
@@ -304,12 +303,47 @@ class ReviewPersistenceTests(CompanionFixture):
         )
         reading = ReadingStore(self.root).load(manga.ref)
         editing = EditingStore(self.root).load(manga.ref)
-        self.assertEqual(reading.folders[folder.ref.name].current_image, "2.PNG")
-        self.assertEqual(editing.folders[folder.ref.name].current_image, "10.jpg")
+        self.assertEqual(reading.last_folder, folder.ref.name)
+        self.assertEqual(reading.last_image, "2.PNG")
+        self.assertEqual(editing.last_folder, folder.ref.name)
+        self.assertEqual(editing.last_image, "10.jpg")
         self.assertEqual(
             editing.folders[folder.ref.name].selected_images, frozenset({"1.jpg"})
         )
         self.assertEqual(selection.manga_selected_count, 1)
+
+    def test_only_latest_manga_position_resumes_and_other_folders_start_first(self) -> None:
+        snapshot = self.build_snapshot()
+        manga = snapshot.mangas[0]
+        first_folder = snapshot.folder(manga.folder_ids[0])
+        second_folder = snapshot.folder(manga.folder_ids[1])
+        review = ReviewService(snapshot)
+        review.set_position(
+            CompanionActivity.EDIT,
+            first_folder.id,
+            first_folder.image_ids[-1],
+        )
+        review.set_position(
+            CompanionActivity.EDIT,
+            second_folder.id,
+            second_folder.image_ids[0],
+        )
+
+        manga_payload = review.manga_payload(manga.id, CompanionActivity.EDIT)[
+            "manga"
+        ]
+        first_payload = review.folder_payload(
+            first_folder.id, CompanionActivity.EDIT
+        )["folder"]
+
+        self.assertEqual(manga_payload["current_folder_id"], second_folder.id)
+        self.assertEqual(
+            manga_payload["current_image_id"], second_folder.image_ids[0]
+        )
+        self.assertTrue(
+            all("current_image_id" not in item for item in manga_payload["folders"])
+        )
+        self.assertEqual(first_payload["current_image_id"], first_folder.image_ids[0])
 
     def test_read_payload_contains_no_paths_or_selection_semantics(self) -> None:
         snapshot = self.build_snapshot()
@@ -332,13 +366,9 @@ class ReviewPersistenceTests(CompanionFixture):
     def test_mobile_warnings_never_expose_storage_error_paths(self) -> None:
         snapshot = self.build_snapshot()
         manga = snapshot.mangas[0]
-        folder_states = {
-            folder.name: ReadingFolderState(folder.images[0].name)
-            for folder in manga.ref.folders
-        }
         loaded = ReadingSnapshot(
             manga.ref.folders[0].name,
-            folder_states,
+            manga.ref.folders[0].images[0].name,
             (f"Could not read {self.root}/private/reading.json",),
         )
         with patch.object(ReadingStore, "load", return_value=loaded):
@@ -372,10 +402,7 @@ class ReviewPersistenceTests(CompanionFixture):
         review.set_position(CompanionActivity.EDIT, folder_id, tenth_id)
         review.set_selection(CompanionActivity.EDIT, folder_id, first_id, True)
         editing = EditingStore(self.root).load(manga.ref)
-        self.assertEqual(
-            editing.folders[snapshot.folder(folder_id).ref.name].current_image,
-            "10.jpg",
-        )
+        self.assertEqual(editing.last_image, "10.jpg")
 
 
 class CoordinatorLifecycleTests(CompanionFixture):
@@ -833,13 +860,16 @@ class CompanionAPITests(CompanionFixture):
         self.assertEqual(self.payload(selected)["selection"]["manga_selected_count"], 1)
         manga_ref = self.snapshot.mangas[0].ref
         folder_name = self.snapshot.folder(folder_id).ref.name
+        reading = ReadingStore(self.root).load(manga_ref)
+        self.assertEqual(reading.last_folder, folder_name)
+        self.assertEqual(reading.last_image, "2.PNG")
+        editing = EditingStore(self.root).load(manga_ref)
+        self.assertEqual(editing.last_folder, folder_name)
+        self.assertEqual(editing.last_image, "10.jpg")
         self.assertEqual(
-            ReadingStore(self.root).load(manga_ref).folders[folder_name].current_image,
-            "2.PNG",
+            editing.folders[folder_name].selected_images,
+            frozenset({"1.jpg"}),
         )
-        editing = EditingStore(self.root).load(manga_ref).folders[folder_name]
-        self.assertEqual(editing.current_image, "10.jpg")
-        self.assertEqual(editing.selected_images, frozenset({"1.jpg"}))
 
     def test_activity_rebind_rejects_queued_writes_from_the_old_activity(self) -> None:
         self.assertEqual(self.claim().status, 200)

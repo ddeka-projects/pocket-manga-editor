@@ -172,6 +172,25 @@ class FilesystemLayoutTests(unittest.TestCase):
         )
         self.assertEqual(self.window.image_name_label.text(), "scan 2.png")
 
+    def test_manga_open_resumes_latest_pair_but_folder_picker_starts_first(self) -> None:
+        manga = self.window.current_manga
+        store = self.window.editing_store
+        assert manga is not None and store is not None
+        first, _second = manga.folders
+        store.set_position(manga, first.name, "scan 10.png")
+        self.window.current_manga = None
+        self.window.current_folder = None
+
+        self.window._populate_folders(manga)
+        self.assertEqual(self.window.current_folder, first)
+        self.assertEqual(self.window.image_name_label.text(), "scan 10.png")
+
+        self.window.folder_combo.setCurrentIndex(1)
+        self.window.folder_combo.setCurrentIndex(0)
+
+        self.assertEqual(self.window.current_folder, first)
+        self.assertEqual(self.window.image_name_label.text(), "scan 2.png")
+
     def test_canvas_dominates_split_and_sidebar_scrolls(self) -> None:
         self._show_window()
         left_width, right_width = self.window.main_splitter.sizes()
@@ -295,7 +314,8 @@ class FilesystemLayoutTests(unittest.TestCase):
         self.window._session_save_timer.stop()
         self.assertTrue(self.window._flush_pending_session_saves())
         restored = store.load(manga)
-        self.assertEqual(restored.folders[first.name].current_image, "scan 10.png")
+        self.assertEqual(restored.last_folder, first.name)
+        self.assertEqual(restored.last_image, "scan 10.png")
         self.assertEqual(
             restored.folders[first.name].selected_images,
             frozenset({"scan 10.png"}),
@@ -322,7 +342,8 @@ class FilesystemLayoutTests(unittest.TestCase):
         self.window._session_save_timer.stop()
         self.assertTrue(self.window._flush_pending_session_saves())
         restored = store.load(manga)
-        self.assertEqual(restored.folders[folder.name].current_image, "scan 10.png")
+        self.assertEqual(restored.last_folder, folder.name)
+        self.assertEqual(restored.last_image, "scan 10.png")
         self.assertEqual(
             restored.folders[folder.name].selected_images,
             frozenset({"scan 10.png"}),
@@ -366,7 +387,7 @@ class FilesystemLayoutTests(unittest.TestCase):
         first = export_manga(self.root, manga)
         self.assertTrue(first.output_directory.is_dir())
         store.set_selection(manga, folder.name, image.name, False)
-        self.window._populate_folders(manga, folder.name)
+        self.window._populate_folders(manga)
 
         with (
             patch.object(
@@ -483,7 +504,7 @@ class FilesystemLayoutTests(unittest.TestCase):
         image = folder.images[0]
         store.set_selection(manga, folder.name, image.name, True)
         export_manga(self.root, manga)
-        self.window._populate_folders(manga, folder.name)
+        self.window._populate_folders(manga)
         self.window._session_save_timer.start(1000)
         with (
             patch.object(
@@ -515,7 +536,7 @@ class FilesystemLayoutTests(unittest.TestCase):
         assert manga is not None and folder is not None and store is not None
         store.set_selection(manga, folder.name, folder.images[0].name, True)
         result = export_manga(self.root, manga)
-        self.window._populate_folders(manga, folder.name)
+        self.window._populate_folders(manga)
         with patch.object(
             QMessageBox,
             "warning",

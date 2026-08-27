@@ -8,7 +8,7 @@ from pathlib import Path
 import stat
 
 from .library_lock import LOCK_FILENAME
-from .models import MangaRef
+from .models import FolderRef, ImageRef, MangaRef
 from .path_safety import is_link_or_reparse
 
 
@@ -121,6 +121,37 @@ def validate_completion_workspace(paths: MangaWorkspacePaths) -> MangaWorkspaceP
 def validate_live_manga(working_directory: str | Path, manga: MangaRef) -> Path:
     """Prove a model still names safe, direct source folders and images."""
 
+    root, resolved_source = validate_live_manga_root(working_directory, manga)
+
+    folder_names: set[str] = set()
+    for folder in manga.folders:
+        if folder.name in folder_names:
+            raise WorkspaceError("The manga model contains a duplicate folder name.")
+        folder_names.add(folder.name)
+        _validate_component(folder.name, "folder")
+        resolved_folder = _validate_live_folder(resolved_source, folder)
+        if not folder.images:
+            raise WorkspaceError(f"Source folder '{folder.name}' contains no images.")
+
+        image_names: set[str] = set()
+        for image in folder.images:
+            if image.name in image_names:
+                raise WorkspaceError(
+                    f"Source folder '{folder.name}' contains a duplicate image name."
+                )
+            image_names.add(image.name)
+            _validate_component(image.name, "image")
+            if Path(image.name).suffix.casefold() not in {".jpg", ".png"}:
+                raise WorkspaceError(f"Source image '{image.name}' is not JPG or PNG.")
+            _validate_live_image(resolved_folder, folder, image)
+    return resolved_source
+
+
+def validate_live_manga_root(
+    working_directory: str | Path, manga: MangaRef
+) -> tuple[Path, Path]:
+    """Validate only the library and manga roots for an ordinary state load."""
+
     root = _resolve_root(working_directory)
     manga_workspace_paths(root, manga.name)
     source = Path(manga.path)
@@ -137,67 +168,80 @@ def validate_live_manga(working_directory: str | Path, manga: MangaRef) -> Path:
         raise WorkspaceError(
             "The source manga is not an exact direct child of the working directory."
         )
+    return root, resolved_source
 
-    folder_names: set[str] = set()
-    for folder in manga.folders:
-        if folder.name in folder_names:
-            raise WorkspaceError("The manga model contains a duplicate folder name.")
-        folder_names.add(folder.name)
-        _validate_component(folder.name, "folder")
-        folder_path = Path(folder.path)
-        if is_link_or_reparse(folder_path):
-            raise WorkspaceError(
-                f"Source folder '{folder.name}' cannot be a symbolic link or junction."
-            )
-        try:
-            folder_information = folder_path.stat(follow_symlinks=False)
-            resolved_folder = folder_path.resolve(strict=True)
-        except OSError as exc:
-            raise WorkspaceError(
-                f"Source folder '{folder.name}' could not be inspected: {exc}"
-            ) from exc
-        if (
-            not stat.S_ISDIR(folder_information.st_mode)
-            or resolved_folder.parent != resolved_source
-            or resolved_folder.name != folder.name
-        ):
-            raise WorkspaceError(
-                f"Source folder '{folder.name}' is not an exact direct child of its manga."
-            )
-        if not folder.images:
-            raise WorkspaceError(f"Source folder '{folder.name}' contains no images.")
 
-        image_names: set[str] = set()
-        for image in folder.images:
-            if image.name in image_names:
-                raise WorkspaceError(
-                    f"Source folder '{folder.name}' contains a duplicate image name."
-                )
-            image_names.add(image.name)
-            _validate_component(image.name, "image")
-            if Path(image.name).suffix.casefold() not in {".jpg", ".png"}:
-                raise WorkspaceError(f"Source image '{image.name}' is not JPG or PNG.")
-            image_path = Path(image.path)
-            if is_link_or_reparse(image_path):
-                raise WorkspaceError(
-                    f"Source image '{folder.name}/{image.name}' cannot be a link."
-                )
-            try:
-                image_information = image_path.stat(follow_symlinks=False)
-                resolved_image = image_path.resolve(strict=True)
-            except OSError as exc:
-                raise WorkspaceError(
-                    f"Source image '{folder.name}/{image.name}' could not be inspected: {exc}"
-                ) from exc
-            if (
-                not stat.S_ISREG(image_information.st_mode)
-                or resolved_image.parent != resolved_folder
-                or resolved_image.name != image.name
-            ):
-                raise WorkspaceError(
-                    f"Source image '{folder.name}/{image.name}' is not a safe direct child."
-                )
-    return resolved_source
+def validate_live_manga_item(
+    working_directory: str | Path,
+    manga: MangaRef,
+    folder: FolderRef,
+    image: ImageRef | None = None,
+) -> Path:
+    """Validate one live folder or image without walking the whole manga."""
+
+    _root, resolved_source = validate_live_manga_root(working_directory, manga)
+    if not any(candidate is folder for candidate in manga.folders):
+        raise WorkspaceError("The source folder is not part of the manga snapshot.")
+    resolved_folder = _validate_live_folder(resolved_source, folder)
+    if image is None:
+        return resolved_folder
+    if not any(candidate is image for candidate in folder.images):
+        raise WorkspaceError("The source image is not part of its folder snapshot.")
+    return _validate_live_image(resolved_folder, folder, image)
+
+
+def _validate_live_folder(resolved_source: Path, folder: FolderRef) -> Path:
+    _validate_component(folder.name, "folder")
+    folder_path = Path(folder.path)
+    if is_link_or_reparse(folder_path):
+        raise WorkspaceError(
+            f"Source folder '{folder.name}' cannot be a symbolic link or junction."
+        )
+    try:
+        information = folder_path.stat(follow_symlinks=False)
+        resolved_folder = folder_path.resolve(strict=True)
+    except OSError as exc:
+        raise WorkspaceError(
+            f"Source folder '{folder.name}' could not be inspected: {exc}"
+        ) from exc
+    if (
+        not stat.S_ISDIR(information.st_mode)
+        or resolved_folder.parent != resolved_source
+        or resolved_folder.name != folder.name
+    ):
+        raise WorkspaceError(
+            f"Source folder '{folder.name}' is not an exact direct child of its manga."
+        )
+    return resolved_folder
+
+
+def _validate_live_image(
+    resolved_folder: Path, folder: FolderRef, image: ImageRef
+) -> Path:
+    _validate_component(image.name, "image")
+    if Path(image.name).suffix.casefold() not in {".jpg", ".png"}:
+        raise WorkspaceError(f"Source image '{image.name}' is not JPG or PNG.")
+    image_path = Path(image.path)
+    if is_link_or_reparse(image_path):
+        raise WorkspaceError(
+            f"Source image '{folder.name}/{image.name}' cannot be a link."
+        )
+    try:
+        information = image_path.stat(follow_symlinks=False)
+        resolved_image = image_path.resolve(strict=True)
+    except OSError as exc:
+        raise WorkspaceError(
+            f"Source image '{folder.name}/{image.name}' could not be inspected: {exc}"
+        ) from exc
+    if (
+        not stat.S_ISREG(information.st_mode)
+        or resolved_image.parent != resolved_folder
+        or resolved_image.name != image.name
+    ):
+        raise WorkspaceError(
+            f"Source image '{folder.name}/{image.name}' is not a safe direct child."
+        )
+    return resolved_image
 
 
 def _validate_workspace_identity(paths: MangaWorkspacePaths) -> MangaWorkspacePaths:

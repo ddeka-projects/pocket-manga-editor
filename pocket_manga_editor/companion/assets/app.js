@@ -178,7 +178,7 @@
     elements.folderPicker.addEventListener("change", (event) => {
       const folderId = event.currentTarget.value;
       if (folderId) {
-        void openFolder(folderId, "", { persist: true });
+        void openFolder(folderId, "", { persist: true, entryEdge: "first" });
       }
     });
     elements.selectedPicker.addEventListener("change", (event) => {
@@ -832,6 +832,7 @@
         id: String(raw.id || manga.id),
         name: String(raw.name || manga.name),
         currentFolderId: String(raw.current_folder_id || ""),
+        currentImageId: String(raw.current_image_id || ""),
         folders,
       };
       if (activity === EDIT) {
@@ -849,7 +850,7 @@
       populateFolderPicker(folders);
       const preferred = folders.find((folder) => folder.id === state.currentManga.currentFolderId)
         || folders[0];
-      await openFolder(preferred.id, preferred.currentImageId, {
+      await openFolder(preferred.id, state.currentManga.currentImageId, {
         persist: false,
         historyMode,
         requestEpoch: epoch,
@@ -879,7 +880,6 @@
       id: String(folder && folder.id || ""),
       name: String(folder && folder.name || "Untitled folder"),
       imageCount: nonNegativeInteger(folder && folder.image_count),
-      currentImageId: String(folder && folder.current_image_id || ""),
     };
     if (activity === EDIT) {
       normalized.selectedCount = nonNegativeInteger(folder && folder.selected_count);
@@ -1423,7 +1423,6 @@
     }
     const summary = state.currentManga.folders.find((candidate) => candidate.id === folder.id);
     if (summary) {
-      summary.currentImageId = folder.currentImageId;
       if (state.activity === EDIT) {
         summary.selectedCount = folder.selectedCount;
       }
@@ -1434,7 +1433,8 @@
   }
 
   function queuePosition(activity, folderId, imageId, epoch) {
-    const key = `${activity}:${folderId}`;
+    const mangaId = state.currentManga ? state.currentManga.id : folderId;
+    const key = `${activity}:${mangaId}`;
     state.positionQueue.set(key, { activity, folderId, imageId, epoch });
     ensurePositionFlush();
   }
@@ -1473,6 +1473,10 @@
             state.currentFolder.currentImageId = String(
               position.current_image_id || pending.imageId,
             );
+            if (state.currentManga) {
+              state.currentManga.currentFolderId = pending.folderId;
+              state.currentManga.currentImageId = state.currentFolder.currentImageId;
+            }
             state.currentFolder.revision = nonNegativeInteger(
               position.revision ?? state.currentFolder.revision,
             );

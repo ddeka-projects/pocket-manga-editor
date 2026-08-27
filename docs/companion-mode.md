@@ -8,11 +8,12 @@ Screen app owns the mobile controller lease.
 
 Tapping a manga always opens an activity choice before metadata is loaded:
 
-- **Read** uses only the manga's `reading.json`. It remembers a last folder and
-  one exact current filename per visited folder. It contains no selected counts,
+- **Read** uses only the manga's `reading.json`. It remembers one latest folder
+  and exact image filename for the manga. It contains no selected counts,
   selection controls, indicators, or selection requests.
-- **Edit** uses the same `editing.json` as the desktop. It remembers editing
-  position, exact selected filenames, and output ownership records.
+- **Edit** uses the same `editing.json` as the desktop. It remembers one latest
+  folder/image pair for the manga, exact selected filenames, and output
+  ownership records. Only folders with selections need a selection entry.
 
 Returning from the reader returns to the activity choice; returning again opens
 the manga library. Switching activity loads the other metadata document and
@@ -25,9 +26,9 @@ its adjacent images. In the middle band, the left 30% moves back, the center 40%
 shows or hides controls, and the right 30% moves forward. At a folder boundary,
 forward opens the next folder's first image, while back opens the previous
 folder's last image. Navigation stops only at the first or last folder in the
-manga. Choosing a folder from the picker instead resumes that folder's saved
-image. In Edit, the lower band selects or deselects the image. In Read, that
-lower band is disabled and does not intercept taps.
+manga. Choosing a folder from the picker opens its first image. In Edit, the
+lower band selects or deselects the image. In Read, that lower band is disabled
+and does not intercept taps.
 
 Folder and image pickers display exact source names. Edit also has a
 current-folder selected-image picker and the confirmed green frame/checkmark.

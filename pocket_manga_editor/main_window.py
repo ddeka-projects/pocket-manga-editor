@@ -1518,7 +1518,6 @@ class MainWindow(QMainWindow):
         preferred_manga = self.current_manga.name if self.current_manga else str(
             self.settings.value("library/last_manga", "")
         )
-        preferred_folder = self.current_folder.name if self.current_folder else None
         export_recovery = None
         try:
             # Output and editing.json must be reconciled before completion
@@ -1622,7 +1621,7 @@ class MainWindow(QMainWindow):
             return False, recovery
 
         self._update_scan_issues()
-        self._populate_mangas(preferred_manga, preferred_folder)
+        self._populate_mangas(preferred_manga)
         manga_count = len(self.scan_result.mangas)
         folder_count = sum(len(manga.folders) for manga in self.scan_result.mangas)
         self.statusBar().showMessage(
@@ -1669,9 +1668,7 @@ class MainWindow(QMainWindow):
         self._refresh_companion_status()
         return True, recovery
 
-    def _populate_mangas(
-        self, preferred_manga: str, preferred_folder: str | None
-    ) -> None:
+    def _populate_mangas(self, preferred_manga: str) -> None:
         self.manga_combo.blockSignals(True)
         self.manga_combo.clear()
         for manga in self.scan_result.mangas:
@@ -1708,7 +1705,7 @@ class MainWindow(QMainWindow):
         self.manga_combo.blockSignals(False)
         self.manga_combo.setEnabled(True)
         manga = self.manga_combo.currentData()
-        self._populate_folders(manga, preferred_folder)
+        self._populate_folders(manga)
 
     def _on_manga_changed(self, _index: int) -> None:
         if not self._desktop_mutation_allowed(notify=False):
@@ -1717,11 +1714,9 @@ class MainWindow(QMainWindow):
         manga = self.manga_combo.currentData()
         if not isinstance(manga, MangaRef):
             return
-        self._populate_folders(manga, None)
+        self._populate_folders(manga)
 
-    def _populate_folders(
-        self, manga: MangaRef, preferred_folder: str | None
-    ) -> None:
+    def _populate_folders(self, manga: MangaRef) -> None:
         self._save_session()
         self.current_manga = manga
         self.current_folder = None
@@ -1750,7 +1745,7 @@ class MainWindow(QMainWindow):
             return
 
         self.editing_snapshot = snapshot
-        target_name = preferred_folder or snapshot.last_folder
+        target_name = snapshot.last_folder
         self.folder_combo.blockSignals(True)
         self.folder_combo.clear()
         for folder in manga.folders:
@@ -1769,7 +1764,11 @@ class MainWindow(QMainWindow):
         self.folder_combo.setCurrentIndex(preferred_index)
         self.folder_combo.blockSignals(False)
         self.folder_combo.setEnabled(bool(manga.folders))
-        self._load_folder(self.folder_combo.currentData(), snapshot=snapshot)
+        self._load_folder(
+            self.folder_combo.currentData(),
+            snapshot=snapshot,
+            resume_saved_position=(target_name == snapshot.last_folder),
+        )
 
     def _on_folder_changed(self, _index: int) -> None:
         if not self._desktop_mutation_allowed(notify=False):
@@ -1781,6 +1780,7 @@ class MainWindow(QMainWindow):
         folder: object,
         *,
         snapshot: EditingSnapshot | None = None,
+        resume_saved_position: bool = False,
     ) -> None:
         self._save_session()
         manga = self.current_manga
@@ -1807,7 +1807,11 @@ class MainWindow(QMainWindow):
         self.canvas.clear_cache()
         folder_state = snapshot.folders.get(folder.name)
         image_names = {image.name for image in folder.images}
-        current_name = folder_state.current_image if folder_state is not None else ""
+        current_name = (
+            snapshot.last_image
+            if resume_saved_position and snapshot.last_folder == folder.name
+            else ""
+        )
         self.current_image_index = next(
             (
                 index

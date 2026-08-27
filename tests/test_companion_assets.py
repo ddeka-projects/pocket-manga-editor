@@ -174,8 +174,11 @@ class CompanionAssetContractTests(unittest.TestCase):
         folder_change = self.javascript.split(
             'elements.folderPicker.addEventListener("change", (event) => {', 1
         )[1].split("elements.selectedPicker", 1)[0]
-        self.assertIn('openFolder(folderId, "", { persist: true })', folder_change)
-        self.assertNotIn("entryEdge", folder_change)
+        self.assertIn(
+            'openFolder(folderId, "", { persist: true, entryEdge: "first" })',
+            folder_change,
+        )
+        self.assertNotIn("currentImageId", folder_change)
 
     def test_javascript_uses_only_the_companion_api_and_exact_write_payloads(self) -> None:
         required_routes = {

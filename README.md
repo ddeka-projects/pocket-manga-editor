@@ -138,10 +138,11 @@ Working Directory/.pocket-manga-editor/
     └── .transactions/
 ```
 
-`reading.json` contains only phone reading bookmarks. `editing.json` contains
-desktop/phone editing positions, exact selected filenames, and output ownership
-records. The files are written atomically while holding the cross-process
-library mutation lock.
+`reading.json` contains only the phone's latest manga folder/image pair.
+`editing.json` contains the desktop/phone latest folder/image pair, exact
+selected filenames, and output ownership records. Selection entries are stored
+only for folders that currently contain selections. The files are written
+atomically while holding the cross-process library mutation lock.
 
 This is an application-owned directory. Do not manually edit active JSON or
 managed output. The exporter nevertheless preserves untracked files and refuses

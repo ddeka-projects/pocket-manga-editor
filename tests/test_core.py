@@ -33,6 +33,7 @@ from pocket_manga_editor.library_lock import (
     LibraryLockError,
     library_mutation_lock,
 )
+from pocket_manga_editor.models import FolderRef, ImageRef, MangaRef
 from pocket_manga_editor.path_safety import is_link_or_reparse
 from pocket_manga_editor.scanner import ScanError, scan_working_directory
 from pocket_manga_editor.storage import (
@@ -302,7 +303,7 @@ class StoreTests(RepositoryFixture):
         initial = self.reading.load(self.manga_ref)
         self.assertFalse(self.reading.path_for(self.manga_ref).exists())
         self.assertEqual(initial.last_folder, "Folder 1")
-        self.assertEqual(initial.folders["Folder 1"].current_image, "1.jpg")
+        self.assertEqual(initial.last_image, "1.jpg")
 
         read = self.reading.set_position(self.manga_ref, "Folder 2", "10.jpg")
         edit = self.editing.save_folder(
@@ -310,13 +311,13 @@ class StoreTests(RepositoryFixture):
         )
 
         self.assertEqual(read.last_folder, "Folder 2")
-        self.assertEqual(read.folders["Folder 2"].current_image, "10.jpg")
+        self.assertEqual(read.last_image, "10.jpg")
         self.assertEqual(edit.last_folder, "Folder 1")
-        self.assertEqual(edit.folders["Folder 1"].current_image, "2.PNG")
+        self.assertEqual(edit.last_image, "2.PNG")
         self.assertEqual(edit.folders["Folder 1"].selected_images, {"2.PNG"})
         self.assertNotIn("selected_images", self.reading.path_for(self.manga_ref).read_text())
 
-    def test_reading_remembers_each_visited_folder_by_exact_name(self) -> None:
+    def test_reading_remembers_only_the_latest_folder_and_image(self) -> None:
         self.reading.set_position(self.manga_ref, "Folder 1", "2.PNG")
         self.reading.set_position(self.manga_ref, "Folder 2", "10.jpg")
 
@@ -324,17 +325,13 @@ class StoreTests(RepositoryFixture):
         payload = json.loads(self.reading.path_for(self.manga_ref).read_text())
 
         self.assertEqual(restored.last_folder, "Folder 2")
-        self.assertEqual(restored.folders["Folder 1"].current_image, "2.PNG")
-        self.assertEqual(restored.folders["Folder 2"].current_image, "10.jpg")
+        self.assertEqual(restored.last_image, "10.jpg")
         self.assertEqual(
             payload,
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "last_folder": "Folder 2",
-                "folders": {
-                    "Folder 1": {"current_image": "2.PNG"},
-                    "Folder 2": {"current_image": "10.jpg"},
-                },
+                "last_image": "10.jpg",
             },
         )
 
@@ -345,8 +342,41 @@ class StoreTests(RepositoryFixture):
             self.manga_ref, "Folder 1", "1.jpg", True
         )
 
-        self.assertEqual(updated.folders["Folder 1"].current_image, "2.PNG")
+        self.assertEqual(updated.last_folder, "Folder 1")
+        self.assertEqual(updated.last_image, "2.PNG")
         self.assertEqual(updated.folders["Folder 1"].selected_images, {"1.jpg"})
+
+    def test_selection_validates_only_its_target_and_keeps_metadata_sparse(self) -> None:
+        uninspected_folders = tuple(
+            FolderRef(
+                f"Chapter {number}",
+                self.root / "Series" / f"Chapter {number}",
+                (
+                    ImageRef(
+                        "missing.jpg",
+                        self.root
+                        / "Series"
+                        / f"Chapter {number}"
+                        / "missing.jpg",
+                    ),
+                ),
+            )
+            for number in range(3, 341)
+        )
+        large_snapshot = MangaRef(
+            self.manga_ref.name,
+            self.manga_ref.path,
+            self.manga_ref.folders + uninspected_folders,
+        )
+        self.assertEqual(len(large_snapshot.folders), 340)
+
+        self.editing.set_selection(large_snapshot, "Folder 1", "1.jpg", True)
+        self.editing.set_position(large_snapshot, "Folder 2", "10.jpg")
+
+        payload = json.loads(self.editing.path_for(large_snapshot).read_text())
+        self.assertEqual(set(payload["folders"]), {"Folder 1"})
+        self.assertEqual(payload["last_folder"], "Folder 2")
+        self.assertEqual(payload["last_image"], "10.jpg")
 
     def test_save_folder_merges_latest_other_folder_and_export_state(self) -> None:
         self.editing.save_folder(
@@ -371,15 +401,14 @@ class StoreTests(RepositoryFixture):
         path.write_text(
             json.dumps(
                 {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "last_folder": "Renamed Folder",
+                    "last_image": "missing.jpg",
                     "folders": {
                         "Folder 1": {
-                            "current_image": "missing.jpg",
                             "selected_images": ["1.jpg", "renamed.png", "gone.png"],
                         },
                         "Old Folder": {
-                            "current_image": "old.jpg",
                             "selected_images": ["old.jpg"],
                         },
                     },
@@ -392,9 +421,46 @@ class StoreTests(RepositoryFixture):
         restored = self.editing.load(self.manga_ref)
 
         self.assertEqual(restored.last_folder, "Folder 1")
-        self.assertEqual(restored.folders["Folder 1"].current_image, "1.jpg")
+        self.assertEqual(restored.last_image, "1.jpg")
         self.assertEqual(restored.folders["Folder 1"].selected_images, {"1.jpg"})
         self.assertGreaterEqual(len(restored.warnings), 3)
+
+    def test_missing_resume_image_resets_the_whole_pair_to_the_manga_start(self) -> None:
+        reading_path = self.reading.path_for(self.manga_ref)
+        reading_path.parent.mkdir(parents=True)
+        reading_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "last_folder": "Folder 2",
+                    "last_image": "missing.jpg",
+                }
+            ),
+            encoding="utf-8",
+        )
+        editing_path = self.editing.path_for(self.manga_ref)
+        editing_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "last_folder": "Folder 2",
+                    "last_image": "missing.jpg",
+                    "folders": {},
+                    "exports": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        reading = self.reading.load(self.manga_ref)
+        editing = self.editing.load(self.manga_ref)
+
+        self.assertEqual(
+            (reading.last_folder, reading.last_image), ("Folder 1", "1.jpg")
+        )
+        self.assertEqual(
+            (editing.last_folder, editing.last_image), ("Folder 1", "1.jpg")
+        )
 
     def test_unsafe_editing_identities_fail_closed_even_when_nested_under_stale_folders(
         self,
@@ -402,15 +468,14 @@ class StoreTests(RepositoryFixture):
         path = self.editing.path_for(self.manga_ref)
         path.parent.mkdir(parents=True)
         base = {
-            "schema_version": 1,
+            "schema_version": 2,
             "last_folder": "Folder 1",
+            "last_image": "1.jpg",
             "folders": {
                 "Folder 1": {
-                    "current_image": "1.jpg",
                     "selected_images": [],
                 },
                 "Old Folder": {
-                    "current_image": "old.jpg",
                     "selected_images": ["old.jpg"],
                 },
             },
@@ -425,9 +490,9 @@ class StoreTests(RepositoryFixture):
             "Old Folder"
         )
         invalid_payloads.append(unsafe_folder)
-        unsafe_current = json.loads(json.dumps(base))
-        unsafe_current["folders"]["Old Folder"]["current_image"] = "../old.jpg"
-        invalid_payloads.append(unsafe_current)
+        unsafe_last_image = json.loads(json.dumps(base))
+        unsafe_last_image["last_image"] = "../old.jpg"
+        invalid_payloads.append(unsafe_last_image)
         non_string_selection = json.loads(json.dumps(base))
         non_string_selection["folders"]["Old Folder"]["selected_images"] = [7]
         invalid_payloads.append(non_string_selection)
@@ -521,16 +586,12 @@ class StoreTests(RepositoryFixture):
         path.write_text(
             json.dumps(
                 {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "last_folder": "Folder 1",
+                    "last_image": "1.jpg",
                     "folders": {
                         "Folder 1": {
-                            "current_image": "1.jpg",
-                            "selected_images": [],
-                        },
-                        "Folder 2": {
-                            "current_image": "2.jpg",
-                            "selected_images": [],
+                            "selected_images": ["1.jpg"],
                         },
                     },
                     "exports": {
@@ -603,7 +664,7 @@ class ExporterTests(RepositoryFixture):
         )
 
         self.assertEqual(saved.last_folder, folder_name)
-        self.assertEqual(saved.folders[folder_name].current_image, image_name)
+        self.assertEqual(saved.last_image, image_name)
         self.assertEqual(saved.folders[folder_name].selected_images, {image_name})
 
         result = export_manga(self.root, manga)
@@ -617,7 +678,7 @@ class ExporterTests(RepositoryFixture):
         )
         restored = editing.load(manga)
         self.assertEqual(restored.last_folder, folder_name)
-        self.assertEqual(restored.folders[folder_name].current_image, image_name)
+        self.assertEqual(restored.last_image, image_name)
         self.assertEqual(restored.folders[folder_name].selected_images, {image_name})
         self.assertEqual(
             restored.exports[folder_name].files[image_name].output_name,
