@@ -1,10 +1,11 @@
-"""Dedicated-thread stdlib HTTP server for the Companion web client."""
+"""Dedicated-thread stdlib HTTP server for the local web application."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import ipaddress
+import logging
 import mimetypes
 import os
 from pathlib import Path
@@ -25,9 +26,12 @@ from .api import (
 from .coordinator import CompanionCoordinator
 
 
+LOGGER = logging.getLogger(__name__)
+
+
 DEFAULT_PORT = 8765
 MAX_HTTP_WORKERS = 16
-_CLIENT_PROTOCOL_ASSET_VERSION = "filesystem-activity-v1"
+_CLIENT_PROTOCOL_ASSET_VERSION = "always-on-web-v1"
 _HOSTNAME = re.compile(
     r"^(?=.{1,253}\.?$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*"
     r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.?$"
@@ -120,9 +124,12 @@ class _CompanionHTTPServer(ThreadingHTTPServer):
             self._worker_condition.notify_all()
 
     def handle_error(self, request: object, client_address: object) -> None:
-        """Never print request headers, cookies, or tracebacks from worker threads."""
+        """Log failures without recording request headers or controller IDs."""
 
-        return
+        address = "unknown"
+        if isinstance(client_address, tuple) and client_address:
+            address = str(client_address[0])
+        LOGGER.exception("Unhandled HTTP worker failure from %s.", address)
 
 
 class CompanionHTTPService:
@@ -173,7 +180,7 @@ class CompanionHTTPService:
             thread = threading.Thread(
                 target=self._serve,
                 args=(server,),
-                name="PocketMangaCompanionHTTP",
+                name="PocketMangaHTTP",
                 daemon=True,
             )
             self._server = server
@@ -185,7 +192,7 @@ class CompanionHTTPService:
                 self._server = None
                 self._thread = None
                 server.server_close()
-                self._error = f"Could not start the Companion HTTP thread: {exc}"
+                self._error = f"Could not start the Pocket Manga HTTP thread: {exc}"
             return self._status_locked()
 
     def stop(self, *, timeout: float = 5.0) -> HTTPServiceStatus:
@@ -214,7 +221,7 @@ class CompanionHTTPService:
             thread.join(timeout=max(0.0, deadline - time.monotonic()))
         with self._lock:
             if not drained or (thread is not None and thread.is_alive()):
-                self._error = "The Companion HTTP requests did not stop in time."
+                self._error = "Pocket Manga HTTP requests did not stop in time."
             return self._status_locked()
 
     def restart(
@@ -272,13 +279,15 @@ class CompanionHTTPService:
         try:
             server.serve_forever(poll_interval=0.25)
         except OSError as exc:
+            LOGGER.exception("Pocket Manga HTTP listener stopped with an OS error.")
             with self._lock:
                 if self._server is server:
-                    self._error = f"The Companion HTTP server stopped: {exc}"
+                    self._error = f"The Pocket Manga HTTP server stopped: {exc}"
         except Exception:
+            LOGGER.exception("Pocket Manga HTTP listener stopped unexpectedly.")
             with self._lock:
                 if self._server is server:
-                    self._error = "The Companion HTTP server stopped unexpectedly."
+                    self._error = "The Pocket Manga HTTP server stopped unexpectedly."
         finally:
             try:
                 server.server_close()
@@ -292,7 +301,7 @@ class CompanionHTTPService:
         assets = self._assets
 
         class Handler(BaseHTTPRequestHandler):
-            server_version = "PocketMangaCompanion"
+            server_version = "PocketManga"
             sys_version = ""
             protocol_version = "HTTP/1.1"
 
@@ -301,7 +310,7 @@ class CompanionHTTPService:
                 self.connection.settimeout(2.5)
 
             def do_GET(self) -> None:  # noqa: N802 - stdlib handler contract
-                if self._reject_if_stopping(api):
+                if self._reject_if_stopping(api) or self._reject_if_nonlocal(api):
                     return
                 if urlsplit(self.path).path.startswith("/api/"):
                     self._send_api(api.handle("GET", self.path, self.headers))
@@ -317,10 +326,13 @@ class CompanionHTTPService:
                 self._dispatch_mutation(api, "POST")
 
             def do_PUT(self) -> None:  # noqa: N802
-                self._dispatch_mutation(api, "PUT")
+                self._reject_method(api)
+
+            def do_PATCH(self) -> None:  # noqa: N802
+                self._dispatch_mutation(api, "PATCH")
 
             def do_HEAD(self) -> None:  # noqa: N802
-                if self._reject_if_stopping(api):
+                if self._reject_if_stopping(api) or self._reject_if_nonlocal(api):
                     return
                 if urlsplit(self.path).path.startswith("/api/"):
                     self._send_api(
@@ -338,14 +350,13 @@ class CompanionHTTPService:
             def do_DELETE(self) -> None:  # noqa: N802
                 self._reject_method(api)
 
-            def do_PATCH(self) -> None:  # noqa: N802
-                self._reject_method(api)
-
             def do_OPTIONS(self) -> None:  # noqa: N802
                 self._reject_method(api)
 
             def _reject_method(self, api: CompanionAPI) -> None:
                 self.close_connection = True
+                if self._reject_if_nonlocal(api):
+                    return
                 try:
                     api.validate_request(self.headers, mutating=True)
                     response = api._error(
@@ -363,13 +374,13 @@ class CompanionHTTPService:
                     api._error(
                         503,
                         "server_shutting_down",
-                        "The Companion service is shutting down.",
+                        "The Pocket Manga server is shutting down.",
                     )
                 )
                 return True
 
             def _dispatch_mutation(self, api: CompanionAPI, method: str) -> None:
-                if self._reject_if_stopping(api):
+                if self._reject_if_stopping(api) or self._reject_if_nonlocal(api):
                     return
                 raw_length = self.headers.get("Content-Length", "")
                 try:
@@ -390,6 +401,15 @@ class CompanionHTTPService:
                 if self._reject_if_stopping(api):
                     return
                 self._send_api(api.handle(method, self.path, self.headers, body))
+
+            def _reject_if_nonlocal(self, api: CompanionAPI) -> bool:
+                try:
+                    api.validate_peer(str(self.client_address[0]))
+                except RequestError as exc:
+                    self.close_connection = True
+                    self._send_api(api._exception_response(exc))
+                    return True
+                return False
 
             def _static_response(self, assets_root: Path) -> APIResponse:
                 path = urlsplit(self.path).path
@@ -412,9 +432,9 @@ class CompanionHTTPService:
                         body = (
                             b"<!doctype html><html><head><meta charset=utf-8>"
                             b"<meta name=viewport content='width=device-width,initial-scale=1'>"
-                            b"<title>Pocket Manga Editor Companion</title></head>"
-                            b"<body><h1>Pocket Manga Editor Companion</h1>"
-                            b"<p>The Companion client assets are unavailable.</p></body></html>"
+                            b"<title>Pocket Manga</title></head>"
+                            b"<body><h1>Pocket Manga</h1>"
+                            b"<p>The web application assets are unavailable.</p></body></html>"
                         )
                         return APIResponse(
                             200,
@@ -550,26 +570,26 @@ class CompanionHTTPService:
     @staticmethod
     def _validate_port(port: int) -> int:
         if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
-            raise ValueError("Companion port must be between 1 and 65535.")
+            raise ValueError("The server port must be between 1 and 65535.")
         return port
 
     @staticmethod
     def _validate_host(host: str, *, allow_wildcard: bool) -> str:
         if not isinstance(host, str) or not host or any(character.isspace() for character in host):
-            raise ValueError("Companion host is invalid.")
+            raise ValueError("The server host is invalid.")
         value = host.strip().rstrip(".")
         try:
             address = ipaddress.ip_address(value)
         except ValueError:
             if not _HOSTNAME.fullmatch(value):
-                raise ValueError("Companion host must be a hostname or IP address.")
+                raise ValueError("The server host must be a hostname or IP address.")
         else:
             if address.version == 6:
                 raise ValueError(
-                    "Companion currently requires an IPv4 bind/display address."
+                    "Pocket Manga currently requires an IPv4 bind/display address."
                 )
             if not allow_wildcard and address.is_unspecified:
-                raise ValueError("The displayed Companion host cannot be a wildcard address.")
+                raise ValueError("The displayed server host cannot be a wildcard address.")
         return value
 
     @classmethod

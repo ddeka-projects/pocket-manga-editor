@@ -27,7 +27,6 @@ class MangaWorkspacePaths:
     reading: Path
     editing: Path
     output: Path
-    completed: Path
     transactions: Path
 
 
@@ -47,7 +46,6 @@ def manga_workspace_paths(
         reading=workspace / "reading.json",
         editing=workspace / "editing.json",
         output=workspace / "output",
-        completed=workspace / "completed",
         transactions=workspace / ".transactions",
     )
 
@@ -98,23 +96,6 @@ def validate_transaction_workspace(
     _validate_directory_if_present(
         paths.transactions, paths.workspace, "transaction workspace"
     )
-    return paths
-
-
-def validate_completed_workspace(paths: MangaWorkspacePaths) -> MangaWorkspacePaths:
-    """Validate only the immutable completion-batch root."""
-
-    paths = _validate_workspace_identity(paths)
-    _validate_directory_if_present(paths.completed, paths.workspace, "completed batches")
-    return paths
-
-
-def validate_completion_workspace(paths: MangaWorkspacePaths) -> MangaWorkspacePaths:
-    """Validate every managed leaf used by destructive completion operations."""
-
-    paths = validate_export_workspace(paths)
-    _validate_file_if_present(paths.reading, paths.workspace, "reading metadata")
-    validate_completed_workspace(paths)
     return paths
 
 

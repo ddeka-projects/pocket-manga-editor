@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -11,23 +10,21 @@ import unittest
 from unittest.mock import patch
 
 import pocket_manga_editor.exporter as exporter_module
-from pocket_manga_editor.completion import recover_interrupted_completions
+from pocket_manga_editor.config import ConfigurationError, load_configuration
 from pocket_manga_editor.exporter import (
     ExportBusyError,
+    ExportConfirmationRequired,
     ExportConflict,
     ExportError,
     ExportRecoveryError,
+    NothingSelectedError,
     export_manga,
     exported_image_name,
+    inspect_export,
     manga_output_directory,
     recover_interrupted_exports,
-    recover_interrupted_exports_locked,
-    verify_managed_output,
 )
-from pocket_manga_editor.filesystem_ops import (
-    remove_managed_path,
-    rename_no_replace,
-)
+from pocket_manga_editor.filesystem_ops import remove_managed_path, rename_no_replace
 from pocket_manga_editor.library_lock import (
     LibraryBusyError,
     LibraryLockError,
@@ -37,14 +34,12 @@ from pocket_manga_editor.models import FolderRef, ImageRef, MangaRef
 from pocket_manga_editor.path_safety import is_link_or_reparse
 from pocket_manga_editor.scanner import ScanError, scan_working_directory
 from pocket_manga_editor.storage import (
+    STATE_SCHEMA_VERSION,
     EditingStateError,
     EditingStore,
     ReadingStore,
 )
-from pocket_manga_editor.workspace import (
-    WorkspaceError,
-    manga_workspace_paths,
-)
+from pocket_manga_editor.workspace import WorkspaceError, manga_workspace_paths
 
 
 class RepositoryFixture(unittest.TestCase):
@@ -68,9 +63,108 @@ class RepositoryFixture(unittest.TestCase):
         source.write_bytes(content if content is not None else image.encode("utf-8"))
         return source
 
-    def manga(self, name: str = "Kimi wa 08"):
+    def manga(self, name: str = "Kimi wa 08") -> MangaRef:
         result = scan_working_directory(self.root)
         return next(manga for manga in result.mangas if manga.name == name)
+
+
+class ConfigurationTests(RepositoryFixture):
+    def test_env_file_loads_absolute_library_host_and_port(self) -> None:
+        library = self.root / "Manga Library"
+        library.mkdir()
+        env_file = self.root / ".env"
+        env_file.write_text(
+            "\n".join(
+                (
+                    "# Local server",
+                    f'POCKET_MANGA_EDITOR_WORKING_DIRECTORY="{library}"',
+                    "POCKET_MANGA_EDITOR_HOST=0.0.0.0",
+                    "POCKET_MANGA_EDITOR_PORT=9123",
+                )
+            ),
+            encoding="utf-8",
+        )
+
+        configuration = load_configuration(env_file, environ={})
+
+        self.assertEqual(configuration.working_directory, library.resolve())
+        self.assertEqual(configuration.host, "0.0.0.0")
+        self.assertEqual(configuration.port, 9123)
+
+    def test_real_environment_overrides_file_values(self) -> None:
+        file_library = self.root / "File Library"
+        process_library = self.root / "Process Library"
+        file_library.mkdir()
+        process_library.mkdir()
+        env_file = self.root / ".env"
+        env_file.write_text(
+            f"POCKET_MANGA_EDITOR_WORKING_DIRECTORY={file_library}\n"
+            "POCKET_MANGA_EDITOR_PORT=8000\n",
+            encoding="utf-8",
+        )
+
+        configuration = load_configuration(
+            env_file,
+            environ={
+                "POCKET_MANGA_EDITOR_WORKING_DIRECTORY": str(process_library),
+                "POCKET_MANGA_EDITOR_HOST": "127.0.0.1",
+                "POCKET_MANGA_EDITOR_PORT": "9000",
+            },
+        )
+
+        self.assertEqual(configuration.working_directory, process_library.resolve())
+        self.assertEqual(configuration.host, "127.0.0.1")
+        self.assertEqual(configuration.port, 9000)
+
+    def test_configuration_rejects_relative_missing_and_linked_library_paths(self) -> None:
+        with self.assertRaisesRegex(ConfigurationError, "absolute"):
+            load_configuration(
+                self.root / "missing.env",
+                environ={"POCKET_MANGA_EDITOR_WORKING_DIRECTORY": "relative"},
+            )
+        with self.assertRaises(ConfigurationError):
+            load_configuration(
+                self.root / "missing.env",
+                environ={
+                    "POCKET_MANGA_EDITOR_WORKING_DIRECTORY": str(
+                        self.root / "does-not-exist"
+                    )
+                },
+            )
+
+        library = self.root / "Library"
+        library.mkdir()
+        alias = self.root / "Alias"
+        try:
+            alias.symlink_to(library, target_is_directory=True)
+        except OSError as exc:
+            self.skipTest(f"Directory links are unavailable: {exc}")
+        with self.assertRaisesRegex(ConfigurationError, "link|junction"):
+            load_configuration(
+                self.root / "missing.env",
+                environ={"POCKET_MANGA_EDITOR_WORKING_DIRECTORY": str(alias)},
+            )
+
+    def test_configuration_rejects_bad_host_port_and_env_syntax(self) -> None:
+        library = self.root / "Library"
+        library.mkdir()
+        base = {"POCKET_MANGA_EDITOR_WORKING_DIRECTORY": str(library)}
+        for name, value in (
+            ("POCKET_MANGA_EDITOR_HOST", "host name"),
+            ("POCKET_MANGA_EDITOR_HOST", "::1"),
+            ("POCKET_MANGA_EDITOR_PORT", "0"),
+            ("POCKET_MANGA_EDITOR_PORT", "not-a-port"),
+        ):
+            with self.subTest(name=name, value=value):
+                with self.assertRaises(ConfigurationError):
+                    load_configuration(
+                        self.root / "missing.env", environ={**base, name: value}
+                    )
+
+        malformed = self.root / ".env"
+        malformed.write_text("this is not an assignment\n", encoding="utf-8")
+        with self.assertRaisesRegex(ConfigurationError, "line 1"):
+            load_configuration(malformed, environ=base)
 
 
 class ScannerTests(RepositoryFixture):
@@ -97,8 +191,6 @@ class ScannerTests(RepositoryFixture):
             [image.name for image in manga.folders[2].images],
             ["1.JPG", "2.png", "10.jpg", "cover-final.PNG"],
         )
-        self.assertEqual(manga.path.name, "Kimi wa 08")
-        self.assertEqual(manga.folders[0].path.name, "Chapter Eleven")
 
     def test_keeps_same_stem_different_extensions_as_distinct_images(self) -> None:
         self.add_image("Series", "Anything", "004.jpg")
@@ -111,7 +203,9 @@ class ScannerTests(RepositoryFixture):
     def test_ignores_empty_nested_direct_and_unrelated_content(self) -> None:
         self.add_image("Series", "Valid", "cover.jpg")
         (self.root / "Series" / "Empty").mkdir()
-        (self.root / "Series" / "Valid" / "notes.txt").write_text("ignored")
+        (self.root / "Series" / "Valid" / "notes.txt").write_text(
+            "ignored", encoding="utf-8"
+        )
         nested = self.root / "Series" / "Nested" / "Inside"
         nested.mkdir(parents=True)
         (nested / "nested.jpg").write_bytes(b"ignored")
@@ -170,7 +264,6 @@ class ScannerTests(RepositoryFixture):
         try:
             with self.assertRaises(ScanError):
                 scan_working_directory(alias)
-
             with self.assertRaises(LibraryLockError):
                 with library_mutation_lock(alias):
                     self.fail("A linked library root must never acquire a lock.")
@@ -181,9 +274,7 @@ class ScannerTests(RepositoryFixture):
         candidate = self.root / "junction-like"
         information = SimpleNamespace(
             st_mode=stat.S_IFDIR,
-            st_file_attributes=getattr(
-                stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400
-            ),
+            st_file_attributes=getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400),
         )
 
         with patch("pocket_manga_editor.path_safety.os.name", "nt"), patch.object(
@@ -230,13 +321,32 @@ class FilesystemOperationTests(RepositoryFixture):
         def cross_device_stat(candidate: Path, *args, **kwargs):
             information = real_stat(candidate, *args, **kwargs)
             if candidate == mounted:
-                return SimpleNamespace(
-                    st_mode=information.st_mode,
-                    st_dev=root_device + 1,
-                )
+                return SimpleNamespace(st_mode=information.st_mode, st_dev=root_device + 1)
             return information
 
         with patch.object(Path, "stat", cross_device_stat):
+            with self.assertRaisesRegex(OSError, "mounted filesystem"):
+                remove_managed_path(tree)
+
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep")
+
+    def test_managed_removal_refuses_a_mounted_root_before_deletion(self) -> None:
+        tree = self.root / "tree"
+        tree.mkdir()
+        sentinel = tree / "keep.txt"
+        sentinel.write_text("keep", encoding="utf-8")
+        parent_device = tree.parent.stat().st_dev
+        real_stat = Path.stat
+
+        def mounted_root_stat(candidate: Path, *args, **kwargs):
+            information = real_stat(candidate, *args, **kwargs)
+            if candidate == tree:
+                return SimpleNamespace(
+                    st_mode=information.st_mode, st_dev=parent_device + 1
+                )
+            return information
+
+        with patch.object(Path, "stat", mounted_root_stat):
             with self.assertRaisesRegex(OSError, "mounted filesystem"):
                 remove_managed_path(tree)
 
@@ -258,34 +368,10 @@ class FilesystemOperationTests(RepositoryFixture):
         ), patch.object(exporter_module.os, "fsync") as fsync:
             exporter_module._fsync_file(staged)
 
-        self.assertEqual(len(opened_flags), 1)
         access_mode_mask = getattr(os, "O_ACCMODE", os.O_WRONLY | os.O_RDWR)
         self.assertEqual(opened_flags[0] & access_mode_mask, os.O_RDWR)
         fsync.assert_called_once()
         self.assertFalse(stat.S_IMODE(staged.stat().st_mode) & stat.S_IWRITE)
-
-    def test_managed_removal_refuses_a_mounted_root_before_deletion(self) -> None:
-        tree = self.root / "tree"
-        tree.mkdir()
-        sentinel = tree / "keep.txt"
-        sentinel.write_text("keep", encoding="utf-8")
-        parent_device = tree.parent.stat().st_dev
-        real_stat = Path.stat
-
-        def mounted_root_stat(candidate: Path, *args, **kwargs):
-            information = real_stat(candidate, *args, **kwargs)
-            if candidate == tree:
-                return SimpleNamespace(
-                    st_mode=information.st_mode,
-                    st_dev=parent_device + 1,
-                )
-            return information
-
-        with patch.object(Path, "stat", mounted_root_stat):
-            with self.assertRaisesRegex(OSError, "mounted filesystem"):
-                remove_managed_path(tree)
-
-        self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep")
 
 
 class StoreTests(RepositoryFixture):
@@ -302,117 +388,103 @@ class StoreTests(RepositoryFixture):
     def test_reading_and_editing_positions_round_trip_independently(self) -> None:
         initial = self.reading.load(self.manga_ref)
         self.assertFalse(self.reading.path_for(self.manga_ref).exists())
-        self.assertEqual(initial.last_folder, "Folder 1")
-        self.assertEqual(initial.last_image, "1.jpg")
+        self.assertEqual((initial.last_folder, initial.last_image), ("Folder 1", "1.jpg"))
 
         read = self.reading.set_position(self.manga_ref, "Folder 2", "10.jpg")
-        edit = self.editing.save_folder(
-            self.manga_ref, "Folder 1", "2.PNG", {"2.PNG"}
-        )
+        self.editing.set_position(self.manga_ref, "Folder 1", "2.PNG")
+        edit = self.editing.set_selection(self.manga_ref, "Folder 1", "2.PNG", True)
 
-        self.assertEqual(read.last_folder, "Folder 2")
-        self.assertEqual(read.last_image, "10.jpg")
-        self.assertEqual(edit.last_folder, "Folder 1")
-        self.assertEqual(edit.last_image, "2.PNG")
+        self.assertEqual((read.last_folder, read.last_image), ("Folder 2", "10.jpg"))
+        self.assertEqual((edit.last_folder, edit.last_image), ("Folder 1", "2.PNG"))
         self.assertEqual(edit.folders["Folder 1"].selected_images, {"2.PNG"})
         self.assertNotIn("selected_images", self.reading.path_for(self.manga_ref).read_text())
 
-    def test_reading_remembers_only_the_latest_folder_and_image(self) -> None:
+    def test_reading_remembers_only_latest_pair_in_schema_three(self) -> None:
         self.reading.set_position(self.manga_ref, "Folder 1", "2.PNG")
         self.reading.set_position(self.manga_ref, "Folder 2", "10.jpg")
 
         restored = self.reading.load(self.manga_ref)
         payload = json.loads(self.reading.path_for(self.manga_ref).read_text())
 
-        self.assertEqual(restored.last_folder, "Folder 2")
-        self.assertEqual(restored.last_image, "10.jpg")
+        self.assertEqual((restored.last_folder, restored.last_image), ("Folder 2", "10.jpg"))
         self.assertEqual(
             payload,
             {
-                "schema_version": 2,
+                "schema_version": STATE_SCHEMA_VERSION,
                 "last_folder": "Folder 2",
                 "last_image": "10.jpg",
             },
         )
 
-    def test_selection_mutation_does_not_change_editing_position(self) -> None:
-        self.editing.set_position(self.manga_ref, "Folder 1", "2.PNG")
+    def test_editing_payload_contains_only_pair_and_sparse_selections(self) -> None:
+        self.editing.set_selection(self.manga_ref, "Folder 1", "2.PNG", True)
+        self.editing.set_position(self.manga_ref, "Folder 2", "10.jpg")
 
-        updated = self.editing.set_selection(
-            self.manga_ref, "Folder 1", "1.jpg", True
+        payload = json.loads(self.editing.path_for(self.manga_ref).read_text())
+
+        self.assertEqual(
+            payload,
+            {
+                "schema_version": STATE_SCHEMA_VERSION,
+                "last_folder": "Folder 2",
+                "last_image": "10.jpg",
+                "folders": {"Folder 1": {"selected_images": ["2.PNG"]}},
+            },
         )
+        self.assertNotIn("exports", payload)
 
-        self.assertEqual(updated.last_folder, "Folder 1")
-        self.assertEqual(updated.last_image, "2.PNG")
-        self.assertEqual(updated.folders["Folder 1"].selected_images, {"1.jpg"})
+    def test_selection_mutation_does_not_change_position_and_empty_is_sparse(self) -> None:
+        self.editing.set_position(self.manga_ref, "Folder 1", "2.PNG")
+        updated = self.editing.set_selection(self.manga_ref, "Folder 1", "1.jpg", True)
+        self.assertEqual((updated.last_folder, updated.last_image), ("Folder 1", "2.PNG"))
 
-    def test_selection_validates_only_its_target_and_keeps_metadata_sparse(self) -> None:
-        uninspected_folders = tuple(
+        cleared = self.editing.set_selection(self.manga_ref, "Folder 1", "1.jpg", False)
+        self.assertEqual(cleared.folders, {})
+        payload = json.loads(self.editing.path_for(self.manga_ref).read_text())
+        self.assertEqual(payload["folders"], {})
+
+    def test_selection_validates_only_target_in_a_340_folder_snapshot(self) -> None:
+        uninspected = tuple(
             FolderRef(
                 f"Chapter {number}",
                 self.root / "Series" / f"Chapter {number}",
                 (
                     ImageRef(
                         "missing.jpg",
-                        self.root
-                        / "Series"
-                        / f"Chapter {number}"
-                        / "missing.jpg",
+                        self.root / "Series" / f"Chapter {number}" / "missing.jpg",
                     ),
                 ),
             )
             for number in range(3, 341)
         )
-        large_snapshot = MangaRef(
+        large = MangaRef(
             self.manga_ref.name,
             self.manga_ref.path,
-            self.manga_ref.folders + uninspected_folders,
+            self.manga_ref.folders + uninspected,
         )
-        self.assertEqual(len(large_snapshot.folders), 340)
 
-        self.editing.set_selection(large_snapshot, "Folder 1", "1.jpg", True)
-        self.editing.set_position(large_snapshot, "Folder 2", "10.jpg")
+        self.editing.set_selection(large, "Folder 1", "1.jpg", True)
+        self.editing.set_position(large, "Folder 2", "10.jpg")
 
-        payload = json.loads(self.editing.path_for(large_snapshot).read_text())
+        payload = json.loads(self.editing.path_for(large).read_text())
         self.assertEqual(set(payload["folders"]), {"Folder 1"})
-        self.assertEqual(payload["last_folder"], "Folder 2")
-        self.assertEqual(payload["last_image"], "10.jpg")
+        self.assertEqual((payload["last_folder"], payload["last_image"]), ("Folder 2", "10.jpg"))
 
-    def test_save_folder_merges_latest_other_folder_and_export_state(self) -> None:
-        self.editing.save_folder(
-            self.manga_ref, "Folder 1", "2.PNG", {"1.jpg", "2.PNG"}
-        )
-        self.editing.save_folder(
-            self.manga_ref, "Folder 2", "10.jpg", {"2.jpg"}
-        )
-
-        exported = export_manga(self.root, self.manga_ref)
-        saved = self.editing.save_folder(
-            self.manga_ref, "Folder 1", "1.jpg", {"2.PNG"}
-        )
-
-        self.assertEqual(exported.copied_count, 3)
-        self.assertEqual(saved.folders["Folder 2"].selected_images, {"2.jpg"})
-        self.assertEqual(set(saved.exports), {"Folder 1", "Folder 2"})
-
-    def test_stale_positions_and_selections_fall_back_without_rename_inference(self) -> None:
+    def test_stale_position_and_selections_fall_back_without_rename_inference(self) -> None:
         path = self.editing.path_for(self.manga_ref)
         path.parent.mkdir(parents=True)
         path.write_text(
             json.dumps(
                 {
-                    "schema_version": 2,
+                    "schema_version": STATE_SCHEMA_VERSION,
                     "last_folder": "Renamed Folder",
                     "last_image": "missing.jpg",
                     "folders": {
                         "Folder 1": {
-                            "selected_images": ["1.jpg", "renamed.png", "gone.png"],
+                            "selected_images": ["1.jpg", "renamed.png", "gone.png"]
                         },
-                        "Old Folder": {
-                            "selected_images": ["old.jpg"],
-                        },
+                        "Old Folder": {"selected_images": ["old.jpg"]},
                     },
-                    "exports": {},
                 }
             ),
             encoding="utf-8",
@@ -420,18 +492,17 @@ class StoreTests(RepositoryFixture):
 
         restored = self.editing.load(self.manga_ref)
 
-        self.assertEqual(restored.last_folder, "Folder 1")
-        self.assertEqual(restored.last_image, "1.jpg")
+        self.assertEqual((restored.last_folder, restored.last_image), ("Folder 1", "1.jpg"))
         self.assertEqual(restored.folders["Folder 1"].selected_images, {"1.jpg"})
         self.assertGreaterEqual(len(restored.warnings), 3)
 
-    def test_missing_resume_image_resets_the_whole_pair_to_the_manga_start(self) -> None:
+    def test_missing_resume_image_resets_whole_pair_to_manga_start(self) -> None:
         reading_path = self.reading.path_for(self.manga_ref)
         reading_path.parent.mkdir(parents=True)
         reading_path.write_text(
             json.dumps(
                 {
-                    "schema_version": 2,
+                    "schema_version": STATE_SCHEMA_VERSION,
                     "last_folder": "Folder 2",
                     "last_image": "missing.jpg",
                 }
@@ -442,11 +513,10 @@ class StoreTests(RepositoryFixture):
         editing_path.write_text(
             json.dumps(
                 {
-                    "schema_version": 2,
+                    "schema_version": STATE_SCHEMA_VERSION,
                     "last_folder": "Folder 2",
                     "last_image": "missing.jpg",
                     "folders": {},
-                    "exports": {},
                 }
             ),
             encoding="utf-8",
@@ -455,47 +525,29 @@ class StoreTests(RepositoryFixture):
         reading = self.reading.load(self.manga_ref)
         editing = self.editing.load(self.manga_ref)
 
-        self.assertEqual(
-            (reading.last_folder, reading.last_image), ("Folder 1", "1.jpg")
-        )
-        self.assertEqual(
-            (editing.last_folder, editing.last_image), ("Folder 1", "1.jpg")
-        )
+        self.assertEqual((reading.last_folder, reading.last_image), ("Folder 1", "1.jpg"))
+        self.assertEqual((editing.last_folder, editing.last_image), ("Folder 1", "1.jpg"))
 
-    def test_unsafe_editing_identities_fail_closed_even_when_nested_under_stale_folders(
-        self,
-    ) -> None:
+    def test_unsafe_editing_identities_fail_closed_even_when_stale(self) -> None:
         path = self.editing.path_for(self.manga_ref)
         path.parent.mkdir(parents=True)
         base = {
-            "schema_version": 2,
+            "schema_version": STATE_SCHEMA_VERSION,
             "last_folder": "Folder 1",
             "last_image": "1.jpg",
-            "folders": {
-                "Folder 1": {
-                    "selected_images": [],
-                },
-                "Old Folder": {
-                    "selected_images": ["old.jpg"],
-                },
-            },
-            "exports": {},
+            "folders": {"Old Folder": {"selected_images": ["old.jpg"]}},
         }
         invalid_payloads = []
-        unsafe_last = json.loads(json.dumps(base))
-        unsafe_last["last_folder"] = "../Folder 1"
-        invalid_payloads.append(unsafe_last)
+        for key, value in (("last_folder", "../Folder 1"), ("last_image", "../old.jpg")):
+            payload = json.loads(json.dumps(base))
+            payload[key] = value
+            invalid_payloads.append(payload)
         unsafe_folder = json.loads(json.dumps(base))
-        unsafe_folder["folders"]["../Old Folder"] = unsafe_folder["folders"].pop(
-            "Old Folder"
-        )
+        unsafe_folder["folders"]["../Old Folder"] = unsafe_folder["folders"].pop("Old Folder")
         invalid_payloads.append(unsafe_folder)
-        unsafe_last_image = json.loads(json.dumps(base))
-        unsafe_last_image["last_image"] = "../old.jpg"
-        invalid_payloads.append(unsafe_last_image)
-        non_string_selection = json.loads(json.dumps(base))
-        non_string_selection["folders"]["Old Folder"]["selected_images"] = [7]
-        invalid_payloads.append(non_string_selection)
+        non_string = json.loads(json.dumps(base))
+        non_string["folders"]["Old Folder"]["selected_images"] = [7]
+        invalid_payloads.append(non_string)
 
         for payload in invalid_payloads:
             with self.subTest(payload=payload):
@@ -503,7 +555,7 @@ class StoreTests(RepositoryFixture):
                 with self.assertRaises(EditingStateError):
                     self.editing.load(self.manga_ref)
 
-    def test_malformed_reading_soft_resets_but_malformed_editing_fails_closed(self) -> None:
+    def test_malformed_reading_soft_resets_but_editing_fails_closed(self) -> None:
         reading_path = self.reading.path_for(self.manga_ref)
         reading_path.parent.mkdir(parents=True)
         reading_path.write_bytes(b"\xff")
@@ -519,6 +571,37 @@ class StoreTests(RepositoryFixture):
         with self.assertRaises(EditingStateError):
             export_manga(self.root, self.manga_ref)
 
+    def test_old_schema_is_a_clean_break(self) -> None:
+        reading_path = self.reading.path_for(self.manga_ref)
+        reading_path.parent.mkdir(parents=True)
+        reading_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "last_folder": "Folder 2",
+                    "last_image": "10.jpg",
+                }
+            ),
+            encoding="utf-8",
+        )
+        editing_path = self.editing.path_for(self.manga_ref)
+        editing_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "last_folder": "Folder 1",
+                    "last_image": "1.jpg",
+                    "folders": {},
+                    "exports": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        self.assertEqual(self.reading.load(self.manga_ref).last_folder, "Folder 1")
+        with self.assertRaises(EditingStateError):
+            self.editing.load(self.manga_ref)
+
     def test_one_manga_state_is_isolated_from_another(self) -> None:
         self.add_image("Other", "Folder", "1.jpg")
         other = self.manga("Other")
@@ -532,14 +615,12 @@ class StoreTests(RepositoryFixture):
         self.assertEqual(first_path.parent.name, "Series")
         self.assertEqual(other_path.parent.name, "Other")
 
-    def test_store_mutations_honor_the_nonblocking_library_lock(self) -> None:
+    def test_store_mutations_honor_nonblocking_library_lock(self) -> None:
         with library_mutation_lock(self.root):
             with self.assertRaises(LibraryBusyError):
-                self.editing.set_selection(
-                    self.manga_ref, "Folder 1", "1.jpg", True
-                )
+                self.editing.set_selection(self.manga_ref, "Folder 1", "1.jpg", True)
 
-    def test_store_refuses_a_symlinked_workspace(self) -> None:
+    def test_store_refuses_symlinked_workspace(self) -> None:
         metadata = self.root / ".pocket-manga-editor"
         metadata.mkdir()
         outside = self.root / "outside-workspace"
@@ -552,65 +633,24 @@ class StoreTests(RepositoryFixture):
         with self.assertRaises(WorkspaceError):
             self.editing.load(self.manga_ref)
 
-    def test_bad_editing_leaf_does_not_break_reading(self) -> None:
+    def test_bad_metadata_leafs_are_isolated_by_activity(self) -> None:
         workspace = manga_workspace_paths(self.root, "Series")
         workspace.workspace.mkdir(parents=True)
         workspace.editing.mkdir()
 
-        restored = self.reading.set_position(
-            self.manga_ref, "Folder 2", "10.jpg"
-        )
+        restored = self.reading.set_position(self.manga_ref, "Folder 2", "10.jpg")
 
         self.assertEqual(restored.last_folder, "Folder 2")
-        self.assertTrue(workspace.reading.is_file())
         with self.assertRaises(WorkspaceError):
             self.editing.load(self.manga_ref)
 
-    def test_bad_reading_leaf_does_not_break_editing(self) -> None:
-        workspace = manga_workspace_paths(self.root, "Series")
-        workspace.workspace.mkdir(parents=True)
+        workspace.editing.rmdir()
+        workspace.reading.unlink()
         workspace.reading.mkdir()
-
-        restored = self.editing.set_selection(
-            self.manga_ref, "Folder 1", "1.jpg", True
-        )
-
-        self.assertEqual(restored.folders["Folder 1"].selected_images, {"1.jpg"})
-        self.assertTrue(workspace.editing.is_file())
+        changed = self.editing.set_selection(self.manga_ref, "Folder 1", "1.jpg", True)
+        self.assertEqual(changed.folders["Folder 1"].selected_images, {"1.jpg"})
         with self.assertRaises(WorkspaceError):
             self.reading.load(self.manga_ref)
-
-    def test_editing_rejects_non_authoritative_export_filename(self) -> None:
-        path = self.editing.path_for(self.manga_ref)
-        path.parent.mkdir(parents=True)
-        path.write_text(
-            json.dumps(
-                {
-                    "schema_version": 2,
-                    "last_folder": "Folder 1",
-                    "last_image": "1.jpg",
-                    "folders": {
-                        "Folder 1": {
-                            "selected_images": ["1.jpg"],
-                        },
-                    },
-                    "exports": {
-                        "Folder 1": {
-                            "files": {
-                                "1.jpg": {
-                                    "output_name": "plausible-but-wrong.jpg",
-                                    "digest": "0" * 64,
-                                }
-                            }
-                        }
-                    },
-                }
-            ),
-            encoding="utf-8",
-        )
-
-        with self.assertRaises(EditingStateError):
-            self.editing.load(self.manga_ref)
 
 
 class ExporterTests(RepositoryFixture):
@@ -624,7 +664,8 @@ class ExporterTests(RepositoryFixture):
         self.editing = EditingStore(self.root)
         self.workspace = manga_workspace_paths(self.root, "Series")
 
-    def tree_snapshot(self, path: Path) -> dict[str, bytes | None]:
+    @staticmethod
+    def tree_snapshot(path: Path) -> dict[str, bytes | None]:
         if not path.exists():
             return {}
         snapshot: dict[str, bytes | None] = {}
@@ -633,693 +674,462 @@ class ExporterTests(RepositoryFixture):
             snapshot[relative] = None if entry.is_dir() else entry.read_bytes()
         return snapshot
 
-    def select_initial_images(self) -> None:
-        self.editing.save_folder(
-            self.manga_ref,
-            "Chapter One",
-            "2.PNG",
-            {"1.jpg", "2.PNG"},
-        )
-        self.editing.save_folder(
-            self.manga_ref,
-            "Odd & Ends",
-            "cover.png",
-            {"cover.png"},
-        )
+    def select(self, *identities: tuple[str, str]) -> None:
+        for folder_name, image_name in identities:
+            self.editing.set_selection(
+                self.manga_ref, folder_name, image_name, True
+            )
 
-    @unittest.skipIf(os.name == "nt", "Backslash is a path separator on Windows.")
-    def test_posix_backslashes_round_trip_as_exact_names_and_export(self) -> None:
-        manga_name = r"Series\Exact"
-        folder_name = r"Chapter\Odd"
-        image_name = r"page\01.JPG"
-        self.add_image(manga_name, folder_name, image_name, b"exact")
-        manga = self.manga(manga_name)
-        editing = EditingStore(self.root)
+    def deselect(self, *identities: tuple[str, str]) -> None:
+        for folder_name, image_name in identities:
+            self.editing.set_selection(
+                self.manga_ref, folder_name, image_name, False
+            )
 
-        saved = editing.save_folder(
-            manga,
-            folder_name,
-            image_name,
-            {image_name},
+    def target(self, folder_name: str, image_name: str) -> Path:
+        return (
+            self.workspace.output
+            / folder_name
+            / exported_image_name(folder_name, image_name)
         )
 
-        self.assertEqual(saved.last_folder, folder_name)
-        self.assertEqual(saved.last_image, image_name)
-        self.assertEqual(saved.folders[folder_name].selected_images, {image_name})
-
-        result = export_manga(self.root, manga)
-        workspace = manga_workspace_paths(self.root, manga_name)
-        output_name = exported_image_name(folder_name, image_name)
-
-        self.assertEqual(result.copied_count, 1)
-        self.assertEqual(
-            (workspace.output / folder_name / output_name).read_bytes(),
-            b"exact",
-        )
-        restored = editing.load(manga)
-        self.assertEqual(restored.last_folder, folder_name)
-        self.assertEqual(restored.last_image, image_name)
-        self.assertEqual(restored.folders[folder_name].selected_images, {image_name})
-        self.assertEqual(
-            restored.exports[folder_name].files[image_name].output_name,
-            output_name,
-        )
-        inventory = verify_managed_output(workspace, restored)
-        self.assertEqual(
-            [(folder.folder_name, folder.image_names) for folder in inventory.folders],
-            [(folder_name, (image_name,))],
+    def test_inspection_and_first_export_use_exact_fresh_tree(self) -> None:
+        self.select(
+            ("Chapter One", "1.jpg"),
+            ("Chapter One", "2.PNG"),
+            ("Odd & Ends", "cover.png"),
         )
 
-    def test_whole_manga_export_uses_exact_folders_names_and_extensions(self) -> None:
-        self.select_initial_images()
+        preview = inspect_export(self.root, self.manga_ref)
 
+        self.assertEqual(preview.output_directory, self.workspace.output)
+        self.assertEqual(preview.selected_folder_count, 2)
+        self.assertEqual(preview.selected_image_count, 3)
+        self.assertFalse(preview.output_exists)
+        self.assertFalse(preview.requires_confirmation)
+        result = export_manga(self.root, self.manga_ref)
+        self.assertEqual((result.folder_count, result.image_count), (2, 3))
+        self.assertEqual(result.warnings, ())
+        self.assertEqual(self.target("Chapter One", "1.jpg").read_bytes(), b"one")
+        self.assertEqual(self.target("Chapter One", "2.PNG").read_bytes(), b"two")
+        self.assertEqual(self.target("Odd & Ends", "cover.png").read_bytes(), b"cover")
+
+    def test_subsequent_export_replaces_entire_prior_output(self) -> None:
+        self.select(("Chapter One", "1.jpg"), ("Odd & Ends", "cover.png"))
+        export_manga(self.root, self.manga_ref)
+        old_only = self.target("Odd & Ends", "cover.png")
+        self.assertTrue(old_only.is_file())
+
+        self.deselect(("Chapter One", "1.jpg"), ("Odd & Ends", "cover.png"))
+        self.select(("Chapter One", "2.PNG"), ("Chapter One", "10.jpg"))
         result = export_manga(self.root, self.manga_ref)
 
-        self.assertEqual(result.output_directory, self.workspace.output)
-        self.assertEqual(result.copied_count, 3)
-        self.assertEqual(result.retained_count, 0)
-        self.assertEqual(result.removed_count, 0)
-        expected = {
-            "Chapter One/Chapter One__1.jpg": b"one",
-            "Chapter One/Chapter One__2.PNG": b"two",
-            "Odd & Ends/Odd & Ends__cover.png": b"cover",
-        }
+        self.assertEqual((result.folder_count, result.image_count), (1, 2))
         self.assertEqual(
+            self.tree_snapshot(self.workspace.output),
             {
-                name: content
-                for name, content in self.tree_snapshot(self.workspace.output).items()
-                if content is not None
+                "Chapter One": None,
+                "Chapter One/Chapter One__2.PNG": b"two",
+                "Chapter One/Chapter One__10.jpg": b"ten",
             },
-            expected,
         )
-        restored = self.editing.load(self.manga_ref)
-        inventory = verify_managed_output(self.workspace, restored)
-        self.assertEqual(inventory.output_directory, self.workspace.output)
-        self.assertEqual(inventory.image_count, 3)
-        self.assertEqual(
-            [(folder.folder_name, folder.image_names) for folder in inventory.folders],
-            [
-                ("Chapter One", ("1.jpg", "2.PNG")),
-                ("Odd & Ends", ("cover.png",)),
-            ],
-        )
-        self.assertFalse(
-            (self.root / ".pocket-manga-editor" / "output").exists()
-        )
-        self.assertEqual(list(self.workspace.transactions.iterdir()), [])
+        self.assertFalse(old_only.exists())
 
-    def test_reconciliation_adds_updates_removes_and_preserves_untracked_files(self) -> None:
-        self.select_initial_images()
+    def test_zero_selection_refuses_and_preserves_every_existing_output_byte(self) -> None:
+        self.select(("Chapter One", "1.jpg"))
         export_manga(self.root, self.manga_ref)
-        (self.workspace.output / "notes.txt").write_text("keep", encoding="utf-8")
-        (self.workspace.output / "Chapter One" / "untracked.txt").write_text(
-            "keep too", encoding="utf-8"
-        )
-        self.add_image("Series", "Chapter One", "2.PNG", b"two changed")
-        self.manga_ref = self.manga("Series")
-        self.editing.save_folder(
-            self.manga_ref,
-            "Chapter One",
-            "10.jpg",
-            {"2.PNG", "10.jpg"},
-        )
-        self.editing.replace_folder_selections(
-            self.manga_ref, "Odd & Ends", set()
-        )
-
-        result = export_manga(self.root, self.manga_ref)
-
-        self.assertEqual(result.copied_count, 2)
-        self.assertEqual(result.retained_count, 0)
-        self.assertEqual(result.removed_count, 2)
-        self.assertFalse(
-            (self.workspace.output / "Chapter One" / "Chapter One__1.jpg").exists()
-        )
-        self.assertEqual(
-            (
-                self.workspace.output
-                / "Chapter One"
-                / "Chapter One__2.PNG"
-            ).read_bytes(),
-            b"two changed",
-        )
-        self.assertEqual(
-            (
-                self.workspace.output
-                / "Chapter One"
-                / "Chapter One__10.jpg"
-            ).read_bytes(),
-            b"ten",
-        )
-        self.assertEqual(
-            (self.workspace.output / "Chapter One" / "untracked.txt").read_text(),
-            "keep too",
-        )
-        self.assertEqual((self.workspace.output / "notes.txt").read_text(), "keep")
-        self.assertFalse((self.workspace.output / "Odd & Ends").exists())
-
-        repeated = export_manga(self.root, self.manga_ref)
-        self.assertEqual(repeated.copied_count, 0)
-        self.assertEqual(repeated.retained_count, 2)
-        self.assertEqual(repeated.removed_count, 0)
-
-    def test_committed_cleanup_handles_read_only_preserved_output(
-        self,
-    ) -> None:
-        self.select_initial_images()
-        export_manga(self.root, self.manga_ref)
-        locked = self.workspace.output / "read-only untracked"
-        locked.mkdir()
-        note = locked / "keep.txt"
-        note.write_text("preserve", encoding="utf-8")
-        note.chmod(stat.S_IRUSR)
-        locked.chmod(stat.S_IRUSR | stat.S_IXUSR)
-
-        try:
-            result = export_manga(self.root, self.manga_ref)
-
-            self.assertEqual(result.warnings, ())
-            self.assertEqual(list(self.workspace.transactions.iterdir()), [])
-            recovered = recover_interrupted_exports(self.root)
-            self.assertEqual(recovered.recovered_count, 0)
-            self.assertEqual(note.read_text(encoding="utf-8"), "preserve")
-        finally:
-            if note.exists():
-                note.chmod(stat.S_IRUSR | stat.S_IWUSR)
-            if locked.exists():
-                locked.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
-
-    def test_committed_cleanup_removes_payload_before_retiring_its_journal(self) -> None:
-        self.select_initial_images()
-        export_manga(self.root, self.manga_ref)
-        real_remove = exporter_module.remove_managed_path
-        interrupted = False
-
-        def interrupt_after_old_output(path: Path) -> None:
-            nonlocal interrupted
-            real_remove(path)
-            if Path(path).name == "old-output" and not interrupted:
-                interrupted = True
-                raise OSError("interrupted after deleting old output")
-
-        with patch(
-            "pocket_manga_editor.exporter.remove_managed_path",
-            side_effect=interrupt_after_old_output,
-        ):
-            result = export_manga(self.root, self.manga_ref)
-
-        self.assertTrue(result.warnings)
-        transactions = list(self.workspace.transactions.glob("export-*"))
-        self.assertEqual(len(transactions), 1)
-        self.assertTrue((transactions[0] / "transaction.json").is_file())
-        self.assertFalse((transactions[0] / "old-output").exists())
-
-        recovered = recover_interrupted_exports(self.root)
-        self.assertEqual(recovered.committed_count, 1)
-        self.assertEqual(list(self.workspace.transactions.iterdir()), [])
-
-    def test_unchanged_managed_images_reuse_the_staged_output_copy(self) -> None:
-        self.select_initial_images()
-        export_manga(self.root, self.manga_ref)
-
-        with patch(
-            "pocket_manga_editor.exporter._copy_source_image",
-            side_effect=AssertionError("retained images must not be recopied"),
-        ):
-            result = export_manga(self.root, self.manga_ref)
-
-        self.assertEqual(result.copied_count, 0)
-        self.assertEqual(result.retained_count, 3)
-        self.assertEqual(
-            verify_managed_output(
-                self.workspace, self.editing.load(self.manga_ref)
-            ).image_count,
-            3,
-        )
-
-    def test_export_uses_safe_defaults_when_pathconf_is_unavailable(self) -> None:
-        self.editing.set_selection(
-            self.manga_ref, "Chapter One", "1.jpg", True
-        )
-
-        with patch.object(exporter_module.os, "pathconf", None, create=True):
-            result = export_manga(self.root, self.manga_ref)
-
-        self.assertEqual(result.copied_count, 1)
-        self.assertEqual(
-            (
-                self.workspace.output
-                / "Chapter One"
-                / "Chapter One__1.jpg"
-            ).read_bytes(),
-            b"one",
-        )
-
-    def test_output_path_lookup_ignores_unrelated_bad_managed_leaves(self) -> None:
-        self.workspace.workspace.mkdir(parents=True)
-        self.workspace.reading.mkdir()
-        self.workspace.editing.mkdir()
-        self.workspace.transactions.write_text("unsafe", encoding="utf-8")
-
-        destination = manga_output_directory(self.root, self.manga_ref)
-
-        self.assertEqual(destination, self.workspace.output)
-
-    def test_deselecting_everything_removes_only_managed_output(self) -> None:
-        self.select_initial_images()
-        export_manga(self.root, self.manga_ref)
-        (self.workspace.output / "keep.txt").write_text("untracked", encoding="utf-8")
-        self.editing.replace_folder_selections(
-            self.manga_ref, "Chapter One", set()
-        )
-        self.editing.replace_folder_selections(
-            self.manga_ref, "Odd & Ends", set()
-        )
-
-        result = export_manga(self.root, self.manga_ref)
-
-        self.assertEqual(result.removed_count, 3)
-        self.assertEqual((self.workspace.output / "keep.txt").read_text(), "untracked")
-        self.assertEqual(self.editing.load(self.manga_ref).exports, {})
-        inventory = verify_managed_output(
-            self.workspace, self.editing.load(self.manga_ref)
-        )
-        self.assertEqual(inventory.image_count, 0)
-
-    def test_export_with_no_selection_or_history_is_refused(self) -> None:
-        with self.assertRaisesRegex(ExportError, "Select at least one"):
-            export_manga(self.root, self.manga_ref)
-
-        self.assertFalse(self.workspace.output.exists())
-
-    def test_export_honors_the_nonblocking_library_lock(self) -> None:
-        self.editing.set_selection(
-            self.manga_ref, "Chapter One", "1.jpg", True
-        )
-
-        with library_mutation_lock(self.root):
-            with self.assertRaises(ExportBusyError):
-                export_manga(self.root, self.manga_ref)
-
-    def test_modified_managed_file_aborts_before_any_manga_output_changes(self) -> None:
-        self.select_initial_images()
-        export_manga(self.root, self.manga_ref)
-        managed = (
-            self.workspace.output / "Chapter One" / "Chapter One__1.jpg"
-        )
-        managed.write_bytes(b"user changed")
-        self.editing.set_selection(
-            self.manga_ref, "Chapter One", "10.jpg", True
-        )
+        (self.workspace.output / "test.txt").write_bytes(b"external")
+        self.deselect(("Chapter One", "1.jpg"))
         before = self.tree_snapshot(self.workspace.output)
-        editing_before = self.workspace.editing.read_bytes()
 
-        with self.assertRaisesRegex(ExportConflict, "changed"):
-            export_manga(self.root, self.manga_ref)
+        preview = inspect_export(self.root, self.manga_ref)
+        self.assertEqual(preview.selected_image_count, 0)
+        self.assertEqual(preview.unrecognized_entries, ())
+        with self.assertRaisesRegex(NothingSelectedError, "Nothing selected"):
+            export_manga(
+                self.root,
+                self.manga_ref,
+                confirm_unrecognized_output=True,
+            )
 
         self.assertEqual(self.tree_snapshot(self.workspace.output), before)
-        self.assertEqual(self.workspace.editing.read_bytes(), editing_before)
 
-    def test_live_output_change_after_staging_is_preserved_and_aborts_export(self) -> None:
-        self.select_initial_images()
+    def test_unrecognized_output_requires_confirmation_then_is_deleted(self) -> None:
+        self.select(("Chapter One", "1.jpg"))
         export_manga(self.root, self.manga_ref)
-        self.editing.set_selection(
-            self.manga_ref, "Chapter One", "10.jpg", True
-        )
-        editing_before = self.workspace.editing.read_bytes()
-        real_copytree = exporter_module.shutil.copytree
+        (self.workspace.output / "test.txt").write_bytes(b"external")
+        nested = self.workspace.output / "Chapter One" / "nested"
+        nested.mkdir()
+        (nested / "extra.jpg").write_bytes(b"external image")
+        before = self.tree_snapshot(self.workspace.output)
 
-        def copy_then_change_live_output(source, destination, *args, **kwargs):
-            copied = real_copytree(source, destination, *args, **kwargs)
-            (self.workspace.output / "late-user-file.txt").write_text(
-                "preserve me", encoding="utf-8"
-            )
-            return copied
+        preview = inspect_export(self.root, self.manga_ref)
 
-        with patch(
-            "pocket_manga_editor.exporter.shutil.copytree",
-            side_effect=copy_then_change_live_output,
-        ):
-            with self.assertRaisesRegex(ExportConflict, "changed"):
-                export_manga(self.root, self.manga_ref)
-
-        self.assertEqual(
-            (self.workspace.output / "late-user-file.txt").read_text(),
-            "preserve me",
-        )
-        self.assertFalse(
-            (
-                self.workspace.output
-                / "Chapter One"
-                / "Chapter One__10.jpg"
-            ).exists()
-        )
-        self.assertEqual(self.workspace.editing.read_bytes(), editing_before)
-        self.assertEqual(list(self.workspace.transactions.iterdir()), [])
-
-    def test_retained_source_change_after_plan_aborts_before_commit(self) -> None:
-        self.select_initial_images()
-        export_manga(self.root, self.manga_ref)
-        output_before = self.tree_snapshot(self.workspace.output)
-        editing_before = self.workspace.editing.read_bytes()
-        source = self.root / "Series" / "Chapter One" / "1.jpg"
-        real_apply_plan = exporter_module._apply_plan
-
-        def apply_then_change_source(staged_output, plan):
-            result = real_apply_plan(staged_output, plan)
-            source.write_bytes(b"changed after plan")
-            return result
-
-        with patch(
-            "pocket_manga_editor.exporter._apply_plan",
-            side_effect=apply_then_change_source,
-        ):
-            with self.assertRaisesRegex(ExportConflict, "Source image.*changed"):
-                export_manga(self.root, self.manga_ref)
-
-        self.assertEqual(self.tree_snapshot(self.workspace.output), output_before)
-        self.assertEqual(self.workspace.editing.read_bytes(), editing_before)
-        self.assertEqual(source.read_bytes(), b"changed after plan")
-        self.assertEqual(list(self.workspace.transactions.iterdir()), [])
-
-    def test_output_change_during_original_rename_is_restored_without_loss(self) -> None:
-        self.select_initial_images()
-        export_manga(self.root, self.manga_ref)
-        self.editing.set_selection(
-            self.manga_ref, "Chapter One", "10.jpg", True
-        )
-        editing_before = self.workspace.editing.read_bytes()
-        managed_relative = Path("Chapter One") / "Chapter One__1.jpg"
-        real_replace = exporter_module.os.replace
-
-        def move_then_change_original(source, destination):
-            result = real_replace(source, destination)
-            if (
-                Path(source) == self.workspace.output
-                and Path(destination).name == "old-output"
-            ):
-                (Path(destination) / managed_relative).write_bytes(
-                    b"changed at rename boundary"
-                )
-            return result
-
-        with patch(
-            "pocket_manga_editor.exporter.os.replace",
-            side_effect=move_then_change_original,
-        ):
-            with self.assertRaisesRegex(ExportConflict, "immediately before"):
-                export_manga(self.root, self.manga_ref)
-
-        self.assertEqual(
-            (self.workspace.output / managed_relative).read_bytes(),
-            b"changed at rename boundary",
-        )
-        self.assertEqual(self.workspace.editing.read_bytes(), editing_before)
-        self.assertEqual(list(self.workspace.transactions.iterdir()), [])
-
-    def test_new_output_install_never_replaces_a_late_destination(self) -> None:
-        self.editing.set_selection(
-            self.manga_ref, "Chapter One", "1.jpg", True
-        )
-        editing_before = self.workspace.editing.read_bytes()
-        real_install = exporter_module._rename_no_replace
-
-        def create_destination_before_install(source, destination):
-            Path(destination).mkdir()
-            (Path(destination) / "late-user-file.txt").write_text(
-                "preserve me", encoding="utf-8"
-            )
-            return real_install(source, destination)
-
-        with patch(
-            "pocket_manga_editor.exporter._rename_no_replace",
-            side_effect=create_destination_before_install,
-        ):
-            with self.assertRaisesRegex(ExportConflict, "appeared"):
-                export_manga(self.root, self.manga_ref)
-
-        self.assertEqual(
-            (self.workspace.output / "late-user-file.txt").read_text(),
-            "preserve me",
-        )
-        self.assertEqual(self.workspace.editing.read_bytes(), editing_before)
-        self.assertEqual(list(self.workspace.transactions.iterdir()), [])
-
-    def test_untracked_file_at_a_selected_destination_is_never_adopted(self) -> None:
-        self.editing.set_selection(
-            self.manga_ref, "Chapter One", "1.jpg", True
-        )
-        target = self.workspace.output / "Chapter One" / "Chapter One__1.jpg"
-        target.parent.mkdir(parents=True)
-        target.write_bytes(b"one")
-
-        with self.assertRaisesRegex(ExportConflict, "Untracked output"):
+        self.assertTrue(preview.requires_confirmation)
+        self.assertIn("test.txt", preview.unrecognized_entries)
+        self.assertIn("Chapter One/nested/", preview.unrecognized_entries)
+        self.assertIn("Chapter One/nested/extra.jpg", preview.unrecognized_entries)
+        with self.assertRaises(ExportConfirmationRequired) as raised:
             export_manga(self.root, self.manga_ref)
+        self.assertEqual(raised.exception.preview, preview)
+        self.assertEqual(self.tree_snapshot(self.workspace.output), before)
 
-        self.assertEqual(target.read_bytes(), b"one")
-        self.assertEqual(self.editing.load(self.manga_ref).exports, {})
+        export_manga(
+            self.root,
+            self.manga_ref,
+            confirm_unrecognized_output=True,
+        )
+        self.assertEqual(
+            self.tree_snapshot(self.workspace.output),
+            {
+                "Chapter One": None,
+                "Chapter One/Chapter One__1.jpg": b"one",
+            },
+        )
 
-    def test_casefold_folder_collisions_are_rejected_before_mutation(self) -> None:
-        upper = self.root / "Collision" / "Foo"
-        lower = self.root / "Collision" / "foo"
-        upper.mkdir(parents=True)
-        lower.mkdir(parents=True, exist_ok=True)
-        if upper.samefile(lower):
-            self.skipTest("The test filesystem is case-insensitive.")
-        (upper / "a.jpg").write_bytes(b"a")
-        (lower / "b.jpg").write_bytes(b"b")
+    def test_output_links_hard_fail_even_when_replacement_is_confirmed(self) -> None:
+        self.select(("Chapter One", "1.jpg"))
+        export_manga(self.root, self.manga_ref)
+        outside = self.root / "outside.txt"
+        outside.write_bytes(b"outside")
+        link = self.workspace.output / "linked.jpg"
+        try:
+            link.symlink_to(outside)
+        except OSError as exc:
+            self.skipTest(f"Symbolic links are unavailable: {exc}")
+
+        with self.assertRaisesRegex(ExportError, "link"):
+            inspect_export(self.root, self.manga_ref)
+        with self.assertRaisesRegex(ExportError, "link"):
+            export_manga(
+                self.root,
+                self.manga_ref,
+                confirm_unrecognized_output=True,
+            )
+        self.assertEqual(outside.read_bytes(), b"outside")
+        self.assertTrue(link.is_symlink())
+
+    def test_export_never_changes_editing_metadata(self) -> None:
+        self.select(("Chapter One", "2.PNG"), ("Odd & Ends", "cover.png"))
+        self.editing.set_position(self.manga_ref, "Chapter One", "10.jpg")
+        editing_path = self.editing.path_for(self.manga_ref)
+        before = editing_path.read_bytes()
+
+        export_manga(self.root, self.manga_ref)
+
+        self.assertEqual(editing_path.read_bytes(), before)
+        payload = json.loads(before)
+        self.assertNotIn("exports", payload)
+
+    def test_copy_failure_before_journal_preserves_prior_output(self) -> None:
+        self.select(("Chapter One", "1.jpg"))
+        export_manga(self.root, self.manga_ref)
+        prior = self.tree_snapshot(self.workspace.output)
+        self.deselect(("Chapter One", "1.jpg"))
+        self.select(("Chapter One", "2.PNG"), ("Chapter One", "10.jpg"))
+        real_copy = exporter_module._copy_source_image
+
+        def fail_second(folder, image, destination):
+            if image.name == "10.jpg":
+                raise ExportError("simulated copy failure")
+            return real_copy(folder, image, destination)
+
+        with patch.object(exporter_module, "_copy_source_image", side_effect=fail_second):
+            with self.assertRaisesRegex(ExportError, "simulated copy failure"):
+                export_manga(self.root, self.manga_ref)
+
+        self.assertEqual(self.tree_snapshot(self.workspace.output), prior)
+        self.assertEqual(tuple(self.workspace.transactions.iterdir()), ())
+
+    def test_source_change_after_staging_aborts_and_preserves_prior_output(self) -> None:
+        self.select(("Chapter One", "1.jpg"))
+        export_manga(self.root, self.manga_ref)
+        prior = self.tree_snapshot(self.workspace.output)
+        self.select(("Chapter One", "10.jpg"))
+        source = self.root / "Series" / "Chapter One" / "10.jpg"
+        real_revalidate = exporter_module._revalidate_sources
+
+        def change_source(desired):
+            source.write_bytes(b"changed after staging")
+            return real_revalidate(desired)
+
+        with patch.object(exporter_module, "_revalidate_sources", side_effect=change_source):
+            with self.assertRaises(ExportConflict):
+                export_manga(self.root, self.manga_ref)
+
+        self.assertEqual(self.tree_snapshot(self.workspace.output), prior)
+        self.assertEqual(tuple(self.workspace.transactions.iterdir()), ())
+
+    def test_live_output_change_during_staging_is_never_overwritten(self) -> None:
+        self.select(("Chapter One", "1.jpg"))
+        export_manga(self.root, self.manga_ref)
+        self.select(("Chapter One", "2.PNG"))
+        active = self.target("Chapter One", "1.jpg")
+        real_revalidate = exporter_module._revalidate_sources
+
+        def change_output(desired):
+            result = real_revalidate(desired)
+            active.write_bytes(b"changed by another actor")
+            return result
+
+        with patch.object(exporter_module, "_revalidate_sources", side_effect=change_output):
+            with self.assertRaises(ExportRecoveryError):
+                export_manga(self.root, self.manga_ref)
+
+        self.assertEqual(active.read_bytes(), b"changed by another actor")
+        self.assertTrue(any(self.workspace.transactions.iterdir()))
+
+    def test_late_destination_collision_preserves_both_copies_for_recovery(self) -> None:
+        self.select(("Chapter One", "1.jpg"))
+        export_manga(self.root, self.manga_ref)
+        prior = self.tree_snapshot(self.workspace.output)
+        self.select(("Chapter One", "2.PNG"))
+        real_rename = exporter_module._rename_no_replace
+
+        def collide(source: Path, destination: Path):
+            if source.name == "new-output":
+                destination.mkdir()
+                (destination / "late.txt").write_bytes(b"late")
+            return real_rename(source, destination)
+
+        with patch.object(exporter_module, "_rename_no_replace", side_effect=collide):
+            with self.assertRaises(ExportRecoveryError):
+                export_manga(self.root, self.manga_ref)
+
+        self.assertEqual((self.workspace.output / "late.txt").read_bytes(), b"late")
+        transactions = tuple(self.workspace.transactions.iterdir())
+        self.assertEqual(len(transactions), 1)
+        self.assertEqual(self.tree_snapshot(transactions[0] / "old-output"), prior)
+
+    def test_prepared_transaction_is_rolled_back_on_next_recovery(self) -> None:
+        self.select(("Chapter One", "1.jpg"))
+        export_manga(self.root, self.manga_ref)
+        prior = self.tree_snapshot(self.workspace.output)
+        self.deselect(("Chapter One", "1.jpg"))
+        self.select(("Chapter One", "2.PNG"))
+        real_atomic_write = exporter_module.atomic_write_json
+
+        def interrupt_commit(path: Path, payload: dict[str, object]):
+            if path.name == "transaction.json" and payload.get("phase") == "committed":
+                raise OSError("simulated interruption before commit marker")
+            return real_atomic_write(path, payload)
+
+        with patch.object(
+            exporter_module, "atomic_write_json", side_effect=interrupt_commit
+        ), patch.object(
+            exporter_module,
+            "_rollback_prepared",
+            return_value=["simulated process termination"],
+        ):
+            with self.assertRaises(ExportRecoveryError):
+                export_manga(self.root, self.manga_ref)
+
+        recovery = recover_interrupted_exports(self.root)
+
+        self.assertEqual(recovery.rolled_back_count, 1)
+        self.assertEqual(self.tree_snapshot(self.workspace.output), prior)
+        self.assertEqual(tuple(self.workspace.transactions.iterdir()), ())
+
+    def test_recovery_discards_partially_cleaned_new_staging_after_rollback(self) -> None:
+        self.select(("Chapter One", "1.jpg"))
+        export_manga(self.root, self.manga_ref)
+        prior = self.tree_snapshot(self.workspace.output)
+        self.deselect(("Chapter One", "1.jpg"))
+        self.select(("Chapter One", "2.PNG"), ("Chapter One", "10.jpg"))
+
+        def interrupt_cleanup(transaction: Path, _transaction_root: Path) -> None:
+            staged_file = next(
+                entry
+                for entry in (transaction / "new-output").rglob("*")
+                if entry.is_file()
+            )
+            staged_file.unlink()
+            raise OSError("simulated partial staging cleanup")
+
+        with patch.object(
+            exporter_module,
+            "_revalidate_sources",
+            side_effect=ExportConflict("simulated pre-commit failure"),
+        ), patch.object(
+            exporter_module,
+            "_cleanup_transaction",
+            side_effect=interrupt_cleanup,
+        ):
+            with self.assertRaises(ExportRecoveryError):
+                export_manga(self.root, self.manga_ref)
+
+        self.assertEqual(self.tree_snapshot(self.workspace.output), prior)
+        self.assertTrue(any(self.workspace.transactions.iterdir()))
+
+        recovery = recover_interrupted_exports(self.root)
+
+        self.assertEqual(recovery.rolled_back_count, 1)
+        self.assertEqual(self.tree_snapshot(self.workspace.output), prior)
+        self.assertEqual(tuple(self.workspace.transactions.iterdir()), ())
+
+    def test_committed_cleanup_is_finished_by_next_recovery(self) -> None:
+        self.select(("Chapter One", "1.jpg"))
+        export_manga(self.root, self.manga_ref)
+        self.deselect(("Chapter One", "1.jpg"))
+        self.select(("Chapter One", "2.PNG"))
+
+        with patch.object(
+            exporter_module,
+            "_cleanup_transaction",
+            side_effect=OSError("simulated cleanup interruption"),
+        ):
+            result = export_manga(self.root, self.manga_ref)
+
+        self.assertEqual(len(result.warnings), 1)
+        committed = self.tree_snapshot(self.workspace.output)
+        self.assertTrue(any(self.workspace.transactions.iterdir()))
+        recovery = recover_interrupted_exports(self.root)
+        self.assertEqual(recovery.committed_count, 1)
+        self.assertEqual(self.tree_snapshot(self.workspace.output), committed)
+        self.assertEqual(tuple(self.workspace.transactions.iterdir()), ())
+
+    def test_markerless_new_output_is_discarded_but_old_output_is_not(self) -> None:
+        self.workspace.workspace.mkdir(parents=True)
+        self.workspace.transactions.mkdir()
+        disposable = self.workspace.transactions / "export-disposable"
+        (disposable / "new-output").mkdir(parents=True)
+        (disposable / "new-output" / "file.jpg").write_bytes(b"new")
+
+        recovery = recover_interrupted_exports(self.root)
+
+        self.assertEqual(recovery.discarded_count, 1)
+        self.assertFalse(disposable.exists())
+
+        unsafe = self.workspace.transactions / "export-unsafe"
+        (unsafe / "old-output").mkdir(parents=True)
+        (unsafe / "old-output" / "file.jpg").write_bytes(b"old")
+        with self.assertRaisesRegex(ExportRecoveryError, "active data"):
+            recover_interrupted_exports(self.root)
+        self.assertTrue((unsafe / "old-output" / "file.jpg").is_file())
+
+    def test_malformed_export_journal_fails_closed(self) -> None:
+        self.workspace.workspace.mkdir(parents=True)
+        self.workspace.transactions.mkdir()
+        transaction = self.workspace.transactions / "export-malformed"
+        (transaction / "new-output").mkdir(parents=True)
+        (transaction / "transaction.json").write_text("{}", encoding="utf-8")
+
+        with self.assertRaisesRegex(ExportRecoveryError, "invalid format"):
+            recover_interrupted_exports(self.root)
+
+        self.assertTrue(transaction.is_dir())
+
+    def test_transaction_free_bad_output_in_other_workspace_does_not_block_recovery(self) -> None:
+        metadata = self.root / ".pocket-manga-editor"
+        other = metadata / "Other"
+        other.mkdir(parents=True)
+        outside = self.root / "outside"
+        outside.mkdir()
+        try:
+            (other / "output").symlink_to(outside, target_is_directory=True)
+        except OSError as exc:
+            self.skipTest(f"Directory links are unavailable: {exc}")
+
+        recovery = recover_interrupted_exports(self.root)
+
+        self.assertEqual(recovery.recovered_count, 0)
+        self.assertTrue((other / "output").is_symlink())
+
+    @unittest.skipIf(os.name == "nt", "Backslash is a path separator on Windows.")
+    def test_posix_backslashes_round_trip_as_exact_names(self) -> None:
+        self.add_image("Slash\\Series", "Part\\One", "page\\1.jpg", b"slash")
+        manga = self.manga("Slash\\Series")
+        store = EditingStore(self.root)
+        store.set_selection(manga, "Part\\One", "page\\1.jpg", True)
+
+        result = export_manga(self.root, manga)
+
+        expected = (
+            result.output_directory
+            / "Part\\One"
+            / exported_image_name("Part\\One", "page\\1.jpg")
+        )
+        self.assertEqual(expected.read_bytes(), b"slash")
+
+    def test_casefold_folder_collision_is_rejected_before_output_mutation(self) -> None:
+        self.add_image("Collision", "Entry", "a.jpg")
+        self.add_image("Collision", "entry", "b.jpg")
         manga = self.manga("Collision")
-        editing = EditingStore(self.root)
-        editing.set_selection(manga, "Foo", "a.jpg", True)
-        editing.set_selection(manga, "foo", "b.jpg", True)
+        if len(manga.folders) != 2:
+            self.skipTest("The test filesystem is case-insensitive.")
+        store = EditingStore(self.root)
+        for folder in manga.folders:
+            store.set_selection(manga, folder.name, folder.images[0].name, True)
 
         with self.assertRaisesRegex(ExportConflict, "case-insensitive"):
             export_manga(self.root, manga)
 
         self.assertFalse(manga_workspace_paths(self.root, "Collision").output.exists())
 
-    def test_output_component_length_is_preflighted(self) -> None:
-        folder_name = "f" * 140
-        image_name = f"{'i' * 115}.jpg"
-        self.add_image("Long", folder_name, image_name, b"long")
-        manga = self.manga("Long")
-        EditingStore(self.root).set_selection(
-            manga, folder_name, image_name, True
-        )
+    def test_casefold_image_collision_is_rejected_before_output_mutation(self) -> None:
+        self.add_image("Collision", "Entry", "page.jpg")
+        self.add_image("Collision", "Entry", "PAGE.JPG")
+        manga = self.manga("Collision")
+        if len(manga.folders[0].images) != 2:
+            self.skipTest("The test filesystem is case-insensitive.")
+        store = EditingStore(self.root)
+        for image in manga.folders[0].images:
+            store.set_selection(manga, "Entry", image.name, True)
 
-        with self.assertRaisesRegex(ExportError, "too long"):
+        with self.assertRaisesRegex(ExportConflict, "collide"):
             export_manga(self.root, manga)
 
-        self.assertFalse(manga_workspace_paths(self.root, "Long").output.exists())
+        self.assertFalse(manga_workspace_paths(self.root, "Collision").output.exists())
 
-    def test_each_precommit_failure_restores_the_entire_manga(self) -> None:
-        self.select_initial_images()
-        export_manga(self.root, self.manga_ref)
-        self.editing.set_selection(
-            self.manga_ref, "Chapter One", "10.jpg", True
-        )
-        output_before = self.tree_snapshot(self.workspace.output)
-        editing_before = self.workspace.editing.read_bytes()
-        real_atomic_write = exporter_module.atomic_write_json
-        real_replace = exporter_module.os.replace
-        real_no_replace = exporter_module.rename_no_replace
+    def test_output_component_length_is_preflighted(self) -> None:
+        self.select(("Chapter One", "1.jpg"))
 
-        def fail_new_editing(path, payload):
-            if Path(path).name == "new-editing.json":
-                raise OSError("injected new-editing failure")
-            return real_atomic_write(path, payload)
-
-        def fail_journal(path, payload):
-            if Path(path).name == "transaction.json":
-                raise OSError("injected journal failure")
-            return real_atomic_write(path, payload)
-
-        def replace_failure(source_name: str, destination: Path):
-            def fail(source, target):
-                source_path = Path(source)
-                target_path = Path(target)
-                if source_path.name == source_name and target_path == destination:
-                    raise OSError(f"injected {source_name} failure")
-                return real_replace(source, target)
-
-            return fail
-
-        def fail_new_output_rename(source, target):
-            if (
-                Path(source).name == "new-output"
-                and Path(target) == self.workspace.output
-            ):
-                raise OSError("injected new-output failure")
-            return real_no_replace(source, target)
-
-        failures = [
-            (
-                "staged editing document",
-                patch(
-                "pocket_manga_editor.exporter.atomic_write_json",
-                side_effect=fail_new_editing,
-                ),
-            ),
-            (
-                "transaction journal",
-                patch(
-                "pocket_manga_editor.exporter.atomic_write_json",
-                side_effect=fail_journal,
-                ),
-            ),
-            (
-                "new output install",
-                patch(
-                    "pocket_manga_editor.exporter.rename_no_replace",
-                side_effect=fail_new_output_rename,
-                ),
-            ),
-            (
-                "editing commit",
-                patch(
-                "pocket_manga_editor.exporter.os.replace",
-                side_effect=replace_failure("new-editing.json", self.workspace.editing),
-                ),
-            ),
-        ]
-
-        def fail_old_output(source, target):
-            if Path(source) == self.workspace.output and Path(target).name == "old-output":
-                raise OSError("injected old-output failure")
-            return real_replace(source, target)
-
-        failures.insert(
-            2,
-            (
-                "old output staging",
-                patch(
-                    "pocket_manga_editor.exporter.os.replace",
-                    side_effect=fail_old_output,
-                ),
-            ),
-        )
-
-        for label, failure in failures:
-            with self.subTest(failure=label):
-                with failure:
-                    with self.assertRaises(ExportError):
-                        export_manga(self.root, self.manga_ref)
-                self.assertEqual(self.tree_snapshot(self.workspace.output), output_before)
-                self.assertEqual(self.workspace.editing.read_bytes(), editing_before)
-                self.assertEqual(list(self.workspace.transactions.iterdir()), [])
-
-    def test_incomplete_precommit_rollback_is_recovered_from_journal(self) -> None:
-        self.select_initial_images()
-        export_manga(self.root, self.manga_ref)
-        self.editing.set_selection(
-            self.manga_ref, "Chapter One", "10.jpg", True
-        )
-        output_before = self.tree_snapshot(self.workspace.output)
-        editing_before = self.workspace.editing.read_bytes()
-        real_replace = exporter_module.os.replace
-
-        def fail_editing_install(source, target):
-            if (
-                Path(source).name == "new-editing.json"
-                and Path(target) == self.workspace.editing
-            ):
-                raise OSError("simulated process interruption")
-            return real_replace(source, target)
-
-        with patch(
-            "pocket_manga_editor.exporter.os.replace",
-            side_effect=fail_editing_install,
-        ), patch(
-            "pocket_manga_editor.exporter._rollback_transaction",
-            return_value=["simulated incomplete rollback"],
-        ):
-            with self.assertRaises(ExportRecoveryError):
+        with patch.object(exporter_module.os, "pathconf", return_value=8, create=True):
+            with self.assertRaisesRegex(ExportError, "too long"):
                 export_manga(self.root, self.manga_ref)
 
-        self.assertEqual(len(list(self.workspace.transactions.iterdir())), 1)
-        recovered = recover_interrupted_exports(self.root)
-        self.assertEqual(recovered.rolled_back_count, 1)
-        self.assertEqual(self.tree_snapshot(self.workspace.output), output_before)
-        self.assertEqual(self.workspace.editing.read_bytes(), editing_before)
-        self.assertEqual(list(self.workspace.transactions.iterdir()), [])
+        self.assertFalse(self.workspace.output.exists())
+        self.assertFalse(self.workspace.transactions.exists())
 
-    def test_committed_export_cleanup_is_finished_by_recovery(self) -> None:
-        self.select_initial_images()
-        real_retire = exporter_module._retire_export_transaction
-        failed = False
+    def test_export_uses_safe_defaults_when_pathconf_is_unavailable(self) -> None:
+        self.select(("Chapter One", "1.jpg"))
 
-        def interrupt_cleanup(path, transaction_root):
-            nonlocal failed
-            if Path(path).name.startswith("export-") and not failed:
-                failed = True
-                raise OSError("simulated cleanup interruption")
-            return real_retire(path, transaction_root)
-
-        with patch(
-            "pocket_manga_editor.exporter._retire_export_transaction",
-            side_effect=interrupt_cleanup,
-        ):
+        with patch.object(exporter_module.os, "pathconf", None, create=True):
             result = export_manga(self.root, self.manga_ref)
 
-        self.assertEqual(result.copied_count, 3)
-        self.assertTrue(result.warnings)
-        self.assertEqual(len(list(self.workspace.transactions.iterdir())), 1)
-        recovered = recover_interrupted_exports(self.root)
-        self.assertEqual(recovered.committed_count, 1)
-        self.assertEqual(list(self.workspace.transactions.iterdir()), [])
-        self.assertEqual(
-            verify_managed_output(
-                self.workspace, self.editing.load(self.manga_ref)
-            ).image_count,
-            3,
-        )
+        self.assertEqual(result.image_count, 1)
+        self.assertEqual(self.target("Chapter One", "1.jpg").read_bytes(), b"one")
 
-    def test_markerless_preparation_artifact_is_discarded(self) -> None:
-        self.editing.set_selection(
-            self.manga_ref, "Chapter One", "1.jpg", True
-        )
-        transaction = self.workspace.transactions / "export-orphan"
-        (transaction / "new-output").mkdir(parents=True)
-        (transaction / "new-output" / "temporary.jpg").write_bytes(b"temporary")
+    def test_export_and_inspection_honor_nonblocking_library_lock(self) -> None:
+        self.select(("Chapter One", "1.jpg"))
 
-        with library_mutation_lock(self.root) as locked_root:
-            result = recover_interrupted_exports_locked(locked_root)
+        with library_mutation_lock(self.root):
+            with self.assertRaises(ExportBusyError):
+                inspect_export(self.root, self.manga_ref)
+            with self.assertRaises(ExportBusyError):
+                export_manga(self.root, self.manga_ref)
 
-        self.assertEqual(result.discarded_count, 1)
-        self.assertFalse(transaction.exists())
+    def test_read_only_prior_output_is_replaced_and_cleaned(self) -> None:
+        self.select(("Chapter One", "1.jpg"))
+        export_manga(self.root, self.manga_ref)
+        old_file = self.target("Chapter One", "1.jpg")
+        old_file.chmod(stat.S_IRUSR)
+        self.select(("Chapter One", "2.PNG"))
 
-    def test_malformed_export_journal_fails_closed(self) -> None:
-        self.editing.set_selection(
-            self.manga_ref, "Chapter One", "1.jpg", True
-        )
-        transaction = self.workspace.transactions / "export-bad"
-        transaction.mkdir(parents=True)
-        (transaction / "transaction.json").write_text("{}", encoding="utf-8")
+        result = export_manga(self.root, self.manga_ref)
 
-        with self.assertRaises(ExportRecoveryError):
-            recover_interrupted_exports(self.root)
+        self.assertEqual(result.image_count, 2)
+        self.assertEqual(self.target("Chapter One", "1.jpg").read_bytes(), b"one")
+        self.assertEqual(self.target("Chapter One", "2.PNG").read_bytes(), b"two")
+        self.assertEqual(tuple(self.workspace.transactions.iterdir()), ())
 
-        self.assertTrue(transaction.exists())
+    def test_output_path_lookup_ignores_unrelated_bad_metadata_leafs(self) -> None:
+        self.workspace.workspace.mkdir(parents=True)
+        self.workspace.reading.mkdir()
 
-    def test_transaction_free_bad_leaf_does_not_block_other_manga_recovery(self) -> None:
-        bad_workspace = manga_workspace_paths(self.root, "Series")
-        bad_workspace.workspace.mkdir(parents=True, exist_ok=True)
-        bad_workspace.editing.mkdir()
-        self.add_image("Other", "Folder", "1.jpg", b"other")
-        other = self.manga("Other")
-        EditingStore(self.root).set_selection(other, "Folder", "1.jpg", True)
+        output = manga_output_directory(self.root, self.manga_ref)
 
-        recovered = recover_interrupted_exports(self.root)
-        completion_recovered = recover_interrupted_completions(self.root)
-        exported = export_manga(self.root, other)
-
-        self.assertEqual(recovered.recovered_count, 0)
-        self.assertEqual(completion_recovered.rolled_back_count, 0)
-        self.assertEqual(completion_recovered.cleaned_count, 0)
-        self.assertEqual(exported.copied_count, 1)
-        self.assertTrue(
-            manga_workspace_paths(self.root, "Other").output.is_dir()
-        )
+        self.assertEqual(output, self.workspace.output)
 
 
 if __name__ == "__main__":

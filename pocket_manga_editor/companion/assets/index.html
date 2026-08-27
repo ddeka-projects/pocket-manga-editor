@@ -34,33 +34,11 @@
             </div>
 
             <div id="state-spinner" class="state-spinner" aria-hidden="true"></div>
-            <p id="state-kicker" class="eyebrow">Companion</p>
+            <p id="state-kicker" class="eyebrow">Pocket Manga</p>
             <h1 id="state-title">Connecting to your PC</h1>
             <p id="state-message" class="state-message">
-              Checking the local Companion service&hellip;
+              Opening your library&hellip;
             </p>
-
-            <form id="pair-form" class="pair-form" hidden novalidate>
-              <label for="pair-code">Pairing code</label>
-              <input
-                id="pair-code"
-                name="code"
-                type="text"
-                inputmode="numeric"
-                autocomplete="one-time-code"
-                autocapitalize="characters"
-                spellcheck="false"
-                maxlength="16"
-                placeholder="Enter code"
-                required
-              >
-              <p id="pair-hint" class="field-hint">
-                Enter the one-time code shown by Pocket Manga Editor on the PC.
-              </p>
-              <button id="pair-submit" class="primary-button" type="submit">
-                Pair this iPhone
-              </button>
-            </form>
 
             <button id="state-action" class="primary-button" type="button" hidden>
               Try again
@@ -72,10 +50,16 @@
         <section id="library-screen" class="screen library-screen" hidden aria-labelledby="library-title">
           <header class="library-header">
             <div>
-              <p class="eyebrow">Companion active</p>
+              <p class="eyebrow">Pocket Manga</p>
               <h1 id="library-title">Your library</h1>
             </div>
-            <button id="library-refresh" class="icon-button" type="button" aria-label="Refresh library">
+            <button
+              id="library-refresh"
+              class="icon-button"
+              type="button"
+              aria-label="Rescan library"
+              title="Rescan library"
+            >
               <svg viewBox="0 0 24 24" aria-hidden="true">
                 <path d="M19 8a8 8 0 1 0 1 6M19 4v4h-4" />
               </svg>
@@ -89,8 +73,8 @@
           <div id="library-empty" class="empty-state" hidden>
             <span class="empty-glyph" aria-hidden="true">&#9638;</span>
             <h2>No manga available</h2>
-            <p>The current Companion snapshot does not contain a readable image folder.</p>
-            <button id="empty-retry" class="secondary-button" type="button">Check again</button>
+            <p>The library does not contain a readable image folder.</p>
+            <button id="empty-retry" class="secondary-button" type="button">Rescan library</button>
           </div>
         </section>
 
@@ -120,6 +104,10 @@
               <button id="choose-edit" class="activity-button" type="button">
                 <strong>Edit</strong>
                 <span>Review and select images for export.</span>
+              </button>
+              <button id="choose-export" class="activity-button export-action" type="button">
+                <strong>Export</strong>
+                <span id="export-action-detail">Replace output with the current selections.</span>
               </button>
             </div>
           </div>
@@ -214,6 +202,36 @@
           </div>
         </section>
       </main>
+
+      <section id="export-overlay" class="dialog-overlay" hidden>
+        <div
+          id="export-dialog"
+          class="export-dialog"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="export-dialog-title"
+          aria-describedby="export-dialog-message"
+        >
+          <p class="eyebrow">Export manga</p>
+          <h2 id="export-dialog-title">Create output?</h2>
+          <p id="export-dialog-message" class="export-dialog-message"></p>
+
+          <div id="export-warning" class="export-warning" hidden>
+            <strong>Unrecognized files will be permanently deleted</strong>
+            <p>
+              These output items do not match the current source library. The
+              entire existing output is replaced when export succeeds.
+            </p>
+            <ul id="export-warning-samples" class="export-warning-samples"></ul>
+            <p id="export-warning-more" class="export-warning-more" hidden></p>
+          </div>
+
+          <div class="export-dialog-actions">
+            <button id="export-cancel" class="secondary-button" type="button">Cancel</button>
+            <button id="export-confirm" class="primary-button" type="button">Export</button>
+          </div>
+        </div>
+      </section>
 
       <aside id="action-error" class="action-error" role="alert" hidden>
         <div>

@@ -1,4 +1,4 @@
-"""Single-controller lease management for Companion Mode."""
+"""In-memory ownership for the web application's single active page."""
 
 from __future__ import annotations
 
@@ -30,7 +30,6 @@ class LeaseSnapshot:
     instance_id: str | None
     connected: bool
     lease_expires_at: float | None
-    grace_expires_at: float | None
     page_instance_id: str | None = None
 
 
@@ -38,29 +37,25 @@ class ControllerLease:
     def __init__(
         self,
         *,
-        ttl_seconds: float = 30.0,
-        grace_seconds: float = 120.0,
+        ttl_seconds: float = 15.0,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        if ttl_seconds <= 0 or grace_seconds < 0:
-            raise ValueError("Lease durations are invalid.")
+        if ttl_seconds <= 0:
+            raise ValueError("Lease duration must be positive.")
         self._lock = threading.RLock()
         self._ttl = ttl_seconds
-        self._grace = grace_seconds
         self._clock = clock
         self._instance_id: str | None = None
         self._page_instance_id: str | None = None
         self._lease_expires = 0.0
-        self._grace_expires = 0.0
 
     def claim(
-        self, instance_id: str, page_instance_id: str | None = None
+        self, instance_id: str, page_instance_id: str
     ) -> LeaseSnapshot:
         page_instance_id = self._validated_identity(instance_id, page_instance_id)
         with self._lock:
             now = self._clock()
-            if self._instance_id is not None and now > self._grace_expires:
-                self._clear_locked()
+            self._expire_locked(now)
             if self._instance_id is None:
                 self._assign_locked(instance_id, page_instance_id, now)
                 return self._snapshot_locked(now)
@@ -69,64 +64,56 @@ class ControllerLease:
                 self._instance_id == instance_id
                 and self._page_instance_id == page_instance_id
             )
-            same_client_after_live_ttl = (
-                self._instance_id == instance_id and now > self._lease_expires
-            )
-            if not exact_owner and not same_client_after_live_ttl:
-                raise LeaseConflictError("Another Companion client controls this library.")
+            if not exact_owner:
+                raise LeaseConflictError("Another page currently controls this library.")
             self._assign_locked(instance_id, page_instance_id, now)
             return self._snapshot_locked(now)
 
     def heartbeat(
-        self, instance_id: str, page_instance_id: str | None = None
+        self, instance_id: str, page_instance_id: str
     ) -> LeaseSnapshot:
         page_instance_id = self._validated_identity(instance_id, page_instance_id)
         with self._lock:
             now = self._clock()
-            if self._instance_id is not None and now > self._grace_expires:
-                self._clear_locked()
+            self._expire_locked(now)
             if self._instance_id is None:
                 raise LeaseExpiredError("The controller lease has expired.")
             if (
                 self._instance_id != instance_id
                 or self._page_instance_id != page_instance_id
             ):
-                raise LeaseConflictError("Another Companion client owns the lease.")
+                raise LeaseConflictError("Another page owns the controller lease.")
             self._assign_locked(instance_id, page_instance_id, now)
             return self._snapshot_locked(now)
 
     def authorize(
-        self, instance_id: str, page_instance_id: str | None = None
+        self, instance_id: str, page_instance_id: str
     ) -> LeaseSnapshot:
         page_instance_id = self._validated_identity(instance_id, page_instance_id)
         with self._lock:
             now = self._clock()
-            if self._instance_id is not None and now > self._grace_expires:
-                self._clear_locked()
+            self._expire_locked(now)
             if self._instance_id is None:
                 raise LeaseExpiredError("No live controller lease exists.")
             if (
                 self._instance_id != instance_id
                 or self._page_instance_id != page_instance_id
             ):
-                raise LeaseConflictError("Another Companion client owns the lease.")
-            if now > self._lease_expires:
-                raise LeaseExpiredError("The controller must reconnect or heartbeat.")
+                raise LeaseConflictError("Another page owns the controller lease.")
             return self._snapshot_locked(now)
 
-    def release(self, instance_id: str, page_instance_id: str | None = None) -> None:
+    def release(self, instance_id: str, page_instance_id: str) -> None:
         page_instance_id = self._validated_identity(instance_id, page_instance_id)
         with self._lock:
             now = self._clock()
-            if self._instance_id is not None and now > self._grace_expires:
-                self._clear_locked()
+            self._expire_locked(now)
             if self._instance_id is None:
                 return
             if (
                 self._instance_id != instance_id
                 or self._page_instance_id != page_instance_id
             ):
-                raise LeaseConflictError("Another Companion client owns the lease.")
+                raise LeaseConflictError("Another page owns the controller lease.")
             self._clear_locked()
 
     def disconnect(self) -> None:
@@ -136,18 +123,15 @@ class ControllerLease:
     def snapshot(self) -> LeaseSnapshot:
         with self._lock:
             now = self._clock()
-            if self._instance_id is not None and now > self._grace_expires:
-                self._clear_locked()
+            self._expire_locked(now)
             return self._snapshot_locked(now)
 
     @staticmethod
     def _validated_identity(
-        instance_id: str, page_instance_id: str | None
-    ) -> str | None:
+        instance_id: str, page_instance_id: str
+    ) -> str:
         if not isinstance(instance_id, str) or not _CLIENT_ID.fullmatch(instance_id):
             raise LeaseError("client_id must be 1-128 URL-safe characters.")
-        if page_instance_id is None:
-            return None
         if (
             not isinstance(page_instance_id, str)
             or not _PAGE_INSTANCE_ID.fullmatch(page_instance_id)
@@ -156,24 +140,25 @@ class ControllerLease:
         return page_instance_id
 
     def _assign_locked(
-        self, instance_id: str, page_instance_id: str | None, now: float
+        self, instance_id: str, page_instance_id: str, now: float
     ) -> None:
         self._instance_id = instance_id
         self._page_instance_id = page_instance_id
         self._lease_expires = now + self._ttl
-        self._grace_expires = self._lease_expires + self._grace
 
     def _snapshot_locked(self, now: float) -> LeaseSnapshot:
         return LeaseSnapshot(
             self._instance_id,
             self._instance_id is not None and now <= self._lease_expires,
             self._lease_expires if self._instance_id is not None else None,
-            self._grace_expires if self._instance_id is not None else None,
             self._page_instance_id,
         )
+
+    def _expire_locked(self, now: float) -> None:
+        if self._instance_id is not None and now >= self._lease_expires:
+            self._clear_locked()
 
     def _clear_locked(self) -> None:
         self._instance_id = None
         self._page_instance_id = None
         self._lease_expires = 0.0
-        self._grace_expires = 0.0

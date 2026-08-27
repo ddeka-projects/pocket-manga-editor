@@ -1,4 +1,4 @@
-"""Fail-closed filesystem mutations shared by export and completion."""
+"""Fail-closed filesystem mutations used by transactional exports."""
 
 from __future__ import annotations
 

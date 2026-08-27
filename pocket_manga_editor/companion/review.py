@@ -1,4 +1,4 @@
-"""Activity-isolated Companion state with immediate durable persistence."""
+"""Activity-isolated web review state with immediate durable persistence."""
 
 from __future__ import annotations
 

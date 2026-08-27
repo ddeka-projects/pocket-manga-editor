@@ -1,19 +1,19 @@
 "use strict";
 
 (() => {
-  const HEARTBEAT_INTERVAL_MS = 12_000;
-  const STATUS_POLL_INTERVAL_MS = 4_000;
+  const HEARTBEAT_INTERVAL_MS = 5_000;
+  const OCCUPIED_RETRY_INTERVAL_MS = 3_000;
   const REQUEST_TIMEOUT_MS = 15_000;
+  const EXPORT_TIMEOUT_MS = 10 * 60_000;
   const READ = "read";
   const EDIT = "edit";
 
   const ROUTES = Object.freeze({
-    status: "/api/status",
-    pair: "/api/pair",
     claim: "/api/controller/claim",
     heartbeat: "/api/controller/heartbeat",
     release: "/api/controller/release",
     library: "/api/library",
+    rescan: "/api/library/rescan",
     manga: (id, activity) => (
       `/api/manga/${encodeURIComponent(id)}?activity=${encodeURIComponent(activity)}`
     ),
@@ -24,6 +24,8 @@
     readPosition: (id) => `/api/read/folder/${encodeURIComponent(id)}/position`,
     editPosition: (id) => `/api/edit/folder/${encodeURIComponent(id)}/position`,
     editSelection: (id) => `/api/edit/folder/${encodeURIComponent(id)}/selection`,
+    exportPreview: (id) => `/api/manga/${encodeURIComponent(id)}/export-preview`,
+    exportManga: (id) => `/api/manga/${encodeURIComponent(id)}/export`,
   });
 
   const element = (id) => document.getElementById(id);
@@ -35,10 +37,6 @@
     stateMessage: element("state-message"),
     stateAction: element("state-action"),
     stateDetail: element("state-detail"),
-    pairForm: element("pair-form"),
-    pairCode: element("pair-code"),
-    pairHint: element("pair-hint"),
-    pairSubmit: element("pair-submit"),
     libraryScreen: element("library-screen"),
     libraryRefresh: element("library-refresh"),
     librarySummary: element("library-summary"),
@@ -51,6 +49,8 @@
     backToLibrary: element("back-to-library"),
     chooseRead: element("choose-read"),
     chooseEdit: element("choose-edit"),
+    chooseExport: element("choose-export"),
+    exportActionDetail: element("export-action-detail"),
     readerScreen: element("reader-screen"),
     readerStage: element("reader-stage"),
     imageDisplay: element("image-display"),
@@ -73,6 +73,15 @@
     imageRetry: element("image-retry"),
     boundaryCue: element("boundary-cue"),
     readerFeedback: element("reader-feedback"),
+    exportOverlay: element("export-overlay"),
+    exportDialog: element("export-dialog"),
+    exportDialogTitle: element("export-dialog-title"),
+    exportDialogMessage: element("export-dialog-message"),
+    exportWarning: element("export-warning"),
+    exportWarningSamples: element("export-warning-samples"),
+    exportWarningMore: element("export-warning-more"),
+    exportCancel: element("export-cancel"),
+    exportConfirm: element("export-confirm"),
     actionError: element("action-error"),
     actionErrorTitle: element("action-error-title"),
     actionErrorMessage: element("action-error-message"),
@@ -99,7 +108,7 @@
     leaseClaimed: false,
     heartbeatTimer: 0,
     heartbeatInFlight: false,
-    statusPollTimer: 0,
+    claimRetryTimer: 0,
     stateAction: null,
     library: [],
     libraryIssueCount: 0,
@@ -128,6 +137,9 @@
     positionFlushPromise: Promise.resolve(),
     mutationBarrierTail: Promise.resolve(),
     activityOpening: false,
+    rescanBusy: false,
+    exportBusy: false,
+    exportPreview: null,
     entryNavigationPending: false,
     entryNavigationToken: 0,
     historyNavigationPending: false,
@@ -135,7 +147,7 @@
   };
 
   function getClientId() {
-    const storageKey = "pocket-manga-companion-client";
+    const storageKey = "pocket-manga-client";
     try {
       const existing = window.sessionStorage.getItem(storageKey);
       if (existing && /^[A-Za-z0-9._~-]{1,128}$/.test(existing)) {
@@ -163,17 +175,19 @@
   }
 
   function bindEvents() {
-    elements.pairForm.addEventListener("submit", pairDevice);
     elements.stateAction.addEventListener("click", () => {
       if (typeof state.stateAction === "function") {
         void state.stateAction();
       }
     });
-    elements.libraryRefresh.addEventListener("click", () => void loadLibrary());
-    elements.emptyRetry.addEventListener("click", () => void loadLibrary());
+    elements.libraryRefresh.addEventListener("click", () => void rescanLibrary());
+    elements.emptyRetry.addEventListener("click", () => void rescanLibrary());
     elements.backToLibrary.addEventListener("click", navigateBackAfterMutations);
     elements.chooseRead.addEventListener("click", () => void chooseActivity(READ));
     elements.chooseEdit.addEventListener("click", () => void chooseActivity(EDIT));
+    elements.chooseExport.addEventListener("click", () => void prepareExport());
+    elements.exportCancel.addEventListener("click", closeExportDialog);
+    elements.exportConfirm.addEventListener("click", () => void commitExport());
     elements.backToActivities.addEventListener("click", navigateBackAfterMutations);
     elements.folderPicker.addEventListener("change", (event) => {
       const folderId = event.currentTarget.value;
@@ -204,6 +218,11 @@
       }
     });
     elements.actionErrorDismiss.addEventListener("click", hideActionError);
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && !elements.exportOverlay.hidden && !state.exportBusy) {
+        closeExportDialog();
+      }
+    });
 
     for (const control of [elements.topChrome, elements.backToActivities]) {
       for (const eventName of ["click", "pointerup", "touchend"]) {
@@ -223,26 +242,23 @@
     }
     window.addEventListener("popstate", historyChanged);
     document.addEventListener("visibilitychange", visibilityChanged);
-    window.addEventListener("pagehide", (event) => {
-      if (!event.persisted) {
-        releaseController();
-      }
-    });
+    window.addEventListener("pagehide", releaseController);
     window.addEventListener("online", () => void bootstrap());
     window.addEventListener("offline", () => {
-      showUnavailable("This iPhone is offline. Reconnect to the same Wi-Fi as the PC.");
+      showUnavailable("This device is offline. Reconnect to the same local network as the PC.");
     });
   }
 
   async function requestJson(path, options = {}) {
     const controller = new AbortController();
-    const timeout = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    const timeout = window.setTimeout(
+      () => controller.abort(),
+      Number.isFinite(options.timeoutMs) ? options.timeoutMs : REQUEST_TIMEOUT_MS,
+    );
     const headers = new Headers(options.headers || {});
     headers.set("Accept", "application/json");
-    if (options.controller !== false) {
-      headers.set("X-Companion-Instance", state.clientId);
-      headers.set("X-Companion-Page", state.pageInstanceId);
-    }
+    headers.set("X-Companion-Instance", state.clientId);
+    headers.set("X-Companion-Page", state.pageInstanceId);
     let body;
     if (options.body !== undefined) {
       headers.set("Content-Type", "application/json");
@@ -324,82 +340,27 @@
   }
 
   async function bootstrap() {
-    clearStatusPoll();
+    clearClaimRetry();
     stopHeartbeat();
     showState({
-      kicker: "Companion",
+      kicker: "Pocket Manga",
       title: "Connecting to your PC",
-      message: "Checking the local Companion service…",
+      message: "Opening your library…",
       loading: true,
     });
-    try {
-      const payload = await requestJson(ROUTES.status, { controller: false });
-      const status = payload.status;
-      if (!status || status.server !== "available") {
-        showUnavailable("Pocket Manga Editor reports that Companion is unavailable.");
-        return;
-      }
-      if (!status.paired) {
-        showPairing(Boolean(status.pairing_open));
-        return;
-      }
-      if (!status.companion_active) {
-        showInactive();
-        return;
-      }
-      await claimController();
-    } catch (error) {
-      if (error.name === "AbortError") {
-        showUnavailable("The PC did not respond in time.");
-      } else {
-        handleSessionError(error, bootstrap);
-      }
-    }
+    await claimController();
   }
 
-  async function pairDevice(event) {
-    event.preventDefault();
-    const code = elements.pairCode.value.trim();
-    if (!code) {
-      elements.pairCode.focus();
-      elements.pairHint.textContent = "Enter the code shown on the PC.";
-      return;
-    }
-    elements.pairSubmit.disabled = true;
-    elements.pairSubmit.textContent = "Pairing…";
-    elements.pairHint.textContent = "Confirming this iPhone with the PC…";
-    try {
-      await requestJson(ROUTES.pair, {
-        method: "POST",
-        body: { code },
-        controller: false,
+  async function claimController({ quiet = false } = {}) {
+    clearClaimRetry();
+    if (!quiet) {
+      showState({
+        kicker: "Pocket Manga",
+        title: "Opening your library",
+        message: "Connecting to the local server…",
+        loading: true,
       });
-      elements.pairCode.value = "";
-      announce("This iPhone is paired.");
-      await bootstrap();
-    } catch (error) {
-      if (
-        error instanceof ApiError
-        && (error.code === "pairing_closed" || error.code === "pairing_rate_limited")
-      ) {
-        showPairing(false, friendlyMessage(error));
-      } else {
-        elements.pairHint.textContent = friendlyMessage(error, "The pairing code was not accepted.");
-        elements.pairCode.select();
-      }
-    } finally {
-      elements.pairSubmit.disabled = false;
-      elements.pairSubmit.textContent = "Pair this iPhone";
     }
-  }
-
-  async function claimController() {
-    showState({
-      kicker: "Paired",
-      title: "Opening your library",
-      message: "Claiming the Companion controller lease…",
-      loading: true,
-    });
     try {
       const payload = await requestJson(ROUTES.claim, {
         method: "POST",
@@ -448,12 +409,7 @@
   }
 
   function releaseController() {
-    if (
-      !state.leaseClaimed
-      || state.positionFlushActive
-      || state.positionQueue.size
-      || state.selectionPending.size
-    ) {
+    if (!state.leaseClaimed) {
       return;
     }
     state.leaseClaimed = false;
@@ -482,7 +438,7 @@
       return;
     }
     if (!navigator.onLine) {
-      showUnavailable("This iPhone is offline. Reconnect to the same Wi-Fi as the PC.");
+      showUnavailable("This device is offline. Reconnect to the same local network as the PC.");
       return;
     }
     if (state.leaseClaimed && state.snapshotId) {
@@ -521,7 +477,7 @@
       } else {
         showLibrary({ historyMode: "none" });
       }
-      announce("Companion reconnected.");
+      announce("Reconnected.");
     } catch (error) {
       handleSessionError(error, bootstrap);
     }
@@ -529,73 +485,39 @@
 
   function handleSessionError(error, retry) {
     const code = error instanceof ApiError ? error.code : "network_error";
-    if (code === "unauthorized" || code === "unpaired") {
-      showPairing(false, "This browser is not authorized. Open pairing on the PC to pair again.");
-      return;
-    }
-    if (code === "inactive_mode") {
-      showInactive();
-      return;
-    }
     if (code === "lease_conflict") {
       showOccupied();
       return;
     }
-    if (code === "stale_snapshot" || code === "invalid_snapshot") {
+    if (
+      code === "lease_expired"
+      || code === "stale_snapshot"
+      || code === "invalid_snapshot"
+    ) {
+      state.leaseClaimed = false;
       state.snapshotId = null;
-      showUnavailable("The PC library changed. Reconnect to load the current snapshot.", bootstrap);
+      void bootstrap();
       return;
     }
-    showUnavailable(friendlyMessage(error, "Pocket Manga Editor could not be reached."), retry);
-  }
-
-  function showPairing(pairingOpen, overrideMessage = "") {
-    state.leaseClaimed = false;
-    const message = overrideMessage || (pairingOpen
-      ? "Enter the one-time code shown by Pocket Manga Editor. Pairing does not enable Companion Mode by itself."
-      : "Open the pairing flow in Pocket Manga Editor on the PC, then check again.");
-    showState({
-      kicker: "Pair this iPhone",
-      title: pairingOpen ? "Enter your pairing code" : "Pairing isn’t open yet",
-      message,
-      loading: false,
-      pair: pairingOpen,
-      actionLabel: pairingOpen ? "" : "Check again",
-      action: bootstrap,
-      detail: "Your PC and iPhone must be on the same trusted Wi-Fi network.",
-    });
-    if (!pairingOpen) {
-      scheduleStatusPoll();
-    } else {
-      window.setTimeout(() => elements.pairCode.focus(), 50);
-    }
-  }
-
-  function showInactive() {
-    state.leaseClaimed = false;
-    showState({
-      kicker: "Paired",
-      title: "Companion Mode is inactive",
-      message: "Enable Companion Mode in Pocket Manga Editor on the PC. Your library stays private until then.",
-      loading: false,
-      actionLabel: "Check again",
-      action: bootstrap,
-      detail: "Keep Pocket Manga Editor open while reading.",
-    });
-    scheduleStatusPoll();
+    showUnavailable(friendlyMessage(error, "The Pocket Manga server could not be reached."), retry);
   }
 
   function showOccupied() {
     state.leaseClaimed = false;
+    stopHeartbeat();
     showState({
       kicker: "Controller in use",
-      title: "Companion is open elsewhere",
-      message: "Another tab or device currently controls this library. Close it or disconnect it from the PC before retrying.",
+      title: "Pocket Manga is open elsewhere",
+      message: "Another tab or device currently controls this library. Close it or leave the app there, then try again.",
       loading: false,
-      actionLabel: "Try again",
+      actionLabel: "Try now",
       action: bootstrap,
-      detail: "Only one mobile controller can be active at a time.",
+      detail: "This page will retry automatically. Only one page can be active at a time.",
     });
+    state.claimRetryTimer = window.setTimeout(
+      () => void claimController({ quiet: true }),
+      OCCUPIED_RETRY_INTERVAL_MS,
+    );
   }
 
   function showUnavailable(message, retry = bootstrap) {
@@ -608,13 +530,15 @@
       loading: false,
       actionLabel: "Try again",
       action: retry,
-      detail: "Confirm the PC is awake, Pocket Manga Editor is open, and both devices use the same Wi-Fi.",
+      detail: "Confirm the PC is awake, the server is running, and both devices use the same local network.",
     });
-    announce("Pocket Manga Editor is unavailable.");
+    announce("Pocket Manga is unavailable.");
   }
 
-  function showState({ kicker, title, message, loading, pair = false, actionLabel = "", action = null, detail = "" }) {
+  function showState({ kicker, title, message, loading, actionLabel = "", action = null, detail = "" }) {
     hideActionError();
+    elements.exportOverlay.hidden = true;
+    document.body.classList.remove("dialog-open");
     clearReaderMedia();
     elements.stateScreen.hidden = false;
     elements.libraryScreen.hidden = true;
@@ -624,7 +548,6 @@
     elements.stateTitle.textContent = title;
     elements.stateMessage.textContent = message;
     elements.stateSpinner.classList.toggle("is-paused", !loading);
-    elements.pairForm.hidden = !pair;
     elements.stateAction.hidden = !actionLabel;
     elements.stateAction.textContent = actionLabel || "Try again";
     elements.stateDetail.hidden = !detail;
@@ -632,20 +555,15 @@
     state.stateAction = action;
   }
 
-  function scheduleStatusPoll() {
-    clearStatusPoll();
-    state.statusPollTimer = window.setTimeout(() => void bootstrap(), STATUS_POLL_INTERVAL_MS);
-  }
-
-  function clearStatusPoll() {
-    if (state.statusPollTimer) {
-      window.clearTimeout(state.statusPollTimer);
-      state.statusPollTimer = 0;
+  function clearClaimRetry() {
+    if (state.claimRetryTimer) {
+      window.clearTimeout(state.claimRetryTimer);
+      state.claimRetryTimer = 0;
     }
   }
 
   async function loadLibrary() {
-    clearStatusPoll();
+    clearClaimRetry();
     await drainPendingMutations();
     const requestToken = ++state.viewRequestToken;
     const epoch = ++state.activityEpoch;
@@ -657,18 +575,7 @@
       ) {
         return;
       }
-      if (payload.snapshot_id) {
-        state.snapshotId = payload.snapshot_id;
-      }
-      state.library = Array.isArray(payload.mangas)
-        ? payload.mangas.map(normalizeMangaSummary).filter((manga) => manga.id)
-        : [];
-      state.libraryIssueCount = nonNegativeInteger(payload.issue_count);
-      state.activityManga = null;
-      state.activity = null;
-      state.currentManga = null;
-      state.currentFolder = null;
-      showLibrary({ historyMode: "replace" });
+      applyLibraryPayload(payload);
     } catch (error) {
       if (
         requestToken === state.viewRequestToken
@@ -677,6 +584,68 @@
         handleSessionError(error, loadLibrary);
       }
     }
+  }
+
+  async function rescanLibrary() {
+    if (state.rescanBusy || state.exportBusy) {
+      return;
+    }
+    state.rescanBusy = true;
+    elements.libraryRefresh.disabled = true;
+    elements.libraryRefresh.classList.add("is-busy");
+    elements.libraryRefresh.setAttribute("aria-busy", "true");
+    elements.emptyRetry.disabled = true;
+    hideActionError();
+    showToast("Rescanning library…", 10_000);
+    await drainPendingMutations();
+    const requestToken = ++state.viewRequestToken;
+    const epoch = ++state.activityEpoch;
+    try {
+      const payload = await requestJson(ROUTES.rescan, {
+        method: "POST",
+        body: {},
+      });
+      if (requestToken !== state.viewRequestToken || epoch !== state.activityEpoch) {
+        return;
+      }
+      applyLibraryPayload(payload);
+      showToast("Library rescanned.", 2_000);
+      announce("Library rescan complete.");
+    } catch (error) {
+      if (requestToken === state.viewRequestToken && epoch === state.activityEpoch) {
+        if (isSessionGateError(error)) {
+          handleSessionError(error, rescanLibrary);
+        } else {
+          showActionError(
+            "Couldn’t rescan library",
+            friendlyMessage(error),
+            rescanLibrary,
+          );
+        }
+      }
+    } finally {
+      state.rescanBusy = false;
+      elements.libraryRefresh.disabled = false;
+      elements.libraryRefresh.classList.remove("is-busy");
+      elements.libraryRefresh.setAttribute("aria-busy", "false");
+      elements.emptyRetry.disabled = false;
+    }
+  }
+
+  function applyLibraryPayload(payload) {
+    if (payload.snapshot_id) {
+      state.snapshotId = payload.snapshot_id;
+    }
+    state.library = Array.isArray(payload.mangas)
+      ? payload.mangas.map(normalizeMangaSummary).filter((manga) => manga.id)
+      : [];
+    state.libraryIssueCount = nonNegativeInteger(payload.issue_count);
+    state.activityManga = null;
+    state.activity = null;
+    state.currentManga = null;
+    state.currentFolder = null;
+    state.exportPreview = null;
+    showLibrary({ historyMode: "replace" });
   }
 
   function normalizeMangaSummary(manga) {
@@ -745,6 +714,8 @@
 
   function showLibrary({ historyMode = "none" } = {}) {
     hideActionError();
+    elements.exportOverlay.hidden = true;
+    document.body.classList.remove("dialog-open");
     clearReaderFeedback();
     state.viewRequestToken += 1;
     state.activityEpoch += 1;
@@ -752,6 +723,7 @@
     state.activity = null;
     state.currentManga = null;
     state.currentFolder = null;
+    state.exportPreview = null;
     state.entryNavigationPending = false;
     state.entryNavigationToken += 1;
     renderLibrary();
@@ -770,6 +742,8 @@
       return;
     }
     hideActionError();
+    elements.exportOverlay.hidden = true;
+    document.body.classList.remove("dialog-open");
     clearReaderFeedback();
     clearReaderMedia();
     state.viewRequestToken += 1;
@@ -778,9 +752,11 @@
     state.activity = null;
     state.currentManga = null;
     state.currentFolder = null;
+    state.exportPreview = null;
     state.entryNavigationPending = false;
     state.entryNavigationToken += 1;
     elements.activityTitle.textContent = manga.name;
+    elements.exportActionDetail.textContent = "Replace output with the current selections.";
     elements.stateScreen.hidden = true;
     elements.libraryScreen.hidden = true;
     elements.readerScreen.hidden = true;
@@ -790,23 +766,257 @@
     window.setTimeout(() => elements.activityTitle.focus(), 20);
   }
 
+  async function prepareExport() {
+    const manga = state.activityManga;
+    if (!manga || state.exportBusy || state.activityOpening) {
+      return;
+    }
+    setActivityActionsDisabled(true);
+    hideActionError();
+    elements.exportActionDetail.textContent = "Checking current selections…";
+    await drainPendingMutations();
+    if (state.activityManga !== manga) {
+      setActivityActionsDisabled(false);
+      return;
+    }
+    try {
+      const payload = await requestJson(ROUTES.exportPreview(manga.id));
+      if (state.activityManga !== manga) {
+        return;
+      }
+      if (payload.snapshot_id) {
+        state.snapshotId = payload.snapshot_id;
+      }
+      const preview = normalizeExportPreview(payload.export, manga);
+      if (preview.selectedImageCount === 0) {
+        state.exportPreview = null;
+        elements.exportActionDetail.textContent = "Nothing selected.";
+        showActionError(
+          "Nothing selected",
+          "Select at least one image in Edit before exporting this manga.",
+        );
+        return;
+      }
+      state.exportPreview = preview;
+      elements.exportActionDetail.textContent = `${plural(
+        preview.selectedImageCount,
+        "1 selected image",
+        `${preview.selectedImageCount} selected images`,
+      )} ready.`;
+      openExportDialog(preview);
+    } catch (error) {
+      if (state.activityManga !== manga) {
+        return;
+      }
+      if (error instanceof ApiError && error.code === "nothing_selected") {
+        elements.exportActionDetail.textContent = "Nothing selected.";
+        showActionError(
+          "Nothing selected",
+          "Select at least one image in Edit before exporting this manga.",
+        );
+      } else if (isSessionGateError(error)) {
+        handleSessionError(error, prepareExport);
+      } else {
+        elements.exportActionDetail.textContent = "Replace output with the current selections.";
+        showActionError(
+          "Couldn’t prepare export",
+          friendlyMessage(error),
+          prepareExport,
+        );
+      }
+    } finally {
+      setActivityActionsDisabled(false);
+    }
+  }
+
+  function normalizeExportPreview(rawPreview, manga) {
+    const raw = rawPreview && typeof rawPreview === "object" ? rawPreview : {};
+    return {
+      mangaId: manga.id,
+      mangaName: manga.name,
+      selectedFolderCount: nonNegativeInteger(raw.selected_folder_count),
+      selectedImageCount: nonNegativeInteger(raw.selected_image_count),
+      outputExists: Boolean(raw.output_exists),
+      unrecognizedEntries: Array.isArray(raw.unrecognized_entries)
+        ? raw.unrecognized_entries.map((entry) => String(entry))
+        : [],
+      requiresConfirmation: Boolean(raw.requires_confirmation),
+    };
+  }
+
+  function openExportDialog(preview) {
+    const suspicious = preview.unrecognizedEntries.length > 0;
+    const imageText = plural(
+      preview.selectedImageCount,
+      "1 selected image",
+      `${preview.selectedImageCount} selected images`,
+    );
+    const folderText = plural(
+      preview.selectedFolderCount,
+      "1 folder",
+      `${preview.selectedFolderCount} folders`,
+    );
+    elements.exportDialogTitle.textContent = suspicious
+      ? "Unrecognized output will be deleted"
+      : preview.outputExists
+        ? "Replace existing output?"
+        : "Export this manga?";
+    elements.exportDialogMessage.textContent = preview.outputExists
+      ? `${imageText} from ${folderText} will replace the entire existing output for ${preview.mangaName}.`
+      : `${imageText} from ${folderText} will be copied to the output for ${preview.mangaName}.`;
+    elements.exportWarning.hidden = !suspicious;
+    elements.exportWarningSamples.replaceChildren();
+    const shownEntries = preview.unrecognizedEntries.slice(0, 6);
+    for (const entry of shownEntries) {
+      const item = document.createElement("li");
+      item.textContent = entry;
+      elements.exportWarningSamples.append(item);
+    }
+    const hiddenCount = preview.unrecognizedEntries.length - shownEntries.length;
+    elements.exportWarningMore.hidden = hiddenCount <= 0;
+    elements.exportWarningMore.textContent = hiddenCount > 0
+      ? `And ${hiddenCount} more unrecognized ${hiddenCount === 1 ? "item" : "items"}.`
+      : "";
+    elements.exportConfirm.textContent = suspicious
+      ? "Delete and export"
+      : preview.outputExists
+        ? "Replace output"
+        : "Export";
+    elements.exportOverlay.hidden = false;
+    document.body.classList.add("dialog-open");
+    window.setTimeout(
+      () => (suspicious ? elements.exportCancel : elements.exportConfirm).focus(),
+      20,
+    );
+  }
+
+  function closeExportDialog() {
+    if (state.exportBusy) {
+      return;
+    }
+    hideExportDialog();
+  }
+
+  function hideExportDialog() {
+    elements.exportOverlay.hidden = true;
+    document.body.classList.remove("dialog-open");
+    elements.exportDialog.removeAttribute("aria-busy");
+    elements.exportCancel.disabled = false;
+    elements.exportConfirm.disabled = false;
+    if (state.activityManga) {
+      window.setTimeout(() => elements.chooseExport.focus(), 20);
+    }
+  }
+
+  async function commitExport() {
+    const preview = state.exportPreview;
+    const manga = state.activityManga;
+    if (
+      !preview
+      || !manga
+      || preview.mangaId !== manga.id
+      || state.exportBusy
+    ) {
+      return;
+    }
+    state.exportBusy = true;
+    setActivityActionsDisabled(true);
+    elements.backToLibrary.disabled = true;
+    elements.exportDialog.setAttribute("aria-busy", "true");
+    elements.exportCancel.disabled = true;
+    elements.exportConfirm.disabled = true;
+    elements.exportConfirm.textContent = "Exporting…";
+    await drainPendingMutations();
+    try {
+      const payload = await requestJson(ROUTES.exportManga(manga.id), {
+        method: "POST",
+        body: {
+          confirm_unrecognized_output: preview.unrecognizedEntries.length > 0,
+        },
+        timeoutMs: EXPORT_TIMEOUT_MS,
+      });
+      if (payload.snapshot_id) {
+        state.snapshotId = payload.snapshot_id;
+      }
+      const result = payload.export && typeof payload.export === "object"
+        ? payload.export
+        : {};
+      const imageCount = nonNegativeInteger(result.selected_image_count);
+      const folderCount = nonNegativeInteger(result.selected_folder_count);
+      state.exportPreview = null;
+      hideExportDialog();
+      elements.exportActionDetail.textContent = `${plural(
+        imageCount,
+        "1 image exported",
+        `${imageCount} images exported`,
+      )} from ${plural(folderCount, "1 folder", `${folderCount} folders`)}.`;
+      showToast(
+        plural(imageCount, "Exported 1 image.", `Exported ${imageCount} images.`),
+        3_000,
+      );
+      showWarnings(result.warnings);
+      announce("Manga export complete.");
+    } catch (error) {
+      hideExportDialog();
+      if (error instanceof ApiError && error.code === "nothing_selected") {
+        state.exportPreview = null;
+        elements.exportActionDetail.textContent = "Nothing selected.";
+        showActionError(
+          "Nothing selected",
+          "Select at least one image in Edit before exporting this manga.",
+        );
+      } else if (
+        error instanceof ApiError
+        && error.code === "export_confirmation_required"
+      ) {
+        state.exportPreview = null;
+        showActionError(
+          "Output changed",
+          "Review the current output warning before exporting.",
+          prepareExport,
+        );
+      } else if (isSessionGateError(error)) {
+        handleSessionError(error, prepareExport);
+      } else {
+        showActionError(
+          "Export failed",
+          friendlyMessage(error, "The previous output was left unchanged."),
+          prepareExport,
+        );
+      }
+    } finally {
+      state.exportBusy = false;
+      elements.backToLibrary.disabled = false;
+      setActivityActionsDisabled(false);
+    }
+  }
+
+  function setActivityActionsDisabled(disabled) {
+    elements.chooseRead.disabled = disabled;
+    elements.chooseEdit.disabled = disabled;
+    elements.chooseExport.disabled = disabled;
+  }
+
   async function chooseActivity(activity, { historyMode = "push" } = {}) {
     const manga = state.activityManga;
     if (
       !manga
       || (activity !== READ && activity !== EDIT)
       || state.activityOpening
+      || state.exportBusy
     ) {
       return;
     }
     state.activityOpening = true;
     elements.chooseRead.disabled = true;
     elements.chooseEdit.disabled = true;
+    elements.chooseExport.disabled = true;
     await drainPendingMutations();
     if (state.activityManga !== manga) {
       state.activityOpening = false;
       elements.chooseRead.disabled = false;
       elements.chooseEdit.disabled = false;
+      elements.chooseExport.disabled = false;
       return;
     }
     const requestToken = ++state.viewRequestToken;
@@ -872,6 +1082,7 @@
       state.activityOpening = false;
       elements.chooseRead.disabled = false;
       elements.chooseEdit.disabled = false;
+      elements.chooseExport.disabled = false;
     }
   }
 
@@ -1326,7 +1537,7 @@
         );
       }
       return requestJson(ROUTES.editSelection(folder.id), {
-        method: "PUT",
+        method: "PATCH",
         body: { image_id: image.id, selected: desired },
       });
     });
@@ -1460,7 +1671,7 @@
           : ROUTES.editPosition(pending.folderId);
         try {
           const payload = await requestJson(route, {
-            method: "PUT",
+            method: "PATCH",
             body: { image_id: pending.imageId },
           });
           const position = payload.position || {};
@@ -1798,14 +2009,10 @@
       return false;
     }
     return [
-      "unauthorized",
-      "unpaired",
-      "inactive_mode",
       "lease_conflict",
       "lease_expired",
       "stale_snapshot",
       "invalid_snapshot",
-      "shutdown_transition",
     ].includes(error.code);
   }
 

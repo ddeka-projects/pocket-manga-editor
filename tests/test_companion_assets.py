@@ -1,4 +1,4 @@
-"""Static contracts for the no-build Companion Home Screen application."""
+"""Static contracts for the no-build Pocket Manga web application."""
 
 from __future__ import annotations
 
@@ -39,7 +39,7 @@ class _DocumentContractParser(HTMLParser):
             self.scripts.append(values)
 
 
-class CompanionAssetContractTests(unittest.TestCase):
+class WebAssetContractTests(unittest.TestCase):
     def setUp(self) -> None:
         self.html = (ASSET_DIRECTORY / "index.html").read_text(encoding="utf-8")
         self.css = (ASSET_DIRECTORY / "styles.css").read_text(encoding="utf-8")
@@ -51,14 +51,21 @@ class CompanionAssetContractTests(unittest.TestCase):
         self.assertEqual(len(self.parser.ids), len(set(self.parser.ids)))
         required_ids = {
             "state-screen",
-            "pair-form",
             "library-screen",
+            "library-refresh",
             "library-list",
             "activity-screen",
             "activity-title",
             "back-to-library",
             "choose-read",
             "choose-edit",
+            "choose-export",
+            "export-overlay",
+            "export-dialog",
+            "export-warning",
+            "export-warning-samples",
+            "export-cancel",
+            "export-confirm",
             "reader-screen",
             "image-display",
             "selection-frame",
@@ -73,6 +80,7 @@ class CompanionAssetContractTests(unittest.TestCase):
             "action-error-retry",
         }
         self.assertTrue(required_ids.issubset(self.parser.ids))
+        self.assertNotIn("pair-form", self.parser.ids)
 
         viewport = next(
             meta["content"]
@@ -180,20 +188,21 @@ class CompanionAssetContractTests(unittest.TestCase):
         )
         self.assertNotIn("currentImageId", folder_change)
 
-    def test_javascript_uses_only_the_companion_api_and_exact_write_payloads(self) -> None:
+    def test_javascript_uses_only_the_web_api_and_exact_write_payloads(self) -> None:
         required_routes = {
-            'status: "/api/status"',
-            'pair: "/api/pair"',
             'claim: "/api/controller/claim"',
             'heartbeat: "/api/controller/heartbeat"',
             'release: "/api/controller/release"',
             'library: "/api/library"',
+            'rescan: "/api/library/rescan"',
             "`/api/manga/${encodeURIComponent(id)}?activity=${encodeURIComponent(activity)}`",
             "`/api/folder/${encodeURIComponent(id)}?activity=${encodeURIComponent(activity)}`",
             "`/api/image/${encodeURIComponent(id)}`",
             "`/api/read/folder/${encodeURIComponent(id)}/position`",
             "`/api/edit/folder/${encodeURIComponent(id)}/position`",
             "`/api/edit/folder/${encodeURIComponent(id)}/selection`",
+            "`/api/manga/${encodeURIComponent(id)}/export-preview`",
+            "`/api/manga/${encodeURIComponent(id)}/export`",
         }
         for route in required_routes:
             with self.subTest(route=route):
@@ -205,7 +214,8 @@ class CompanionAssetContractTests(unittest.TestCase):
         )
         self.assertIn('body: { image_id: image.id, selected: desired }', self.javascript)
         self.assertIn('body: { image_id: pending.imageId }', self.javascript)
-        self.assertIn('const status = payload.status;', self.javascript)
+        self.assertIn('method: "PATCH"', self.javascript)
+        self.assertNotIn('method: "PUT"', self.javascript)
         self.assertIn('"X-Companion-Instance": state.clientId', self.javascript)
         self.assertIn('"X-Companion-Page": state.pageInstanceId', self.javascript)
         self.assertIn("window.sessionStorage.getItem", self.javascript)
@@ -218,21 +228,25 @@ class CompanionAssetContractTests(unittest.TestCase):
         self.assertIn('view: "reader"', self.javascript)
         self.assertIn("window.addEventListener(\"popstate\"", self.javascript)
         self.assertNotIn("innerHTML", self.javascript)
-        self.assertNotIn("/api/export", self.javascript)
         self.assertNotIn("/api/complete", self.javascript)
         self.assertNotIn("/api/volume", self.javascript)
         self.assertNotIn("/api/page", self.javascript)
         self.assertNotIn("chapterLabel", self.javascript)
+        self.assertNotIn('status: "/api/status"', self.javascript)
+        self.assertNotIn('pair: "/api/pair"', self.javascript)
 
     def test_activity_choice_is_explicit_neutral_and_accessible(self) -> None:
         self.assertIn("Choose an activity", self.html)
         self.assertIn("Read without image-selection controls.", self.html)
         self.assertIn("Review and select images for export.", self.html)
+        self.assertIn('id="choose-export"', self.html)
+        self.assertIn("Replace output with the current selections.", self.html)
         self.assertIn('id="activity-title" tabindex="-1"', self.html)
         self.assertIn('aria-label="Back to library"', self.html)
         self.assertIn("showActivityChoice(manga", self.javascript)
         self.assertIn("chooseActivity(READ)", self.javascript)
         self.assertIn("chooseActivity(EDIT)", self.javascript)
+        self.assertIn("void prepareExport()", self.javascript)
         self.assertNotIn("selectedCount: nonNegativeInteger(manga", self.javascript)
         self.assertNotIn("selectedCount: activity === EDIT", self.javascript)
         self.assertNotIn("mangaSelectedCount: activity === EDIT", self.javascript)
@@ -283,6 +297,108 @@ class CompanionAssetContractTests(unittest.TestCase):
             history_change.index('historyState.view === "activity"'),
         )
 
+    def test_server_first_startup_claims_one_controller_and_retries_contention(self) -> None:
+        self.assertIn("const HEARTBEAT_INTERVAL_MS = 5_000", self.javascript)
+        self.assertIn("const OCCUPIED_RETRY_INTERVAL_MS = 3_000", self.javascript)
+
+        bootstrap = self.javascript.split(
+            "async function bootstrap() {", 1
+        )[1].split("async function claimController", 1)[0]
+        self.assertIn("await claimController()", bootstrap)
+        self.assertNotIn("ROUTES.status", bootstrap)
+        self.assertNotIn("pair", bootstrap.lower())
+
+        occupied = self.javascript.split(
+            "function showOccupied() {", 1
+        )[1].split("function showUnavailable", 1)[0]
+        self.assertIn("Only one page can be active at a time.", occupied)
+        self.assertIn("OCCUPIED_RETRY_INTERVAL_MS", occupied)
+        self.assertIn("claimController({ quiet: true })", occupied)
+
+        self.assertIn(
+            'window.addEventListener("pagehide", releaseController)',
+            self.javascript,
+        )
+        release = self.javascript.split(
+            "function releaseController() {", 1
+        )[1].split("async function visibilityChanged", 1)[0]
+        self.assertIn("keepalive: true", release)
+        self.assertNotIn("positionFlushActive", release)
+        self.assertNotIn("selectionPending", release)
+
+    def test_rescan_drains_writes_and_replaces_the_library_snapshot(self) -> None:
+        rescan = self.javascript.split(
+            "async function rescanLibrary() {", 1
+        )[1].split("function applyLibraryPayload", 1)[0]
+        self.assertLess(
+            rescan.index("await drainPendingMutations()"),
+            rescan.index("requestJson(ROUTES.rescan"),
+        )
+        self.assertIn('method: "POST"', rescan)
+        self.assertIn("body: {}", rescan)
+        self.assertIn("applyLibraryPayload(payload)", rescan)
+        self.assertIn('elements.libraryRefresh.disabled = true', rescan)
+        self.assertIn('elements.libraryRefresh.disabled = false', rescan)
+        self.assertIn(
+            'elements.libraryRefresh.addEventListener("click", () => void rescanLibrary())',
+            self.javascript,
+        )
+
+        apply_library = self.javascript.split(
+            "function applyLibraryPayload(payload) {", 1
+        )[1].split("function normalizeMangaSummary", 1)[0]
+        self.assertIn("state.snapshotId = payload.snapshot_id", apply_library)
+        self.assertIn("showLibrary({ historyMode: \"replace\" })", apply_library)
+
+    def test_export_preview_refusal_confirmation_and_long_commit_are_explicit(self) -> None:
+        prepare = self.javascript.split(
+            "async function prepareExport() {", 1
+        )[1].split("function normalizeExportPreview", 1)[0]
+        self.assertLess(
+            prepare.index("await drainPendingMutations()"),
+            prepare.index("requestJson(ROUTES.exportPreview"),
+        )
+        self.assertIn("preview.selectedImageCount === 0", prepare)
+        self.assertIn('"Nothing selected"', prepare)
+        self.assertLess(
+            prepare.index("preview.selectedImageCount === 0"),
+            prepare.index("openExportDialog(preview)"),
+        )
+
+        dialog = self.javascript.split(
+            "function openExportDialog(preview) {", 1
+        )[1].split("function closeExportDialog", 1)[0]
+        self.assertIn("Replace existing output?", dialog)
+        self.assertIn("Unrecognized output will be deleted", dialog)
+        self.assertIn("preview.unrecognizedEntries.slice(0, 6)", dialog)
+        self.assertIn('item.textContent = entry', dialog)
+        self.assertNotIn("innerHTML", dialog)
+
+        commit = self.javascript.split(
+            "async function commitExport() {", 1
+        )[1].split("function setActivityActionsDisabled", 1)[0]
+        self.assertLess(
+            commit.index("await drainPendingMutations()"),
+            commit.index("requestJson(ROUTES.exportManga"),
+        )
+        self.assertIn(
+            "confirm_unrecognized_output: preview.unrecognizedEntries.length > 0",
+            commit,
+        )
+        self.assertIn("timeoutMs: EXPORT_TIMEOUT_MS", commit)
+        self.assertIn("showWarnings(result.warnings)", commit)
+        self.assertIn('elements.exportConfirm.textContent = "Exporting…"', commit)
+        self.assertIn('error.code === "nothing_selected"', commit)
+        self.assertIn('error.code === "export_confirmation_required"', commit)
+        self.assertIn("const EXPORT_TIMEOUT_MS = 10 * 60_000", self.javascript)
+
+        self.assertIn('id="export-dialog"', self.html)
+        self.assertIn('role="dialog"', self.html)
+        self.assertIn('aria-modal="true"', self.html)
+        self.assertIn("Unrecognized files will be permanently deleted", self.html)
+        self.assertIn(".dialog-overlay", self.css)
+        self.assertIn(".export-warning", self.css)
+
     def test_manifest_and_code_native_icons_are_installable(self) -> None:
         manifest = json.loads(
             (ASSET_DIRECTORY / "manifest.webmanifest").read_text(encoding="utf-8")
@@ -290,8 +406,13 @@ class CompanionAssetContractTests(unittest.TestCase):
         self.assertEqual(manifest["id"], "/")
         self.assertEqual(manifest["start_url"], "/")
         self.assertEqual(manifest["display"], "standalone")
+        self.assertEqual(manifest["name"], "Pocket Manga")
         self.assertEqual(manifest["background_color"], "#050706")
         self.assertEqual(manifest["theme_color"], "#050706")
+        self.assertNotIn("Companion", self.html)
+        self.assertNotIn("Companion", self.css)
+        self.assertNotIn("Companion", manifest["name"])
+        self.assertNotIn("Companion", manifest["description"])
 
         icon_sources = {icon["src"] for icon in manifest["icons"]}
         self.assertIn("/assets/icon.svg", icon_sources)

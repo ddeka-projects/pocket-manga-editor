@@ -1,101 +1,133 @@
-"""Application bootstrap."""
+"""Foreground bootstrap for the always-on local web server."""
 
 from __future__ import annotations
 
-from pathlib import Path
+import logging
+import signal
 import sys
+import threading
 
-from PySide6.QtCore import QSettings, QStandardPaths
-from PySide6.QtWidgets import QApplication, QMessageBox
+from .companion import CompanionCoordinator, CompanionHTTPService
+from .config import ConfigurationError, load_configuration
+from .exporter import ExportError, recover_interrupted_exports
+from .scanner import ScanError, scan_working_directory
 
-from .companion import (
-    CompanionCoordinator,
-    CompanionHTTPService,
-    CompanionState,
-    CredentialVerifierStore,
-)
-from .companion.server import DEFAULT_PORT
-from .instance_guard import InstanceGuardError, acquire_instance_guard
-from .main_window import MainWindow
+
+LOGGER = logging.getLogger(__name__)
 
 
 def main() -> int:
-    app = QApplication(sys.argv)
-    app.setOrganizationName("Pocket Manga Editor")
-    app.setApplicationName("Pocket Manga Editor")
-    app.setApplicationVersion("0.2.0")
-    app.setStyle("Fusion")
+    """Validate configuration, recover state, and serve until terminated."""
 
+    _configure_logging()
     try:
-        instance_guard = acquire_instance_guard()
-    except InstanceGuardError as exc:
-        QMessageBox.critical(None, "Pocket Manga Editor cannot start", str(exc))
+        configuration = load_configuration()
+        recovery = recover_interrupted_exports(configuration.working_directory)
+        scan_result = scan_working_directory(configuration.working_directory)
+        coordinator = CompanionCoordinator(
+            configuration.working_directory,
+            scan_result,
+        )
+        service = CompanionHTTPService(
+            coordinator,
+            host=configuration.host,
+            port=configuration.port,
+        )
+    except (ConfigurationError, ExportError, ScanError, OSError, ValueError) as exc:
+        LOGGER.error("Pocket Manga Editor could not start: %s", exc)
+        return 1
+    except Exception:
+        LOGGER.exception("Pocket Manga Editor failed during startup.")
         return 1
 
-    coordinator: CompanionCoordinator | None = None
-    companion_server: CompanionHTTPService | None = None
     try:
-        settings = QSettings()
-        raw_port = settings.value("companion/port", DEFAULT_PORT)
-        try:
-            port = int(raw_port)
-        except (TypeError, ValueError):
-            port = DEFAULT_PORT
-        if not 1 <= port <= 65535:
-            port = DEFAULT_PORT
-        public_host = str(settings.value("companion/public_host", "")).strip()
-        app_data = QStandardPaths.writableLocation(
-            QStandardPaths.StandardLocation.AppLocalDataLocation
+        status = service.start()
+    except Exception:
+        LOGGER.exception("Pocket Manga Editor could not start its web server.")
+        coordinator.disconnect_client()
+        return 1
+    if not status.running:
+        LOGGER.error(
+            "Pocket Manga Editor could not start its web server: %s",
+            status.error or "unknown listener error",
         )
-        try:
-            if not app_data:
-                raise OSError(
-                    "The operating system did not provide an application-data folder "
-                    "for the paired-device verifier."
-                )
-            credential_store = CredentialVerifierStore(
-                Path(app_data) / "companion-device.json"
-            )
-            coordinator = CompanionCoordinator(credential_store=credential_store)
-            companion_server = CompanionHTTPService(
-                coordinator,
-                port=port,
-                public_host=public_host or None,
-            )
-            companion_server.start()
-        except (OSError, ValueError) as exc:
-            coordinator = None
-            companion_server = None
-            QMessageBox.warning(
-                None,
-                "Companion Mode unavailable",
-                f"The desktop editor can still be used, but Companion Mode could "
-                f"not be initialized.\n\n{exc}",
-            )
+        service.stop()
+        coordinator.disconnect_client()
+        return 1
 
-        window = MainWindow(
-            companion_coordinator=coordinator,
-            companion_server=companion_server,
+    if recovery.recovered_count:
+        LOGGER.info(
+            "Recovered %d interrupted export transaction(s).",
+            recovery.recovered_count,
         )
-        window.show()
-        return app.exec()
+    if scan_result.issues:
+        LOGGER.warning(
+            "Library scan completed with %d ignored item(s).",
+            len(scan_result.issues),
+        )
+        for issue in scan_result.issues:
+            LOGGER.warning("Ignored %s: %s", issue.path, issue.message)
+    LOGGER.info(
+        "Pocket Manga Editor is serving %s (%d manga).",
+        status.url,
+        len(scan_result.mangas),
+    )
+
+    stop_requested = threading.Event()
+    previous_handlers: dict[int, object] = {}
+
+    def request_stop(signum, _frame) -> None:
+        LOGGER.info("Shutdown requested by signal %s.", signum)
+        stop_requested.set()
+
+    for signal_name in ("SIGINT", "SIGTERM", "SIGBREAK"):
+        signum = getattr(signal, signal_name, None)
+        if signum is None:
+            continue
+        try:
+            previous_handlers[signum] = signal.getsignal(signum)
+            signal.signal(signum, request_stop)
+        except (OSError, RuntimeError, ValueError):
+            continue
+
+    exit_code = 0
+    try:
+        while not stop_requested.wait(0.5):
+            if not service.running:
+                LOGGER.error(
+                    "The web server stopped unexpectedly: %s",
+                    service.error or "unknown server error",
+                )
+                exit_code = 1
+                break
+    except KeyboardInterrupt:
+        stop_requested.set()
     finally:
-        if companion_server is not None:
-            companion_server.stop()
-        if coordinator is not None:
-            state = coordinator.status().state
+        for signum, previous in previous_handlers.items():
             try:
-                if state is CompanionState.COMPANION_ACTIVE:
-                    coordinator.begin_exit()
-                    coordinator.finish_exit()
-                elif state is CompanionState.EXITING_COMPANION:
-                    coordinator.finish_exit()
-            except Exception:
-                # The process is already terminating. The HTTP listener is stopped,
-                # immediate review writes have completed before their requests return,
-                # and a new process starts in desktop authority.
+                signal.signal(signum, previous)
+            except (OSError, RuntimeError, ValueError):
                 pass
-        instance_guard.release()
+        try:
+            stopped = service.stop(timeout=10.0)
+            if stopped.error:
+                LOGGER.warning("Web server shutdown warning: %s", stopped.error)
+        except Exception:
+            LOGGER.exception("The web server could not be stopped cleanly.")
+            exit_code = 1
+        coordinator.disconnect_client()
+        LOGGER.info("Pocket Manga Editor stopped.")
+    return exit_code
+
+
+def _configure_logging() -> None:
+    if logging.getLogger().handlers:
+        return
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        stream=sys.stderr,
+    )
 
 
 if __name__ == "__main__":

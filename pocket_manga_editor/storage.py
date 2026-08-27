@@ -6,7 +6,6 @@ from dataclasses import dataclass, replace
 import json
 import os
 from pathlib import Path
-import re
 import tempfile
 from typing import Any, Collection, Mapping
 
@@ -23,8 +22,7 @@ from .workspace import (
 )
 
 
-STATE_SCHEMA_VERSION = 2
-_DIGEST = re.compile(r"[0-9a-f]{64}")
+STATE_SCHEMA_VERSION = 3
 
 
 class StorageError(OSError):
@@ -48,22 +46,10 @@ class EditingFolderState:
 
 
 @dataclass(frozen=True, slots=True)
-class ExportedImageState:
-    output_name: str
-    digest: str
-
-
-@dataclass(frozen=True, slots=True)
-class FolderExportState:
-    files: Mapping[str, ExportedImageState]
-
-
-@dataclass(frozen=True, slots=True)
 class EditingSnapshot:
     last_folder: str
     last_image: str
     folders: Mapping[str, EditingFolderState]
-    exports: Mapping[str, FolderExportState]
     warnings: tuple[str, ...] = ()
 
 
@@ -98,7 +84,7 @@ class ReadingStore:
 
 
 class EditingStore:
-    """Persist shared desktop/mobile editing state and export bookkeeping."""
+    """Persist web editing position and sparse selections."""
 
     def __init__(self, working_directory: str | Path) -> None:
         self.working_directory = Path(working_directory)
@@ -148,53 +134,6 @@ class EditingStore:
             return replace(snapshot, folders=folders, warnings=())
 
         return self._mutate(manga, folder_name, (image_name,), update)
-
-    def replace_folder_selections(
-        self,
-        manga: MangaRef,
-        folder_name: str,
-        selected_images: Collection[str],
-    ) -> EditingSnapshot:
-        selected_tuple = tuple(selected_images)
-
-        def update(snapshot: EditingSnapshot) -> EditingSnapshot:
-            folder = _folder_for(manga, folder_name)
-            validated = _selected_image_names(folder, selected_tuple)
-            folders = dict(snapshot.folders)
-            if validated:
-                folders[folder_name] = EditingFolderState(validated)
-            else:
-                folders.pop(folder_name, None)
-            return replace(snapshot, folders=folders, warnings=())
-
-        return self._mutate(manga, folder_name, selected_tuple, update)
-
-    def save_folder(
-        self,
-        manga: MangaRef,
-        folder_name: str,
-        current_image: str,
-        selected_images: Collection[str],
-    ) -> EditingSnapshot:
-        """Atomically merge one folder position and selections into latest state."""
-
-        def update(snapshot: EditingSnapshot) -> EditingSnapshot:
-            folder = _folder_for(manga, folder_name)
-            validated = _selected_image_names(folder, selected_images)
-            folders = dict(snapshot.folders)
-            if validated:
-                folders[folder_name] = EditingFolderState(validated)
-            else:
-                folders.pop(folder_name, None)
-            return replace(
-                snapshot,
-                last_folder=folder_name,
-                last_image=current_image,
-                folders=folders,
-                warnings=(),
-            )
-
-        return self._mutate(manga, folder_name, (current_image,), update)
 
     def _mutate(
         self,
@@ -340,7 +279,6 @@ def _default_editing(manga: MangaRef) -> EditingSnapshot:
         first_folder.name,
         first_folder.images[0].name,
         {},
-        {},
     )
 
 
@@ -348,13 +286,12 @@ def _parse_editing(payload: object, manga: MangaRef) -> EditingSnapshot:
     if (
         not isinstance(payload, dict)
         or set(payload)
-        != {"schema_version", "last_folder", "last_image", "folders", "exports"}
+        != {"schema_version", "last_folder", "last_image", "folders"}
         or payload.get("schema_version") != STATE_SCHEMA_VERSION
         or isinstance(payload.get("schema_version"), bool)
         or not isinstance(payload.get("last_folder"), str)
         or not isinstance(payload.get("last_image"), str)
         or not isinstance(payload.get("folders"), dict)
-        or not isinstance(payload.get("exports"), dict)
     ):
         raise EditingStateError("Editing metadata uses an invalid or unsupported format.")
 
@@ -404,38 +341,6 @@ def _parse_editing(payload: object, manga: MangaRef) -> EditingSnapshot:
         if selected:
             folder_states[folder_name] = EditingFolderState(frozenset(selected))
 
-    exports: dict[str, FolderExportState] = {}
-    for folder_name, value in payload["exports"].items():
-        if not _safe_component(folder_name):
-            raise EditingStateError("Editing metadata contains an unsafe export folder.")
-        if not isinstance(value, dict) or set(value) != {"files"} or not isinstance(
-            value.get("files"), dict
-        ):
-            raise EditingStateError(
-                f"Editing metadata contains an invalid export for '{folder_name}'."
-            )
-        files: dict[str, ExportedImageState] = {}
-        for image_name, entry in value["files"].items():
-            if (
-                not _safe_component(image_name)
-                or Path(image_name).suffix.casefold() not in {".jpg", ".png"}
-                or not isinstance(entry, dict)
-                or set(entry) != {"output_name", "digest"}
-                or not _safe_component(entry.get("output_name"))
-                or entry.get("output_name")
-                != _managed_output_name(folder_name, image_name)
-                or not isinstance(entry.get("digest"), str)
-                or not _DIGEST.fullmatch(entry["digest"])
-            ):
-                raise EditingStateError(
-                    f"Editing metadata contains an invalid exported image in '{folder_name}'."
-                )
-            files[image_name] = ExportedImageState(
-                entry["output_name"], entry["digest"]
-            )
-        if files:
-            exports[folder_name] = FolderExportState(files)
-
     resume_folder = live_folders.get(last_folder)
     if resume_folder is None or last_image not in {
         image.name for image in resume_folder.images
@@ -446,9 +351,7 @@ def _parse_editing(payload: object, manga: MangaRef) -> EditingSnapshot:
         first_folder = _first_folder(manga)
         last_folder = first_folder.name
         last_image = first_folder.images[0].name
-    return EditingSnapshot(
-        last_folder, last_image, folder_states, exports, tuple(warnings)
-    )
+    return EditingSnapshot(last_folder, last_image, folder_states, tuple(warnings))
 
 
 def _editing_payload(manga: MangaRef, snapshot: EditingSnapshot) -> dict[str, Any]:
@@ -483,36 +386,11 @@ def _editing_payload(manga: MangaRef, snapshot: EditingSnapshot) -> dict[str, An
             "selected_images": selected,
         }
 
-    exports_payload: dict[str, Any] = {}
-    for folder_name in sorted(snapshot.exports, key=natural_name_key):
-        if not _safe_component(folder_name):
-            raise EditingStateError("Editing state contains an unsafe export folder.")
-        export = snapshot.exports[folder_name]
-        files_payload: dict[str, Any] = {}
-        for image_name in sorted(export.files, key=natural_name_key):
-            entry = export.files[image_name]
-            if (
-                not _safe_component(image_name)
-                or Path(image_name).suffix.casefold() not in {".jpg", ".png"}
-                or not _safe_component(entry.output_name)
-                or entry.output_name
-                != _managed_output_name(folder_name, image_name)
-                or not _DIGEST.fullmatch(entry.digest)
-            ):
-                raise EditingStateError("Editing state contains an invalid export entry.")
-            files_payload[image_name] = {
-                "output_name": entry.output_name,
-                "digest": entry.digest,
-            }
-        if files_payload:
-            exports_payload[folder_name] = {"files": files_payload}
-
     return {
         "schema_version": STATE_SCHEMA_VERSION,
         "last_folder": snapshot.last_folder,
         "last_image": snapshot.last_image,
         "folders": folder_payload,
-        "exports": exports_payload,
     }
 
 
@@ -544,25 +422,6 @@ def _image_for(folder: FolderRef, image_name: str):
     return image
 
 
-def _selected_image_names(
-    folder: FolderRef, selected_images: Collection[str]
-) -> frozenset[str]:
-    try:
-        selected = set(selected_images)
-    except TypeError as exc:
-        raise StorageError("Selected images must be exact filename strings.") from exc
-    if any(not isinstance(value, str) for value in selected):
-        raise StorageError("Selected images must be exact filename strings.")
-    live_names = {image.name for image in folder.images}
-    unknown = sorted(selected - live_names, key=natural_name_key)
-    if unknown:
-        raise StorageError(
-            f"Selection contains images that are not in '{folder.name}': "
-            + ", ".join(unknown)
-        )
-    return frozenset(selected)
-
-
 def _first_folder(manga: MangaRef) -> FolderRef:
     if not manga.folders:
         raise StorageError(f"Manga '{manga.name}' contains no image folders.")
@@ -579,12 +438,6 @@ def _safe_component(value: object) -> bool:
         and "\x00" not in value
         and Path(value).name == value
     )
-
-
-def _managed_output_name(folder_name: str, image_name: str) -> str:
-    """Return the sole authoritative filename for one managed export entry."""
-
-    return f"{folder_name}__{image_name}"
 
 
 def _safe_image_name(value: object) -> bool:

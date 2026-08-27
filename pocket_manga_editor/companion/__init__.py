@@ -1,33 +1,20 @@
-"""Thread-safe Companion Mode services with no Qt dependencies."""
+"""Thread-safe services for the always-on local web application."""
 
-from .auth import (
-    CredentialPersistenceError,
-    CredentialVerifierStore,
-    PairingManager,
-    PairingOffer,
-    UnpairedError,
-)
 from .coordinator import (
     CompanionCoordinator,
     CoordinatorStatus,
-    MobileContext,
+    ExportMutation,
 )
 from .server import CompanionHTTPService, HTTPServiceStatus
 from .snapshot import LibrarySnapshot
-from .state import CompanionActivity, CompanionState
+from .state import CompanionActivity
 
 __all__ = [
     "CompanionCoordinator",
     "CompanionHTTPService",
     "CompanionActivity",
-    "CompanionState",
     "CoordinatorStatus",
-    "CredentialPersistenceError",
-    "CredentialVerifierStore",
+    "ExportMutation",
     "HTTPServiceStatus",
     "LibrarySnapshot",
-    "MobileContext",
-    "PairingManager",
-    "PairingOffer",
-    "UnpairedError",
 ]

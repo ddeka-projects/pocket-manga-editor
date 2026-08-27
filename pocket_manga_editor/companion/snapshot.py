@@ -1,4 +1,4 @@
-"""Immutable, path-free identifiers for one Companion Mode session."""
+"""Immutable, path-free identifiers for one live library snapshot."""
 
 from __future__ import annotations
 

@@ -1,230 +1,215 @@
 # Pocket Manga Editor
 
-Pocket Manga Editor is a development-stage desktop editor with an iPhone Home
-Screen companion. It follows the source filesystem directly: a manga contains
-arbitrarily named image folders, and each folder contains JPG or PNG images.
-The app does not parse volumes or chapters and never combines folders into a
-constructed reading unit.
+Pocket Manga Editor is a local web application for reading manga and selecting
+specific pages to copy into an output folder. A small Python server runs on the
+Windows PC that owns the files; the same full-screen web interface works from an
+iPhone Home Screen app or a browser on the PC.
 
-Desktop and phone **Edit** share selections and editing position. Phone
-**Read** keeps a separate bookmark and has no selection behavior. Reviewing,
-reading, editing, and export do not modify source images. The explicitly
-confirmed **Complete Manga** operation permanently deletes its source folder.
+There is no desktop GUI, account, cloud service, or permanent phone pairing.
+Any device on the trusted private LAN can open the app, and one browser page at
+a time owns the controller lease.
 
 ## Source library
 
-Choose a working directory containing one or more manga folders:
+The configured working directory is the library. Each direct child is a manga,
+each direct child of a manga containing supported images is an entry, and each
+entry contains direct JPG or PNG files:
 
 ```text
-Working Directory/
-└── Kimi wa 08/
-    ├── V1_C01 - First Day/
-    │   ├── 1.jpg
-    │   ├── 2.png
-    │   └── 10.jpg
-    ├── Volume Two - Ch 12/
-    │   ├── page 1.png
-    │   └── page 2.png
-    └── Bonus artwork/
-        └── extra-cover.JPG
+C:\Manga Library\
+├── Kimi wa 08\
+│   ├── V1_C01 - First Day\
+│   │   ├── 1.jpg
+│   │   ├── 2.png
+│   │   └── 10.jpg
+│   ├── Volume Two - Ch 12\
+│   │   ├── page 1.png
+│   │   └── page 2.png
+│   └── Bonus artwork\
+│       └── extra-cover.JPG
+└── Another Manga\
+    └── Chapter 1\
+        └── 001.jpg
 ```
 
-- Every normal direct child of the working directory is a manga, except
-  `.pocket-manga-editor`. The exact manga name `.library-mutation.lock` is also
-  reserved for the cross-process library lock.
-- Every direct child of a manga containing at least one direct `.jpg` or `.png`
-  file is an image folder.
-- Extensions are case-insensitive and exact folder names and complete image
-  filenames are preserved.
-- Folders and filenames use deterministic, case-insensitive natural ordering,
-  so `1.jpg`, `2.jpg`, and `10.jpg` appear in that order.
-- Nested folders, images directly in the manga root, JPEG files using `.jpeg`,
-  archives, PDFs, symlinks, and other formats are not included.
+- Exact manga, entry, and image names are preserved.
+- Ordering is case-insensitive and natural, so `1.jpg`, `2.jpg`, and `10.jpg`
+  appear in that order.
+- `.jpg` and `.png` extensions are supported case-insensitively.
+- Nested folders, images directly inside a manga, `.jpeg`, archives, PDFs,
+  symbolic links, junctions, and other file types are not included.
+- Renaming a folder or image creates a new identity; stale saved references are
+  ignored rather than inferred as renames.
 
-Renaming an image or folder creates a new identity. Stale saved references are
-ignored; the app does not infer renames.
+## First-time Windows setup
 
-## Development setup
-
-Python 3.10 or newer is required. On Windows:
+Python 3.10 or newer is required. Open PowerShell in the repository and run:
 
 ```powershell
-py -m venv .venv
-.venv\Scripts\python -m pip install -r requirements.txt
-.venv\Scripts\python run.py
+powershell -ExecutionPolicy Bypass -File .\scripts\bootstrap-windows.ps1
 ```
 
-On macOS:
+The script creates `.venv`, installs the current requirements, and creates a
+local `.env` from `.env.example` when needed. Edit `.env` and set the required
+absolute path:
 
-```bash
-python3 -m venv .venv
-.venv/bin/python -m pip install -r requirements.txt
-.venv/bin/python run.py
+```env
+POCKET_MANGA_EDITOR_WORKING_DIRECTORY=C:\Manga Library
+POCKET_MANGA_EDITOR_HOST=0.0.0.0
+POCKET_MANGA_EDITOR_PORT=8765
 ```
 
-## Building the Windows portable application
+The working directory must already exist and cannot be a symbolic link or
+junction. Do not use `~`, a relative path, or a user-mapped network drive for a
+server that will run as `SYSTEM`. Real Windows environment variables override
+values from `.env`.
 
-Build the Windows application on Windows itself; PyInstaller does not
-cross-compile Windows executables from macOS or Linux.
+This development release intentionally does not migrate metadata created by
+the former desktop/completion builds. Before its first run, move aside any old
+output you want to keep and remove the old manga workspace under
+`.pocket-manga-editor`; the server will create the smaller metadata format as
+you use it.
 
-Double-click `build-windows.cmd`, or run it from PowerShell/Command Prompt:
+For a manual foreground run:
 
 ```powershell
-.\build-windows.cmd
+powershell -ExecutionPolicy Bypass -File .\scripts\run-server.ps1
 ```
 
-The first build creates an isolated `.build-venv` and installs the build
-dependencies. Every build installs any changed requirements, runs the complete
-test suite, recreates the application, and produces:
+Server output is appended under `logs\`. Open `http://127.0.0.1:8765/` on the
+PC. From another trusted LAN device, use the PC's stable private IPv4 address,
+for example `http://192.168.1.20:8765/`.
 
-```text
-release/
-├── Pocket Manga Editor/
-│   ├── Pocket Manga Editor.exe
-│   ├── PORTABLE-README.txt
-│   └── _internal/
-└── Pocket-Manga-Editor-Windows-<architecture>.zip
-```
+## Start automatically with Windows
 
-Distribute the ZIP or the entire `Pocket Manga Editor` folder. The executable
-depends on `_internal`, so do not move the EXE out of that folder. Generated
-build environments and output are ignored by Git; the build launcher, PowerShell
-script, PyInstaller specification, and build requirements are tracked.
-
-For a quicker local packaging pass after tests have already run, use:
+First complete the setup above and verify `.env`. Then open PowerShell **as
+Administrator** and run:
 
 ```powershell
-.\build-windows.cmd -SkipTests
+powershell -ExecutionPolicy Bypass -File .\scripts\install-startup-task.ps1
 ```
 
-Use `-FreshEnvironment` if the isolated build environment ever needs to be
-recreated.
+The installer:
 
-These are unsigned local builds. Windows may show a SmartScreen warning on a
-newly downloaded ZIP; code signing can be added later if the application is
-distributed beyond your own machines.
+- registers **Pocket Manga Editor Server** at Windows startup;
+- runs it as `SYSTEM`, whether or not a user has signed in;
+- prevents duplicate task instances;
+- restarts the server after failures;
+- permits the configured TCP port only from `LocalSubnet` on the Windows
+  **Private** firewall profile; and
+- starts the task immediately.
 
-## Desktop editing
+Reserve the PC's address in the router's DHCP settings so the iPhone Home
+Screen URL does not change. Keep the Windows network profile set to Private.
+Do not configure router port forwarding or publish the server through a VPN or
+internet tunnel.
 
-The desktop is always an editing surface. Choose a manga and an exact source
-folder, then review and select images. Progress and selections autosave.
+To remove automatic startup, run as Administrator:
 
-| Key | Action |
-| --- | --- |
-| `←` / `→` | Previous or next image |
-| `Ctrl+←` / `Ctrl+→` | Previous or next selected image in the folder |
-| `Space` | Select or deselect the current image |
-| `Enter` | Select the current image and advance |
-| `Home` / `End` | First or last image |
-| `Ctrl+S` | Synchronize the current manga output |
-| `F5` | Rescan the working directory |
-| `?` / `F1` | Show keyboard help |
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\remove-startup-task.ps1
+```
+
+Removal stops and unregisters the task and removes its firewall rule. It does
+not delete `.env`, `.venv`, logs, source manga, metadata, or output.
+
+After updating the code, rerun `bootstrap-windows.ps1` to apply any future
+requirement changes, then restart the scheduled task or run the installer again.
+
+## Web application
+
+The home screen lists the current library. Its top-right button performs a real
+filesystem rescan. Selecting a manga presents three actions:
+
+- **Read** — selection-free reading with an independent saved position.
+- **Edit** — reading plus page selection controls and a saved editing position.
+- **Export** — replace that manga's output with all currently selected pages.
+
+Read and Edit each remember one latest entry/image pair per manga. Choosing an
+entry from the picker starts at its first image. Crossing forward into the next
+entry starts at its first image; crossing backward into the previous entry
+starts at its last image.
+
+The web reader preserves the immediate navigation behavior: it displays the
+prefetched neighboring image without a decorative transition. In Edit, tapping
+the lower middle area toggles selection; tapping the center shows or hides the
+controls.
+
+Only one browser page can control the library at a time. Closing or navigating
+away releases ownership when the browser reports it. If that signal is lost,
+the in-memory heartbeat lease expires automatically after a short timeout. A
+server restart also clears ownership. There is no paired-device credential;
+the trusted private LAN is the authorization boundary.
+
+See [Local web server behavior](docs/server-mode.md) for operational and
+security details.
 
 ## App-managed workspace
 
-Each manga has an isolated workspace:
+The server creates one isolated workspace per manga inside the library:
 
 ```text
-Working Directory/.pocket-manga-editor/
-└── Kimi wa 08/
+C:\Manga Library\.pocket-manga-editor\
+└── Kimi wa 08\
     ├── reading.json
     ├── editing.json
-    ├── output/
-    │   └── V1_C01 - First Day/
+    ├── output\
+    │   └── V1_C01 - First Day\
     │       └── V1_C01 - First Day__2.png
-    ├── completed/
-    │   ├── batch-0001/
-    │   └── batch-0002/
-    └── .transactions/
+    └── .transactions\
 ```
 
-`reading.json` contains only the phone's latest manga folder/image pair.
-`editing.json` contains the desktop/phone latest folder/image pair, exact
-selected filenames, and output ownership records. Selection entries are stored
-only for folders that currently contain selections. The files are written
-atomically while holding the cross-process library mutation lock.
+`reading.json` stores only the latest Read entry/image pair. `editing.json`
+stores only the latest Edit pair and sparse exact selections. Export history and
+per-file export digests are not retained. `.transactions` contains temporary
+crash-recovery state only while an export is being committed or cleaned up.
 
-This is an application-owned directory. Do not manually edit active JSON or
-managed output. The exporter nevertheless preserves untracked files and refuses
-to overwrite or remove a managed file whose bytes changed after export.
+Everything under `.pocket-manga-editor` is application-managed. Do not edit it
+or add files that need to be preserved. The user may move a completed `output`
+folder elsewhere and may manually delete source or workspace folders.
 
-This release is a clean development-stage break. It does not read or migrate
-the former global `selections`, `exports`, `output`, `completed`, or completion
-log layout. Remove the old `.pocket-manga-editor` directory before testing this
-model if the workspace was created by an earlier build.
+There is intentionally no **Complete Manga** operation. Export does not delete
+source files or clear reading/selections.
 
 ## Whole-manga export
 
-One **Export Manga** action reconciles every edited folder in the current manga.
-After success, each app-managed output folder exactly represents that folder's
-current selections:
+Export builds a fresh output from the complete current selection and then
+transactionally replaces the previous output:
 
-- newly selected images are copied;
-- unchanged selected images are retained and verified;
-- deselected managed images are removed;
-- a managed folder with no selections is removed only if it becomes empty;
-- unrelated files are preserved; and
-- modified managed files or name/path collisions stop the export before data is
-  overwritten.
+- zero selections are refused without changing existing output;
+- every selected image is copied into a newly staged tree;
+- the previous output remains recoverable until the new output commits;
+- a failed or interrupted pre-commit operation restores the previous output;
+- a subsequent server start completes transaction recovery before scanning;
+- deselected images and entries disappear because the old output is replaced;
+  and
+- exported bytes and extensions are unchanged.
 
-Exported names are `<exact folder name>__<exact image filename>` and retain the
-original image bytes and extension. The multi-folder operation is transactional;
-failed or interrupted work is rolled back or recovered before new mutations.
+If existing output contains an unknown folder, filename, nesting level, special
+file, or file type that does not correspond to the current source structure,
+the app warns before replacement. Confirmation deletes the entire old output,
+including that unrecognized content. A manually added file that exactly mimics
+a valid source-derived output path is inherently indistinguishable from an
+app-created file.
 
-## Completing a manga
+Exported filenames remain `<exact entry name>__<exact image filename>` inside
+the corresponding exact entry folder.
 
-**Complete Manga** requires at least one verified app-managed exported image.
-After destructive confirmation, it moves the complete active output into the
-next immutable per-manga batch, such as:
+## Development and tests
 
-```text
-.pocket-manga-editor/Kimi wa 08/completed/batch-0001/
-```
-
-It then permanently deletes the source manga and removes active `reading.json`
-and `editing.json`. Earlier batches remain unchanged. A later same-name source
-manga reuses the workspace and can create `batch-0002`. No global completion
-log or source/output coverage comparison is used; source folders without
-selections are valid. Completion is journaled and recovered before scanning.
-
-## Mobile Companion Mode
-
-Companion Mode serves an installable reader/editor over the trusted local
-network. After tapping a manga, the phone always asks:
-
-- **Read** — selection-free reading using only `reading.json`.
-- **Edit** — shared desktop/mobile position and selections using `editing.json`.
-
-Returning from the reader goes back to this choice. Read and Edit can resume at
-different folders and images. Export, completion, deletion, rescanning, and
-working-directory changes remain desktop-only.
-
-Setup:
-
-1. Reserve a stable IP address for the PC in the router.
-2. Open **Connection…** in the desktop Mobile Companion card and enter that
-   address and a fixed port (`8765` by default).
-3. Permit the application on private networks if the firewall prompts.
-4. Choose **Pair Phone**, open the displayed address, and enter the one-time code.
-5. In Safari, choose **Share → Add to Home Screen**.
-6. On later launches, a remembered paired phone automatically puts the app into
-   Companion Mode when the saved library and Companion server are available.
-7. Use **End Companion Mode** to return ownership to the desktop. **Start
-   Companion Mode** remains available for manual entry when no phone is remembered.
-
-Only one desktop process and one mobile controller are allowed. Companion uses
-unencrypted HTTP and is intended only for a trusted home LAN; do not expose it
-with port forwarding. See [Companion Mode](docs/companion-mode.md) for details.
-
-## Tests
-
-Install the development requirements, then run:
+The runtime uses only the Python standard library. Run the application directly
+from an activated environment with:
 
 ```powershell
-py -m unittest discover -s tests -v
+.venv\Scripts\python -m pocket_manga_editor
 ```
 
-The suite covers discovery and natural ordering, independent metadata,
-transactional export and completion, crash recovery, singleton and mutation
-locks, Companion authorization/activity isolation, authenticated images,
-mobile asset contracts, and the desktop layout.
+Run the test suite with:
+
+```powershell
+.venv\Scripts\python -m unittest discover -s tests -v
+```
+
+The suite covers scanning and ordering, reading/editing persistence, safe path
+handling, whole-output export and crash recovery, controller leasing, HTTP/API
+security, image delivery, and web-client behavior.
