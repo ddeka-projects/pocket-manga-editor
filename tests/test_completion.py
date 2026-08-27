@@ -247,7 +247,10 @@ class CompletionPreviewTests(CompletionFixture):
         outside = self.root / "outside.txt"
         outside.write_bytes(b"outside")
         link = source.parent / "link.txt"
-        link.symlink_to(outside)
+        try:
+            link.symlink_to(outside)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"Symbolic links are unavailable: {exc}")
 
         with self.assertRaisesRegex(CompletionError, "symbolic link"):
             analyze_completion(self.root, self.manga())

@@ -258,7 +258,8 @@ class FilesystemOperationTests(RepositoryFixture):
             exporter_module._fsync_file(staged)
 
         self.assertEqual(len(opened_flags), 1)
-        self.assertEqual(opened_flags[0] & os.O_ACCMODE, os.O_RDWR)
+        access_mode_mask = getattr(os, "O_ACCMODE", os.O_WRONLY | os.O_RDWR)
+        self.assertEqual(opened_flags[0] & access_mode_mask, os.O_RDWR)
         fsync.assert_called_once()
         self.assertFalse(stat.S_IMODE(staged.stat().st_mode) & stat.S_IWRITE)
 
@@ -800,7 +801,7 @@ class ExporterTests(RepositoryFixture):
             self.manga_ref, "Chapter One", "1.jpg", True
         )
 
-        with patch.object(exporter_module.os, "pathconf", None):
+        with patch.object(exporter_module.os, "pathconf", None, create=True):
             result = export_manga(self.root, self.manga_ref)
 
         self.assertEqual(result.copied_count, 1)
