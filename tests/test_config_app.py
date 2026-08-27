@@ -300,5 +300,17 @@ class ApplicationBootstrapTests(unittest.TestCase):
         coordinator.disconnect_client.assert_called_once_with()
 
 
+class WindowsLauncherContractTests(unittest.TestCase):
+    def test_runner_redirects_native_streams_without_powershell_error_records(self) -> None:
+        runner = (
+            Path(__file__).resolve().parent.parent / "scripts" / "run-server.ps1"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("Start-Process", runner)
+        self.assertIn("-RedirectStandardError $logFile", runner)
+        self.assertIn("-RedirectStandardOutput $standardOutputLog", runner)
+        self.assertNotIn(">> $logFile 2>&1", runner)
+
+
 if __name__ == "__main__":
     unittest.main()
