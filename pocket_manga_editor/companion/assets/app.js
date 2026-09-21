@@ -3,6 +3,7 @@
 (() => {
   const HEARTBEAT_INTERVAL_MS = 5_000;
   const OCCUPIED_RETRY_INTERVAL_MS = 3_000;
+  const HEARTBEAT_MAX_FAILURES = 2;
   const REQUEST_TIMEOUT_MS = 15_000;
   const EXPORT_TIMEOUT_MS = 10 * 60_000;
   const READ = "read";
@@ -108,6 +109,7 @@
     leaseClaimed: false,
     heartbeatTimer: 0,
     heartbeatInFlight: false,
+    heartbeatFailures: 0,
     claimRetryTimer: 0,
     stateAction: null,
     library: [],
@@ -386,6 +388,7 @@
       state.heartbeatTimer = 0;
     }
     state.heartbeatInFlight = false;
+    state.heartbeatFailures = 0;
   }
 
   async function sendHeartbeat() {
@@ -398,10 +401,15 @@
         method: "POST",
         body: { client_id: state.clientId, page_id: state.pageInstanceId },
       });
+      state.heartbeatFailures = 0;
       if (payload.snapshot_id && state.snapshotId && payload.snapshot_id !== state.snapshotId) {
         await loadLibrary();
       }
     } catch (error) {
+      const isTransient = !(error instanceof ApiError) || error.code === "network_error";
+      if (isTransient && ++state.heartbeatFailures <= HEARTBEAT_MAX_FAILURES) {
+        return;
+      }
       handleSessionError(error, bootstrap);
     } finally {
       state.heartbeatInFlight = false;
