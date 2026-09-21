@@ -1704,52 +1704,14 @@
             );
             updateFolderSummary(state.currentFolder);
           }
-        } catch (error) {
+        } catch {
           const failureStillRelevant = (
             !state.positionQueue.has(key)
             && state.activity === pending.activity
             && pending.epoch === state.activityEpoch
           );
-          const failedCurrentFolder = Boolean(
-            failureStillRelevant
-            && state.currentFolder
-            && state.currentFolder.id === pending.folderId
-          );
-          let failedIndex = -1;
-          if (failedCurrentFolder) {
-            failedIndex = state.currentFolder.images.findIndex(
-              (image) => image.id === pending.imageId,
-            );
-            const confirmedIndex = state.currentFolder.images.findIndex(
-              (image) => image.id === state.currentFolder.currentImageId,
-            );
-            if (confirmedIndex >= 0) {
-              showImage(confirmedIndex, { persist: false });
-              showReaderFeedback("Position not saved · restored", "error", 2_100);
-            }
-          }
           if (failureStillRelevant) {
-            showActionError(
-              "Position not saved",
-              friendlyMessage(
-                error,
-                failedCurrentFolder
-                  ? "The reader returned to the last confirmed image."
-                  : "The prior folder retains its last confirmed reading position.",
-              ),
-              () => {
-                if (failedIndex >= 0 && state.currentFolder && state.currentFolder.id === pending.folderId) {
-                  showImage(failedIndex);
-                } else {
-                  queuePosition(
-                    pending.activity,
-                    pending.folderId,
-                    pending.imageId,
-                    pending.epoch,
-                  );
-                }
-              },
-            );
+            showReaderFeedback("Position not saved", "error", 425);
           }
         }
       }

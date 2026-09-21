@@ -129,7 +129,7 @@ class WebAssetContractTests(unittest.TestCase):
             self.javascript,
         )
         self.assertIn(
-            "The prior folder retains its last confirmed reading position.",
+            "Position not saved",
             self.javascript,
         )
         self.assertIn(
@@ -220,10 +220,7 @@ class WebAssetContractTests(unittest.TestCase):
         self.assertIn('"X-Companion-Page": state.pageInstanceId', self.javascript)
         self.assertIn("window.sessionStorage.getItem", self.javascript)
         self.assertIn("pageInstanceId: createOpaqueId()", self.javascript)
-        self.assertIn(
-            "showImage(confirmedIndex, { persist: false })",
-            self.javascript,
-        )
+        self.assertIn("showImage(index, { persist: false })", self.javascript)
         self.assertIn('view: "activity"', self.javascript)
         self.assertIn('view: "reader"', self.javascript)
         self.assertIn("window.addEventListener(\"popstate\"", self.javascript)
