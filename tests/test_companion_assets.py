@@ -132,10 +132,7 @@ class WebAssetContractTests(unittest.TestCase):
             "Position not saved",
             self.javascript,
         )
-        self.assertIn(
-            "The prior folder retains its last confirmed selection state.",
-            self.javascript,
-        )
+        self.assertIn("Selection not saved", self.javascript)
         self.assertIn("applySelectionConfirmation", self.javascript)
         self.assertIn(
             'id="chrome-toggle" class="tap-zone chrome-toggle-zone"',

@@ -1510,31 +1510,15 @@
           pulseSelection("selection-pulse");
         }
       }
-    } catch (error) {
+    } catch {
       state.selectionPending.delete(image.id);
-      const failureStillRelevant = (
-        epoch === state.activityEpoch
-        && state.activity === EDIT
-      );
       const failedCurrentImage = isCurrentImage(folder.id, image.id, epoch);
       if (failedCurrentImage && state.activity === EDIT) {
         renderSelectionState(currentImage());
         pulseSelection("selection-failed");
-        showReaderFeedback("Selection not saved", "error", 2_100);
       }
-      if (failureStillRelevant) {
-        showActionError(
-          "Selection not saved",
-          friendlyMessage(
-            error,
-            failedCurrentImage
-              ? "The image remains in its last confirmed state."
-              : "The prior folder retains its last confirmed selection state.",
-          ),
-          isSessionGateError(error)
-            ? bootstrap
-            : () => setSelection(folder, image, desired, epoch),
-        );
+      if (epoch === state.activityEpoch && state.activity === EDIT) {
+        showReaderFeedback("Selection not saved", "error", 425);
       }
     }
   }
