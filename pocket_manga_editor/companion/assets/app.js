@@ -1046,6 +1046,7 @@
         ? raw.folders.map((folder) => normalizeFolderSummary(folder, activity)).filter((folder) => folder.id)
         : [];
       state.activity = activity;
+      state.chromeVisible = true;
       const currentManga = {
         id: String(raw.id || manga.id),
         name: String(raw.name || manga.name),
@@ -1278,10 +1279,12 @@
     elements.selectionZone.hidden = !editing;
     elements.selectionZone.disabled = !editing;
     elements.selectedPickerShell.hidden = !editing;
-    state.chromeVisible = true;
-    elements.readerScreen.classList.remove("chrome-hidden");
-    elements.chromeToggle.setAttribute("aria-pressed", "false");
-    elements.chromeToggle.setAttribute("aria-label", "Hide reader controls");
+    elements.readerScreen.classList.toggle("chrome-hidden", !state.chromeVisible);
+    elements.chromeToggle.setAttribute("aria-pressed", String(!state.chromeVisible));
+    elements.chromeToggle.setAttribute(
+      "aria-label",
+      state.chromeVisible ? "Hide reader controls" : "Show reader controls",
+    );
     if (!editing) {
       clearSelectionPresentation();
     }
@@ -1425,7 +1428,7 @@
     elements.boundaryCue.classList.add("is-visible");
     state.boundaryTimer = window.setTimeout(() => {
       elements.boundaryCue.classList.remove("is-visible");
-    }, 850);
+    }, 425);
   }
 
   function currentImage() {
