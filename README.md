@@ -82,41 +82,43 @@ for example `http://192.168.1.20:8765/`.
 
 ## Start automatically at your logon
 
-First complete the setup above and verify `.env`. Then open PowerShell **as
-Administrator using the same Windows account you normally sign in with** and run:
+Complete setup and verify `.env`, then run from ordinary PowerShell in the repository:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\install-startup-task.ps1
 ```
 
-The installer:
+This installs and immediately starts **Pocket Manga Editor** at your user logon
+with limited privileges, duplicate instances ignored, no runtime limit, and
+restart after failure. The PC must remain signed in and awake.
 
-- registers **Pocket Manga Editor** at your Windows user logon;
-- runs it in your signed-in session with limited privileges;
-- prevents duplicate task instances;
-- restarts the server after failures;
-- permits the configured TCP port only from `LocalSubnet` on the Windows
-  **Private** firewall profile; and
-- starts the task immediately.
+For first-time phone access or after changing the port, run the following from
+**PowerShell as Administrator using the same Windows account**:
 
-The PC must be signed in and awake for the phone to connect. Elevation is used
-for task installation and the firewall rule; the server itself runs under your
-account with limited privileges. Do not install using a different administrator
-account.
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install-startup-task.ps1 -ConfigureFirewall
+```
+
+This allows the configured TCP port only from `LocalSubnet` on the **Private**
+firewall profile. Without `-ConfigureFirewall`, the installer leaves firewall
+rules untouched. The server always runs with limited privileges.
 
 Reserve the PC's address in the router's DHCP settings so the iPhone Home
 Screen URL does not change. Keep the Windows network profile set to Private.
 Do not configure router port forwarding or publish the server through a VPN or
 internet tunnel.
 
-To remove automatic startup, run as Administrator:
+To remove automatic startup from ordinary PowerShell:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\remove-startup-task.ps1
+# Optional, from elevated PowerShell: also remove this app's firewall rule.
+powershell -ExecutionPolicy Bypass -File .\scripts\remove-startup-task.ps1 -RemoveFirewall
 ```
 
-Removal stops and unregisters the task and removes its firewall rule. It does
-not delete `.env`, `.venv`, logs, source manga, metadata, or output.
+Removal stops and unregisters the task. Firewall rules stay in place unless
+`-RemoveFirewall` is supplied. It keeps `.env`, `.venv`, logs, source manga,
+metadata, and output.
 
 After updating the code, rerun `bootstrap-windows.ps1` to apply any future
 requirement changes, then restart the scheduled task or run the installer again.

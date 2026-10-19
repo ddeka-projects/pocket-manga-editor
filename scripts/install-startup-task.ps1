@@ -2,7 +2,8 @@
 
 [CmdletBinding()]
 param(
-    [string]$TaskName = "Pocket Manga Editor"
+    [string]$TaskName = "Pocket Manga Editor",
+    [switch]$ConfigureFirewall
 )
 
 Set-StrictMode -Version Latest
@@ -10,8 +11,8 @@ $ErrorActionPreference = "Stop"
 
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principalCheck = New-Object Security.Principal.WindowsPrincipal($identity)
-if (-not $principalCheck.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    throw "Run this script from PowerShell as Administrator."
+if ($ConfigureFirewall -and -not $principalCheck.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw "-ConfigureFirewall needs an elevated PowerShell for the same Windows user. Omit it if the rule is already configured."
 }
 
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
@@ -95,22 +96,29 @@ Register-ScheduledTask `
     -Description "Runs Pocket Manga Editor when $($identity.Name) signs in." `
     -Force | Out-Null
 
-foreach ($ruleName in @($firewallRuleName, "Pocket Manga Editor Server (Private LAN)")) {
-    Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue |
-        Remove-NetFirewallRule
+if ($ConfigureFirewall) {
+    foreach ($ruleName in @($firewallRuleName, "Pocket Manga Editor Server (Private LAN)")) {
+        Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue |
+            Remove-NetFirewallRule
+    }
+    New-NetFirewallRule `
+        -DisplayName $firewallRuleName `
+        -Direction Inbound `
+        -Action Allow `
+        -Protocol TCP `
+        -LocalPort $configuredPort `
+        -Profile Private `
+        -RemoteAddress LocalSubnet | Out-Null
 }
-New-NetFirewallRule `
-    -DisplayName $firewallRuleName `
-    -Direction Inbound `
-    -Action Allow `
-    -Protocol TCP `
-    -LocalPort $configuredPort `
-    -Profile Private `
-    -RemoteAddress LocalSubnet | Out-Null
 
 Start-ScheduledTask -TaskName $TaskName -TaskPath "\"
 
 Write-Host "Installed and started '$TaskName'." -ForegroundColor Green
 Write-Host "Runs at logon as $($identity.Name), with limited privileges."
-Write-Host "Allowed TCP port $configuredPort only from the local subnet on Private networks." -ForegroundColor Green
+if ($ConfigureFirewall) {
+    Write-Host "Allowed TCP port $configuredPort only from the local subnet on Private networks." -ForegroundColor Green
+}
+else {
+    Write-Host "Firewall was left as configured. To add Private/LocalSubnet rules, run this script elevated with -ConfigureFirewall."
+}
 Write-Host "Server output is written under $repositoryRoot\logs." -ForegroundColor Green

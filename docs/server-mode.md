@@ -130,11 +130,12 @@ remain safety errors rather than content that the application follows or adopts.
 `scripts/install-startup-task.ps1` registers **Pocket Manga Editor** at the
 installing user's logon, with an interactive, limited-privilege principal,
 duplicate instances ignored, unlimited runtime, and retry after failure.
-Installation requires an elevated PowerShell under that same Windows account
-to configure the firewall. `scripts/run-server.ps1` uses the
+Normal installation and removal use ordinary PowerShell. Add `-ConfigureFirewall`
+to installation or `-RemoveFirewall` to removal from an elevated PowerShell under
+that same Windows account to change this app's Private/LocalSubnet firewall rule.
+Otherwise firewall rules are left untouched. `scripts/run-server.ps1` uses the
 repository's `.venv` and appends output to a dated log file.
-`scripts/remove-startup-task.ps1` removes the task
-and firewall rule without touching user or application data.
+`scripts/remove-startup-task.ps1` removes the task without touching application data.
 
 The server is available after that user signs in, while the PC remains awake.
 Prefer an always-available local absolute library path. If the repository itself
@@ -157,9 +158,9 @@ invalid. Stopping and starting the server also clears ownership.
 ### Port already in use
 
 Stop the other listener or choose a different
-`POCKET_MANGA_EDITOR_PORT`. Rerun the startup-task installer afterward so the
-Private-profile firewall rule follows the configured port, and update the Home
-Screen URL.
+`POCKET_MANGA_EDITOR_PORT`. Rerun the startup-task installer with
+`-ConfigureFirewall` from elevated PowerShell so the Private-profile firewall rule
+follows the configured port, and update the Home Screen URL.
 
 ### Library does not reflect filesystem changes
 
