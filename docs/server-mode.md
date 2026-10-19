@@ -127,16 +127,18 @@ remain safety errors rather than content that the application follows or adopts.
 
 ## Windows Task Scheduler
 
-`scripts/install-startup-task.ps1` registers the server as `SYSTEM` at machine
-startup with duplicate instances ignored, unlimited runtime, and retry after
-failure. `scripts/run-server.ps1` uses the repository's `.venv` and appends
-output to a dated log file. `scripts/remove-startup-task.ps1` removes the task
+`scripts/install-startup-task.ps1` registers **Pocket Manga Editor** at the
+installing user's logon, with an interactive, limited-privilege principal,
+duplicate instances ignored, unlimited runtime, and retry after failure.
+Installation requires an elevated PowerShell under that same Windows account
+to configure the firewall. `scripts/run-server.ps1` uses the
+repository's `.venv` and appends output to a dated log file.
+`scripts/remove-startup-task.ps1` removes the task
 and firewall rule without touching user or application data.
 
-A task running as `SYSTEM` normally cannot use drive letters mapped only in a
-signed-in user session. Prefer an always-available local absolute path. If the
-repository itself is moved, reinstall the task so its absolute action path is
-updated.
+The server is available after that user signs in, while the PC remains awake.
+Prefer an always-available local absolute library path. If the repository itself
+is moved, reinstall the task so its absolute action path is updated.
 
 ## Troubleshooting
 

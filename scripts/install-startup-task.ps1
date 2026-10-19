@@ -2,7 +2,7 @@
 
 [CmdletBinding()]
 param(
-    [string]$TaskName = "Pocket Manga Editor Server"
+    [string]$TaskName = "Pocket Manga Editor"
 )
 
 Set-StrictMode -Version Latest
@@ -18,7 +18,7 @@ $repositoryRoot = Split-Path -Parent $PSScriptRoot
 $virtualPython = Join-Path $repositoryRoot ".venv\Scripts\python.exe"
 $environmentFile = Join-Path $repositoryRoot ".env"
 $runScript = Join-Path $PSScriptRoot "run-server.ps1"
-$firewallRuleName = "Pocket Manga Editor Server (Private LAN)"
+$firewallRuleName = "Pocket Manga Editor (Private LAN)"
 
 if (-not (Test-Path -LiteralPath $virtualPython -PathType Leaf)) {
     throw "The virtual environment is missing. Run scripts\bootstrap-windows.ps1 first."
@@ -49,7 +49,7 @@ $action = New-ScheduledTaskAction `
     -Execute $powerShell `
     -Argument $actionArguments `
     -WorkingDirectory $repositoryRoot
-$trigger = New-ScheduledTaskTrigger -AtStartup
+$trigger = New-ScheduledTaskTrigger -AtLogOn -User $identity.Name
 $settings = New-ScheduledTaskSettingsSet `
     -MultipleInstances IgnoreNew `
     -RestartCount 999 `
@@ -59,26 +59,46 @@ $settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries
 $taskPrincipal = New-ScheduledTaskPrincipal `
-    -UserId "SYSTEM" `
-    -LogonType ServiceAccount `
-    -RunLevel Highest
+    -UserId $identity.Name `
+    -LogonType Interactive `
+    -RunLevel Limited
 
-$existingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-if ($null -ne $existingTask) {
-    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+# Retire the old SYSTEM task before starting the renamed user-logon task.
+$taskNames = @($TaskName)
+if ($TaskName -eq "Pocket Manga Editor") {
+    $taskNames += "Pocket Manga Editor Server"
+}
+foreach ($name in $taskNames) {
+    $existingTask = Get-ScheduledTask -TaskName $name -TaskPath "\" -ErrorAction SilentlyContinue
+    if ($null -eq $existingTask) { continue }
+    Stop-ScheduledTask -TaskName $name -TaskPath "\"
+    $deadline = (Get-Date).AddSeconds(30)
+    do {
+        $existingTask = Get-ScheduledTask -TaskName $name -TaskPath "\"
+        if ($existingTask.State -notin @("Running", "Queued")) { break }
+        if ((Get-Date) -ge $deadline) { throw "Timed out stopping '$name'. No replacement server was started." }
+        Start-Sleep -Milliseconds 250
+    } while ($true)
+    if ($name -ne $TaskName) {
+        Unregister-ScheduledTask -TaskName $name -TaskPath "\" -Confirm:$false
+        Write-Host "Removed legacy scheduled task: $name"
+    }
 }
 
 Register-ScheduledTask `
     -TaskName $TaskName `
+    -TaskPath "\" `
     -Action $action `
     -Trigger $trigger `
     -Settings $settings `
     -Principal $taskPrincipal `
-    -Description "Runs the Pocket Manga Editor local web server whenever Windows starts." `
+    -Description "Runs Pocket Manga Editor when $($identity.Name) signs in." `
     -Force | Out-Null
 
-Get-NetFirewallRule -DisplayName $firewallRuleName -ErrorAction SilentlyContinue |
-    Remove-NetFirewallRule -ErrorAction SilentlyContinue
+foreach ($ruleName in @($firewallRuleName, "Pocket Manga Editor Server (Private LAN)")) {
+    Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue |
+        Remove-NetFirewallRule
+}
 New-NetFirewallRule `
     -DisplayName $firewallRuleName `
     -Direction Inbound `
@@ -88,8 +108,9 @@ New-NetFirewallRule `
     -Profile Private `
     -RemoteAddress LocalSubnet | Out-Null
 
-Start-ScheduledTask -TaskName $TaskName
+Start-ScheduledTask -TaskName $TaskName -TaskPath "\"
 
 Write-Host "Installed and started '$TaskName'." -ForegroundColor Green
+Write-Host "Runs at logon as $($identity.Name), with limited privileges."
 Write-Host "Allowed TCP port $configuredPort only from the local subnet on Private networks." -ForegroundColor Green
 Write-Host "Server output is written under $repositoryRoot\logs." -ForegroundColor Green

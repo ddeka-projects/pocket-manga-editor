@@ -60,8 +60,8 @@ POCKET_MANGA_EDITOR_PORT=8765
 ```
 
 The working directory must already exist and cannot be a symbolic link or
-junction. Do not use `~`, a relative path, or a user-mapped network drive for a
-server that will run as `SYSTEM`. Real Windows environment variables override
+junction. Do not use `~` or a relative path. Prefer a local disk that is
+available as soon as you sign in. Real Windows environment variables override
 values from `.env`.
 
 This development release intentionally does not migrate metadata created by
@@ -80,10 +80,10 @@ Server output is appended under `logs\`. Open `http://127.0.0.1:8765/` on the
 PC. From another trusted LAN device, use the PC's stable private IPv4 address,
 for example `http://192.168.1.20:8765/`.
 
-## Start automatically with Windows
+## Start automatically at your logon
 
 First complete the setup above and verify `.env`. Then open PowerShell **as
-Administrator** and run:
+Administrator using the same Windows account you normally sign in with** and run:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\install-startup-task.ps1
@@ -91,13 +91,18 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-startup-task.ps1
 
 The installer:
 
-- registers **Pocket Manga Editor Server** at Windows startup;
-- runs it as `SYSTEM`, whether or not a user has signed in;
+- registers **Pocket Manga Editor** at your Windows user logon;
+- runs it in your signed-in session with limited privileges;
 - prevents duplicate task instances;
 - restarts the server after failures;
 - permits the configured TCP port only from `LocalSubnet` on the Windows
   **Private** firewall profile; and
 - starts the task immediately.
+
+The PC must be signed in and awake for the phone to connect. Elevation is used
+for task installation and the firewall rule; the server itself runs under your
+account with limited privileges. Do not install using a different administrator
+account.
 
 Reserve the PC's address in the router's DHCP settings so the iPhone Home
 Screen URL does not change. Keep the Windows network profile set to Private.
