@@ -2,22 +2,19 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 from dataclasses import dataclass
 import logging
 from pathlib import Path
 import threading
-from typing import Iterator
 
 from .. import exporter as exporter_module
 from ..models import ScanResult
 from ..scanner import scan_working_directory
-from .lease import ControllerLease, LeaseSnapshot
+from .controller import ControllerGrant, ControllerOwnership
 from .review import PositionMutation, ReviewService, SelectionMutation
 from .snapshot import ImageSnapshotEntry, LibrarySnapshot
 from .state import (
     CompanionActivity,
-    OperationBusyError,
     RescanError,
     WrongActivityError,
 )
@@ -28,11 +25,9 @@ LOGGER = logging.getLogger(__name__)
 
 @dataclass(frozen=True, slots=True)
 class CoordinatorStatus:
-    active_client: bool
-    active_client_id: str | None
-    lease_expires_at: float | None
+    active_controller: bool
+    active_page_id: str | None
     snapshot_id: str
-    operation: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,8 +39,7 @@ class ExportMutation:
 
 @dataclass(frozen=True, slots=True)
 class _ActivityBinding:
-    client_id: str
-    page_instance_id: str
+    page_id: str
     manga_id: str
     activity: CompanionActivity
 
@@ -58,13 +52,11 @@ class CompanionCoordinator:
         working_directory: str | Path,
         scan_result: ScanResult,
         *,
-        controller_lease: ControllerLease | None = None,
+        controller: ControllerOwnership | None = None,
     ) -> None:
         snapshot = LibrarySnapshot.build(working_directory, scan_result)
         self._lock = threading.RLock()
-        self._operation_gate = threading.Lock()
-        self._operation: str | None = None
-        self._lease = controller_lease or ControllerLease()
+        self._controller = controller or ControllerOwnership()
         self._snapshot = snapshot
         self._review = ReviewService(snapshot)
         self._activity_binding: _ActivityBinding | None = None
@@ -75,128 +67,110 @@ class CompanionCoordinator:
             return self._snapshot.working_directory
 
     def claim_controller(
-        self, client_id: str, page_instance_id: str
-    ) -> LeaseSnapshot:
-        with self._lock:
-            previous = self._lease.snapshot()
-            claimed = self._lease.claim(client_id, page_instance_id)
-            if (
-                previous.instance_id != claimed.instance_id
-                or previous.page_instance_id != claimed.page_instance_id
-            ):
+        self, page_id: str, *, takeover: bool = False
+    ) -> ControllerGrant:
+        with self._controller.claimed(page_id, takeover=takeover) as grant:
+            with self._lock:
                 self._activity_binding = None
-            return claimed
+            return grant
 
-    def heartbeat_controller(
-        self, client_id: str, page_instance_id: str
-    ) -> LeaseSnapshot:
-        with self._lock:
-            return self._lease.heartbeat(client_id, page_instance_id)
+    def release_controller(self, page_id: str, token: str) -> None:
+        with self._controller.authorized(page_id, token):
+            with self._lock:
+                self._activity_binding = None
+            self._controller.release(page_id, token)
 
-    def release_controller(self, client_id: str, page_instance_id: str) -> None:
-        with self._lock:
-            self._lease.release(client_id, page_instance_id)
-            self._activity_binding = None
-
-    def disconnect_client(self) -> None:
+    def clear_controller(self) -> None:
         """Drop volatile controller state during process shutdown."""
 
+        self._controller.disconnect()
         with self._lock:
-            self._lease.disconnect()
             self._activity_binding = None
 
-    def library(
-        self, client_id: str, page_instance_id: str
-    ) -> dict[str, object]:
-        with self._lock:
-            return self._review_locked(client_id, page_instance_id).library_payload()
+    def library(self, page_id: str, token: str) -> dict[str, object]:
+        with self._controller.authorized(page_id, token):
+            with self._lock:
+                return self._review.library_payload()
 
     def open_manga(
         self,
-        client_id: str,
+        page_id: str,
+        token: str,
         manga_id: str,
         activity: CompanionActivity,
-        page_instance_id: str,
     ) -> dict[str, object]:
-        with self._lock:
-            review = self._review_locked(client_id, page_instance_id)
-            review.snapshot.manga(manga_id)
-            self._activity_binding = _ActivityBinding(
-                client_id, page_instance_id, manga_id, activity
-            )
-            return review.manga_payload(manga_id, activity)
+        with self._controller.authorized(page_id, token):
+            with self._lock:
+                self._review.snapshot.manga(manga_id)
+                self._activity_binding = _ActivityBinding(
+                    page_id, manga_id, activity
+                )
+                return self._review.manga_payload(manga_id, activity)
 
     def folder(
         self,
-        client_id: str,
+        page_id: str,
+        token: str,
         folder_id: str,
         activity: CompanionActivity,
-        page_instance_id: str,
     ) -> dict[str, object]:
-        with self._lock:
-            review = self._review_locked(client_id, page_instance_id)
-            self._require_activity_locked(
-                client_id, page_instance_id, activity, folder_id=folder_id
-            )
-            return review.folder_payload(folder_id, activity)
+        with self._controller.authorized(page_id, token):
+            with self._lock:
+                self._require_activity_locked(
+                    page_id, activity, folder_id=folder_id
+                )
+                return self._review.folder_payload(folder_id, activity)
 
     def set_position(
         self,
-        client_id: str,
+        page_id: str,
+        token: str,
         activity: CompanionActivity,
         folder_id: str,
         image_id: str,
-        page_instance_id: str,
     ) -> PositionMutation:
-        with self._lock:
-            self._require_mutations_available_locked()
-            review = self._review_locked(client_id, page_instance_id)
-            self._require_activity_locked(
-                client_id, page_instance_id, activity, folder_id=folder_id
-            )
-            return review.set_position(activity, folder_id, image_id)
+        with self._controller.authorized(page_id, token):
+            with self._lock:
+                self._require_activity_locked(
+                    page_id, activity, folder_id=folder_id
+                )
+                return self._review.set_position(activity, folder_id, image_id)
 
     def set_selection(
         self,
-        client_id: str,
+        page_id: str,
+        token: str,
         activity: CompanionActivity,
         folder_id: str,
         image_id: str,
         selected: bool,
-        page_instance_id: str,
     ) -> SelectionMutation:
-        with self._lock:
-            self._require_mutations_available_locked()
-            review = self._review_locked(client_id, page_instance_id)
-            self._require_activity_locked(
-                client_id, page_instance_id, activity, folder_id=folder_id
-            )
-            if activity is not CompanionActivity.EDIT:
-                raise WrongActivityError(
-                    "Selections are available only in Edit activity."
+        with self._controller.authorized(page_id, token):
+            with self._lock:
+                self._require_activity_locked(
+                    page_id, activity, folder_id=folder_id
                 )
-            return review.set_selection(activity, folder_id, image_id, selected)
+                if activity is not CompanionActivity.EDIT:
+                    raise WrongActivityError(
+                        "Selections are available only in Edit activity."
+                    )
+                return self._review.set_selection(
+                    activity, folder_id, image_id, selected
+                )
 
     def image_for_delivery(
-        self, client_id: str, image_id: str, page_instance_id: str
+        self, page_id: str, token: str, image_id: str
     ) -> tuple[LibrarySnapshot, ImageSnapshotEntry]:
-        with self._lock:
-            review = self._review_locked(client_id, page_instance_id)
-            image = review.snapshot.image(image_id)
-            self._require_activity_locked(
-                client_id,
-                page_instance_id,
-                None,
-                folder_id=image.folder_id,
-            )
-            return review.snapshot, image
+        with self._controller.authorized(page_id, token):
+            with self._lock:
+                image = self._review.snapshot.image(image_id)
+                self._require_activity_locked(
+                    page_id, None, folder_id=image.folder_id
+                )
+                return self._review.snapshot, image
 
-    def rescan(
-        self, client_id: str, page_instance_id: str
-    ) -> dict[str, object]:
-        self._authorize(client_id, page_instance_id)
-        with self._exclusive_operation("rescan"):
-            self._authorize(client_id, page_instance_id)
+    def rescan(self, page_id: str, token: str) -> dict[str, object]:
+        with self._controller.authorized(page_id, token):
             root = self.working_directory
             try:
                 exporter_module.recover_interrupted_exports(root)
@@ -204,9 +178,12 @@ class CompanionCoordinator:
                 snapshot = LibrarySnapshot.build(root, scan_result)
                 review = ReviewService(snapshot)
             except Exception as exc:
-                LOGGER.exception("Library rescan failed; retaining the prior snapshot.")
+                LOGGER.exception(
+                    "Library rescan failed; retaining the prior snapshot."
+                )
                 raise RescanError(
-                    "The library could not be rescanned; the previous library is still active."
+                    "The library could not be rescanned; the previous library "
+                    "is still active."
                 ) from exc
 
             with self._lock:
@@ -215,28 +192,22 @@ class CompanionCoordinator:
                 self._activity_binding = None
                 return review.library_payload()
 
-    def export_preview(
-        self, client_id: str, manga_id: str, page_instance_id: str
-    ):
-        self._authorize(client_id, page_instance_id)
-        with self._exclusive_operation("export inspection"):
+    def export_preview(self, page_id: str, token: str, manga_id: str):
+        with self._controller.authorized(page_id, token):
             with self._lock:
-                self._lease.authorize(client_id, page_instance_id)
                 snapshot = self._snapshot
                 manga = snapshot.manga(manga_id).ref
             return exporter_module.inspect_export(snapshot.working_directory, manga)
 
     def export_manga(
         self,
-        client_id: str,
+        page_id: str,
+        token: str,
         manga_id: str,
         confirm_unrecognized_output: bool,
-        page_instance_id: str,
     ) -> ExportMutation:
-        self._authorize(client_id, page_instance_id)
-        with self._exclusive_operation("export"):
+        with self._controller.authorized(page_id, token):
             with self._lock:
-                self._lease.authorize(client_id, page_instance_id)
                 snapshot = self._snapshot
                 manga = snapshot.manga(manga_id).ref
 
@@ -246,7 +217,9 @@ class CompanionCoordinator:
                 confirm_unrecognized_output=confirm_unrecognized_output,
             )
             for warning in result.warnings:
-                LOGGER.warning("Export cleanup warning for %s: %s", manga.name, warning)
+                LOGGER.warning(
+                    "Export cleanup warning for %s: %s", manga.name, warning
+                )
             public_warnings = (
                 (
                     "Export succeeded, but temporary cleanup is pending. "
@@ -260,30 +233,17 @@ class CompanionCoordinator:
             )
 
     def status(self) -> CoordinatorStatus:
+        controller = self._controller.snapshot()
         with self._lock:
-            lease = self._lease.snapshot()
             return CoordinatorStatus(
-                lease.connected,
-                lease.instance_id,
-                lease.lease_expires_at,
+                controller.connected,
+                controller.page_id,
                 self._snapshot.snapshot_id,
-                self._operation,
             )
-
-    def _authorize(self, client_id: str, page_instance_id: str) -> None:
-        with self._lock:
-            self._lease.authorize(client_id, page_instance_id)
-
-    def _review_locked(
-        self, client_id: str, page_instance_id: str
-    ) -> ReviewService:
-        self._lease.authorize(client_id, page_instance_id)
-        return self._review
 
     def _require_activity_locked(
         self,
-        client_id: str,
-        page_instance_id: str,
+        page_id: str,
         activity: CompanionActivity | None,
         *,
         folder_id: str,
@@ -291,8 +251,7 @@ class CompanionCoordinator:
         binding = self._activity_binding
         if (
             binding is None
-            or binding.client_id != client_id
-            or binding.page_instance_id != page_instance_id
+            or binding.page_id != page_id
             or (activity is not None and binding.activity is not activity)
         ):
             raise WrongActivityError(
@@ -303,26 +262,3 @@ class CompanionCoordinator:
             raise WrongActivityError(
                 "This folder is outside the chosen manga activity."
             )
-
-    def _require_mutations_available_locked(self) -> None:
-        if self._operation is not None:
-            raise OperationBusyError(
-                f"The library is busy with {self._operation}. Try again shortly."
-            )
-
-    @contextmanager
-    def _exclusive_operation(self, name: str) -> Iterator[None]:
-        if not self._operation_gate.acquire(blocking=False):
-            with self._lock:
-                active = self._operation or "another operation"
-            raise OperationBusyError(
-                f"The library is busy with {active}. Try again shortly."
-            )
-        try:
-            with self._lock:
-                self._operation = name
-            yield
-        finally:
-            with self._lock:
-                self._operation = None
-            self._operation_gate.release()

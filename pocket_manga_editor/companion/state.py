@@ -1,4 +1,4 @@
-"""Shared activity and operation errors for the always-on web application."""
+"""Shared activity errors for the always-on web application."""
 
 from __future__ import annotations
 
@@ -16,10 +16,6 @@ class CoordinatorError(RuntimeError):
     """Base error for web-application coordination failures."""
 
     code = "coordinator_error"
-
-
-class OperationBusyError(CoordinatorError):
-    code = "operation_busy"
 
 
 class RescanError(CoordinatorError):

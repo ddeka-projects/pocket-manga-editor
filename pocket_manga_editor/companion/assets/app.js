@@ -1,9 +1,6 @@
 "use strict";
 
 (() => {
-  const HEARTBEAT_INTERVAL_MS = 5_000;
-  const OCCUPIED_RETRY_INTERVAL_MS = 3_000;
-  const HEARTBEAT_MAX_FAILURES = 2;
   const REQUEST_TIMEOUT_MS = 15_000;
   const EXPORT_TIMEOUT_MS = 10 * 60_000;
   const READ = "read";
@@ -11,8 +8,7 @@
 
   const ROUTES = Object.freeze({
     claim: "/api/controller/claim",
-    heartbeat: "/api/controller/heartbeat",
-    release: "/api/controller/release",
+    takeover: "/api/controller/takeover",
     library: "/api/library",
     rescan: "/api/library/rescan",
     manga: (id, activity) => (
@@ -103,14 +99,12 @@
   }
 
   const state = {
-    clientId: getClientId(),
-    pageInstanceId: createOpaqueId(),
+    pageId: createOpaqueId(),
+    controllerToken: null,
+    controllerEpoch: 0,
+    ownsControl: false,
+    connectionInterrupted: false,
     snapshotId: null,
-    leaseClaimed: false,
-    heartbeatTimer: 0,
-    heartbeatInFlight: false,
-    heartbeatFailures: 0,
-    claimRetryTimer: 0,
     stateAction: null,
     library: [],
     libraryIssueCount: 0,
@@ -147,25 +141,6 @@
     historyNavigationPending: false,
     historyChangeToken: 0,
   };
-
-  function getClientId() {
-    const storageKey = "pocket-manga-client";
-    try {
-      const existing = window.sessionStorage.getItem(storageKey);
-      if (existing && /^[A-Za-z0-9._~-]{1,128}$/.test(existing)) {
-        return existing;
-      }
-    } catch (_error) {
-      // An in-memory identity remains valid when storage is unavailable.
-    }
-    const id = createOpaqueId();
-    try {
-      window.sessionStorage.setItem(storageKey, id);
-    } catch (_error) {
-      // An in-memory identity remains valid for this document lifetime.
-    }
-    return id;
-  }
 
   function createOpaqueId() {
     if (typeof crypto.randomUUID === "function") {
@@ -243,15 +218,19 @@
       window.visualViewport.addEventListener("resize", syncSelectionFrame, { passive: true });
     }
     window.addEventListener("popstate", historyChanged);
-    document.addEventListener("visibilitychange", visibilityChanged);
-    window.addEventListener("pagehide", releaseController);
-    window.addEventListener("online", () => void bootstrap());
-    window.addEventListener("offline", () => {
-      showUnavailable("This device is offline. Reconnect to the same local network as the PC.");
-    });
   }
 
   async function requestJson(path, options = {}) {
+    const needsController = options.controller !== false;
+    const ownershipEpoch = state.controllerEpoch;
+    const controllerToken = state.controllerToken;
+    if (needsController && (!state.ownsControl || !controllerToken)) {
+      throw new ApiError(
+        "controller_required",
+        "Take control before using the library.",
+        409,
+      );
+    }
     const controller = new AbortController();
     const timeout = window.setTimeout(
       () => controller.abort(),
@@ -259,8 +238,10 @@
     );
     const headers = new Headers(options.headers || {});
     headers.set("Accept", "application/json");
-    headers.set("X-Companion-Instance", state.clientId);
-    headers.set("X-Companion-Page", state.pageInstanceId);
+    if (needsController) {
+      headers.set("X-Controller-Page", state.pageId);
+      headers.set("X-Controller-Token", controllerToken);
+    }
     let body;
     if (options.body !== undefined) {
       headers.set("Content-Type", "application/json");
@@ -288,6 +269,14 @@
           payload,
         );
       }
+      if (needsController && ownershipEpoch !== state.controllerEpoch) {
+        throw new ApiError(
+          "controller_changed",
+          "Controller ownership changed while the request was running.",
+          409,
+        );
+      }
+      state.connectionInterrupted = false;
       return payload;
     } catch (error) {
       if (error instanceof ApiError || error.name === "AbortError") {
@@ -300,14 +289,19 @@
   }
 
   async function requestImage(imageId, signal) {
+    const ownershipEpoch = state.controllerEpoch;
+    const controllerToken = state.controllerToken;
+    if (!state.ownsControl || !controllerToken) {
+      throw new ApiError("controller_required", "Take control to load images.", 409);
+    }
     let response;
     try {
       response = await fetch(ROUTES.image(imageId), {
         method: "GET",
         headers: {
           Accept: "image/avif,image/webp,image/png,image/jpeg,*/*;q=0.5",
-          "X-Companion-Instance": state.clientId,
-          "X-Companion-Page": state.pageInstanceId,
+          "X-Controller-Page": state.pageId,
+          "X-Controller-Token": controllerToken,
         },
         credentials: "same-origin",
         cache: "default",
@@ -334,6 +328,13 @@
         detail,
       );
     }
+    if (ownershipEpoch !== state.controllerEpoch) {
+      throw new ApiError(
+        "controller_changed",
+        "Controller ownership changed while the image was loading.",
+        409,
+      );
+    }
     const contentType = response.headers.get("content-type") || "";
     if (!contentType.startsWith("image/")) {
       throw new ApiError("invalid_image", "The PC returned an invalid image.");
@@ -342,195 +343,230 @@
   }
 
   async function bootstrap() {
-    clearClaimRetry();
-    stopHeartbeat();
     showState({
       kicker: "Pocket Manga",
       title: "Connecting to your PC",
       message: "Opening your library…",
       loading: true,
     });
-    await claimController();
+    await acquireController();
   }
 
-  async function claimController({ quiet = false } = {}) {
-    clearClaimRetry();
+  async function acquireController({ takeover = false, quiet = false } = {}) {
     if (!quiet) {
       showState({
         kicker: "Pocket Manga",
-        title: "Opening your library",
-        message: "Connecting to the local server…",
+        title: takeover ? "Taking control" : "Opening your library",
+        message: takeover
+          ? "Waiting for any active save to finish…"
+          : "Connecting to the local server…",
         loading: true,
       });
     }
+    const priorView = captureActiveView();
+    const uncertainCount = state.selectionPending.size + state.positionQueue.size;
     try {
-      const payload = await requestJson(ROUTES.claim, {
+      const payload = await requestJson(takeover ? ROUTES.takeover : ROUTES.claim, {
         method: "POST",
-        body: { client_id: state.clientId, page_id: state.pageInstanceId },
+        body: { page_id: state.pageId },
+        controller: false,
+        timeoutMs: takeover ? EXPORT_TIMEOUT_MS : REQUEST_TIMEOUT_MS,
       });
-      state.leaseClaimed = Boolean(payload.controller && payload.controller.claimed);
+      const controller = payload.controller || {};
+      state.controllerToken = String(controller.token || "");
+      state.ownsControl = Boolean(controller.owned && state.controllerToken);
+      state.controllerEpoch += 1;
+      state.connectionInterrupted = false;
       state.snapshotId = payload.snapshot_id || null;
-      startHeartbeat();
-      await loadLibrary();
-    } catch (error) {
-      handleSessionError(error, bootstrap);
-    }
-  }
-
-  function startHeartbeat() {
-    stopHeartbeat();
-    state.heartbeatTimer = window.setInterval(sendHeartbeat, HEARTBEAT_INTERVAL_MS);
-  }
-
-  function stopHeartbeat() {
-    if (state.heartbeatTimer) {
-      window.clearInterval(state.heartbeatTimer);
-      state.heartbeatTimer = 0;
-    }
-    state.heartbeatInFlight = false;
-    state.heartbeatFailures = 0;
-  }
-
-  async function sendHeartbeat() {
-    if (state.heartbeatInFlight || document.visibilityState === "hidden") {
-      return;
-    }
-    state.heartbeatInFlight = true;
-    try {
-      const payload = await requestJson(ROUTES.heartbeat, {
-        method: "POST",
-        body: { client_id: state.clientId, page_id: state.pageInstanceId },
-      });
-      state.heartbeatFailures = 0;
-      if (payload.snapshot_id && state.snapshotId && payload.snapshot_id !== state.snapshotId) {
-        await loadLibrary();
+      if (!state.ownsControl) {
+        throw new ApiError("controller_required", "The PC did not grant control.", 409);
+      }
+      if (takeover) {
+        discardUnconfirmedMutations();
+      }
+      updateControllerControls();
+      await loadLibrary({ drain: false });
+      if (takeover && priorView) {
+        await restoreActiveView(priorView);
+      }
+      if (takeover && uncertainCount) {
+        showActionError(
+          "Review unconfirmed changes",
+          `${uncertainCount} pending ${plural(uncertainCount, "save was", "saves were")} not replayed after control changed. The refreshed view shows what the PC actually saved.`,
+        );
       }
     } catch (error) {
-      const isTransient = !(error instanceof ApiError) || error.code === "network_error";
-      if (isTransient && ++state.heartbeatFailures <= HEARTBEAT_MAX_FAILURES) {
-        return;
-      }
-      handleSessionError(error, bootstrap);
-    } finally {
-      state.heartbeatInFlight = false;
-    }
-  }
-
-  function releaseController() {
-    if (!state.leaseClaimed) {
-      return;
-    }
-    state.leaseClaimed = false;
-    stopHeartbeat();
-    void fetch(ROUTES.release, {
-      method: "POST",
-      headers: {
-        Accept: "application/json",
-        "Content-Type": "application/json",
-        "X-Companion-Instance": state.clientId,
-        "X-Companion-Page": state.pageInstanceId,
-      },
-      body: JSON.stringify({
-        client_id: state.clientId,
-        page_id: state.pageInstanceId,
-      }),
-      credentials: "same-origin",
-      cache: "no-store",
-      keepalive: true,
-    }).catch(() => {});
-  }
-
-  async function visibilityChanged() {
-    if (document.visibilityState === "hidden") {
-      stopHeartbeat();
-      return;
-    }
-    if (!navigator.onLine) {
-      showUnavailable("This device is offline. Reconnect to the same local network as the PC.");
-      return;
-    }
-    if (state.leaseClaimed && state.snapshotId) {
-      await resumeController();
-    } else {
-      await bootstrap();
-    }
-  }
-
-  async function resumeController() {
-    try {
-      const previousSnapshotId = state.snapshotId;
-      const payload = await requestJson(ROUTES.claim, {
-        method: "POST",
-        body: { client_id: state.clientId, page_id: state.pageInstanceId },
-      });
-      state.leaseClaimed = Boolean(payload.controller && payload.controller.claimed);
-      state.snapshotId = payload.snapshot_id || null;
-      startHeartbeat();
-      if (!state.snapshotId || state.snapshotId !== previousSnapshotId) {
-        await loadLibrary();
-        return;
-      }
-      await drainPendingMutations();
-      if (
-        state.activity
-        && state.currentFolder
-        && state.currentManga
-        && state.activityManga
-      ) {
-        const activity = state.activity;
-        showActivityChoice(state.activityManga, { historyMode: "none" });
-        await chooseActivity(activity, { historyMode: "none" });
-      } else if (state.activityManga) {
-        showActivityChoice(state.activityManga, { historyMode: "none" });
+      if (error instanceof ApiError && error.code === "controller_occupied") {
+        showOccupied();
       } else {
-        showLibrary({ historyMode: "none" });
+        showUnavailable(
+          friendlyMessage(error, "The Pocket Manga server could not be reached."),
+          () => acquireController({ takeover }),
+        );
       }
-      announce("Reconnected.");
-    } catch (error) {
-      handleSessionError(error, bootstrap);
     }
   }
 
-  function handleSessionError(error, retry) {
-    const code = error instanceof ApiError ? error.code : "network_error";
-    if (code === "lease_conflict") {
-      showOccupied();
+  async function recoverConnection() {
+    if (!state.ownsControl) {
+      await acquireController({ takeover: true });
       return;
     }
+    try {
+      const payload = await requestJson(ROUTES.library);
+      if (payload.snapshot_id && state.snapshotId && payload.snapshot_id !== state.snapshotId) {
+        discardUnconfirmedMutations();
+        applyLibraryPayload(payload);
+        showActionError(
+          "Library changed",
+          "The PC library changed while disconnected. Unconfirmed saves were not replayed; review the refreshed library.",
+        );
+        return;
+      }
+      state.connectionInterrupted = false;
+      retryPendingMutations();
+      if (await drainPendingMutations()) {
+        hideActionError();
+        announce("Reconnected and pending saves confirmed.");
+      }
+    } catch (error) {
+      handleSessionError(error, recoverConnection);
+    }
+  }
+
+  function captureActiveView() {
+    const image = currentImage();
+    if (!state.activityManga) {
+      return null;
+    }
+    return {
+      mangaId: state.activityManga.id,
+      activity: state.activity,
+      folderId: state.currentFolder ? state.currentFolder.id : "",
+      imageId: image ? image.id : "",
+    };
+  }
+
+  async function restoreActiveView(view) {
+    const manga = state.library.find((candidate) => candidate.id === view.mangaId);
+    if (!manga) {
+      return;
+    }
+    showActivityChoice(manga, { historyMode: "none" });
+    if (!view.activity) {
+      return;
+    }
+    await chooseActivity(view.activity, { historyMode: "none" });
     if (
-      code === "lease_expired"
-      || code === "stale_snapshot"
-      || code === "invalid_snapshot"
+      view.folderId
+      && state.currentManga
+      && state.currentManga.folders.some((folder) => folder.id === view.folderId)
+      && (!state.currentFolder || state.currentFolder.id !== view.folderId)
     ) {
-      state.leaseClaimed = false;
-      state.snapshotId = null;
-      void bootstrap();
+      await openFolder(view.folderId, view.imageId, {
+        persist: false,
+        historyMode: "none",
+      });
+    } else if (view.imageId && state.currentFolder) {
+      const index = state.currentFolder.images.findIndex(
+        (image) => image.id === view.imageId,
+      );
+      if (index >= 0) {
+        showImage(index, { persist: false });
+      }
+    }
+  }
+
+  function discardUnconfirmedMutations() {
+    state.selectionPending.clear();
+    state.positionQueue.clear();
+    state.connectionInterrupted = false;
+    if (state.activity === EDIT) {
+      renderSelectionState(currentImage());
+    }
+  }
+
+  function loseControl(message) {
+    state.ownsControl = false;
+    state.controllerToken = null;
+    state.controllerEpoch += 1;
+    state.connectionInterrupted = false;
+    updateControllerControls();
+    const action = () => acquireController({ takeover: true });
+    if (hasVisibleAppView()) {
+      showActionError(
+        "Control moved elsewhere",
+        message || "Another page took control. This screen has been kept in place.",
+        action,
+        "Take Control",
+        false,
+      );
+    } else {
+      showOccupied();
+    }
+  }
+
+  async function handleSessionError(error, retry) {
+    const code = error instanceof ApiError ? error.code : "network_error";
+    if (["controller_occupied", "controller_required", "controller_transferred"].includes(code)) {
+      loseControl(friendlyMessage(error));
+      return;
+    }
+    if (code === "controller_changed") {
+      return;
+    }
+    if (code === "stale_snapshot" || code === "invalid_snapshot") {
+      const uncertainCount = state.selectionPending.size + state.positionQueue.size;
+      discardUnconfirmedMutations();
+      if (state.ownsControl) {
+        await loadLibrary();
+      }
+      if (uncertainCount) {
+        showActionError(
+          "Library changed",
+          "Unconfirmed saves were not replayed because their source entries are no longer in the active library snapshot.",
+        );
+      }
+      return;
+    }
+    if (hasVisibleAppView()) {
+      state.connectionInterrupted = true;
+      showActionError(
+        "Connection interrupted",
+        "This screen and any unconfirmed saves have been kept. Reconnect to the PC, then retry.",
+        recoverConnection,
+        "Retry",
+      );
+      announce("Connection interrupted. Current screen retained.");
       return;
     }
     showUnavailable(friendlyMessage(error, "The Pocket Manga server could not be reached."), retry);
   }
 
-  function showOccupied() {
-    state.leaseClaimed = false;
-    stopHeartbeat();
-    showState({
-      kicker: "Controller in use",
-      title: "Pocket Manga is open elsewhere",
-      message: "Another tab or device currently controls this library. Close it or leave the app there, then try again.",
-      loading: false,
-      actionLabel: "Try now",
-      action: bootstrap,
-      detail: "This page will retry automatically. Only one page can be active at a time.",
-    });
-    state.claimRetryTimer = window.setTimeout(
-      () => void claimController({ quiet: true }),
-      OCCUPIED_RETRY_INTERVAL_MS,
+  function hasVisibleAppView() {
+    return (
+      elements.stateScreen.hidden
+      && (!elements.libraryScreen.hidden
+        || !elements.activityScreen.hidden
+        || !elements.readerScreen.hidden)
     );
   }
 
+  function showOccupied() {
+    state.ownsControl = false;
+    state.controllerToken = null;
+    showState({
+      kicker: "Controller in use",
+      title: "Pocket Manga is open elsewhere",
+      message: "Another tab or device currently controls this library.",
+      loading: false,
+      actionLabel: "Take Control",
+      action: () => acquireController({ takeover: true }),
+      detail: "Taking control is immediate once any in-progress save or export finishes.",
+    });
+  }
+
   function showUnavailable(message, retry = bootstrap) {
-    state.leaseClaimed = false;
-    stopHeartbeat();
     showState({
       kicker: "Connection unavailable",
       title: "Can’t reach your PC",
@@ -563,16 +599,10 @@
     state.stateAction = action;
   }
 
-  function clearClaimRetry() {
-    if (state.claimRetryTimer) {
-      window.clearTimeout(state.claimRetryTimer);
-      state.claimRetryTimer = 0;
+  async function loadLibrary({ drain = true } = {}) {
+    if (drain && !(await drainPendingMutations())) {
+      return;
     }
-  }
-
-  async function loadLibrary() {
-    clearClaimRetry();
-    await drainPendingMutations();
     const requestToken = ++state.viewRequestToken;
     const epoch = ++state.activityEpoch;
     try {
@@ -595,7 +625,7 @@
   }
 
   async function rescanLibrary() {
-    if (state.rescanBusy || state.exportBusy) {
+    if (!state.ownsControl || state.rescanBusy || state.exportBusy) {
       return;
     }
     state.rescanBusy = true;
@@ -605,7 +635,13 @@
     elements.emptyRetry.disabled = true;
     hideActionError();
     showToast("Rescanning library…", 10_000);
-    await drainPendingMutations();
+    if (!(await drainPendingMutations())) {
+      state.rescanBusy = false;
+      elements.libraryRefresh.classList.remove("is-busy");
+      elements.libraryRefresh.setAttribute("aria-busy", "false");
+      updateControllerControls();
+      return;
+    }
     const requestToken = ++state.viewRequestToken;
     const epoch = ++state.activityEpoch;
     try {
@@ -633,10 +669,10 @@
       }
     } finally {
       state.rescanBusy = false;
-      elements.libraryRefresh.disabled = false;
+      elements.libraryRefresh.disabled = !state.ownsControl;
       elements.libraryRefresh.classList.remove("is-busy");
       elements.libraryRefresh.setAttribute("aria-busy", "false");
-      elements.emptyRetry.disabled = false;
+      elements.emptyRetry.disabled = !state.ownsControl;
     }
   }
 
@@ -776,13 +812,16 @@
 
   async function prepareExport() {
     const manga = state.activityManga;
-    if (!manga || state.exportBusy || state.activityOpening) {
+    if (!state.ownsControl || !manga || state.exportBusy || state.activityOpening) {
       return;
     }
     setActivityActionsDisabled(true);
     hideActionError();
     elements.exportActionDetail.textContent = "Checking current selections…";
-    await drainPendingMutations();
+    if (!(await drainPendingMutations())) {
+      setActivityActionsDisabled(false);
+      return;
+    }
     if (state.activityManga !== manga) {
       setActivityActionsDisabled(false);
       return;
@@ -922,6 +961,7 @@
     if (
       !preview
       || !manga
+      || !state.ownsControl
       || preview.mangaId !== manga.id
       || state.exportBusy
     ) {
@@ -934,7 +974,15 @@
     elements.exportCancel.disabled = true;
     elements.exportConfirm.disabled = true;
     elements.exportConfirm.textContent = "Exporting…";
-    await drainPendingMutations();
+    if (!(await drainPendingMutations())) {
+      state.exportBusy = false;
+      elements.backToLibrary.disabled = false;
+      elements.exportCancel.disabled = false;
+      elements.exportConfirm.disabled = false;
+      elements.exportConfirm.textContent = "Export";
+      setActivityActionsDisabled(false);
+      return;
+    }
     try {
       const payload = await requestJson(ROUTES.exportManga(manga.id), {
         method: "POST",
@@ -1000,15 +1048,17 @@
   }
 
   function setActivityActionsDisabled(disabled) {
-    elements.chooseRead.disabled = disabled;
-    elements.chooseEdit.disabled = disabled;
-    elements.chooseExport.disabled = disabled;
+    const blocked = disabled || !state.ownsControl;
+    elements.chooseRead.disabled = blocked;
+    elements.chooseEdit.disabled = blocked;
+    elements.chooseExport.disabled = blocked;
   }
 
   async function chooseActivity(activity, { historyMode = "push" } = {}) {
     const manga = state.activityManga;
     if (
       !manga
+      || !state.ownsControl
       || (activity !== READ && activity !== EDIT)
       || state.activityOpening
       || state.exportBusy
@@ -1019,12 +1069,14 @@
     elements.chooseRead.disabled = true;
     elements.chooseEdit.disabled = true;
     elements.chooseExport.disabled = true;
-    await drainPendingMutations();
+    if (!(await drainPendingMutations())) {
+      state.activityOpening = false;
+      setActivityActionsDisabled(false);
+      return;
+    }
     if (state.activityManga !== manga) {
       state.activityOpening = false;
-      elements.chooseRead.disabled = false;
-      elements.chooseEdit.disabled = false;
-      elements.chooseExport.disabled = false;
+      setActivityActionsDisabled(false);
       return;
     }
     const requestToken = ++state.viewRequestToken;
@@ -1089,9 +1141,7 @@
       }
     } finally {
       state.activityOpening = false;
-      elements.chooseRead.disabled = false;
-      elements.chooseEdit.disabled = false;
-      elements.chooseExport.disabled = false;
+      setActivityActionsDisabled(false);
     }
   }
 
@@ -1262,7 +1312,11 @@
         elements.selectedPicker.append(option.cloneNode(true));
       }
     }
-    elements.selectedPicker.disabled = state.activity !== EDIT || selectedImages.length === 0;
+    elements.selectedPicker.disabled = (
+      !state.ownsControl
+      || state.activity !== EDIT
+      || selectedImages.length === 0
+    );
     elements.selectedPicker.value = "";
   }
 
@@ -1277,7 +1331,7 @@
     const editing = state.activity === EDIT;
     elements.selectionFrame.hidden = !editing;
     elements.selectionZone.hidden = !editing;
-    elements.selectionZone.disabled = !editing;
+    elements.selectionZone.disabled = !editing || !state.ownsControl;
     elements.selectedPickerShell.hidden = !editing;
     elements.readerScreen.classList.toggle("chrome-hidden", !state.chromeVisible);
     elements.chromeToggle.setAttribute("aria-pressed", String(!state.chromeVisible));
@@ -1330,7 +1384,7 @@
   }
 
   function navigateImage(direction) {
-    if (state.entryNavigationPending) {
+    if (!state.ownsControl || state.entryNavigationPending) {
       return;
     }
     const folder = state.currentFolder;
@@ -1406,9 +1460,9 @@
     elements.bottomFolder.textContent = folder.name;
     elements.bottomPosition.textContent = `${state.currentImageIndex + 1} of ${folder.images.length}`;
     elements.imageDisplay.alt = `${state.currentManga ? state.currentManga.name : "Manga"}, ${folder.name}, ${image.name}`;
-    elements.selectionZone.disabled = state.activity !== EDIT;
-    elements.previousZone.disabled = false;
-    elements.nextZone.disabled = false;
+    elements.selectionZone.disabled = state.activity !== EDIT || !state.ownsControl;
+    elements.previousZone.disabled = !state.ownsControl;
+    elements.nextZone.disabled = !state.ownsControl;
   }
 
   function toggleChrome() {
@@ -1437,7 +1491,7 @@
   }
 
   function toggleCurrentSelection() {
-    if (state.activity !== EDIT) {
+    if (!state.ownsControl || state.activity !== EDIT) {
       return;
     }
     const image = currentImage();
@@ -1452,12 +1506,30 @@
     if (state.activity !== EDIT || state.selectionPending.has(image.id)) {
       return;
     }
-    state.selectionPending.set(image.id, { desired, folderId: folder.id, epoch });
+    const pending = {
+      desired,
+      folderId: folder.id,
+      epoch,
+      folder,
+      image,
+      inFlight: false,
+      ownershipEpoch: state.controllerEpoch,
+    };
+    state.selectionPending.set(image.id, pending);
     if (isCurrentImage(folder.id, image.id, epoch)) {
       renderSelectionState(currentImage());
     }
+    await commitSelection(pending);
+  }
+
+  async function commitSelection(pending) {
+    if (pending.inFlight || state.selectionPending.get(pending.image.id) !== pending) {
+      return;
+    }
+    const { folder, image, desired, epoch } = pending;
+    pending.inFlight = true;
     try {
-      const payload = await queueSelectionRequest(folder, image, desired, epoch);
+      const payload = await queueSelectionRequest(pending);
       const selection = payload.selection || {};
       const confirmed = typeof selection.selected === "boolean" ? selection.selected : desired;
       const responseRevision = nonNegativeInteger(selection.revision ?? folder.revision);
@@ -1468,7 +1540,9 @@
         selection,
         responseRevision,
       );
-      state.selectionPending.delete(image.id);
+      if (state.selectionPending.get(image.id) === pending) {
+        state.selectionPending.delete(image.id);
+      }
 
       const editingSameManga = (
         state.activity === EDIT
@@ -1510,7 +1584,21 @@
           pulseSelection("selection-pulse");
         }
       }
-    } catch {
+    } catch (error) {
+      pending.inFlight = false;
+      if (state.selectionPending.get(image.id) !== pending) {
+        return;
+      }
+      if (isUncertainSaveError(error)) {
+        state.connectionInterrupted = true;
+        if (!(error instanceof ApiError) || error.code !== "controller_changed") {
+          void handleSessionError(error, recoverConnection);
+        }
+        if (isCurrentImage(folder.id, image.id, epoch)) {
+          renderSelectionState(currentImage());
+        }
+        return;
+      }
       state.selectionPending.delete(image.id);
       const failedCurrentImage = isCurrentImage(folder.id, image.id, epoch);
       if (failedCurrentImage && state.activity === EDIT) {
@@ -1523,17 +1611,21 @@
     }
   }
 
-  function queueSelectionRequest(folder, image, desired, epoch) {
+  function queueSelectionRequest(pending) {
     const request = state.selectionRequestTail.then(() => {
-      if (epoch !== state.activityEpoch || state.activity !== EDIT) {
+      if (
+        pending.ownershipEpoch !== state.controllerEpoch
+        || state.selectionPending.get(pending.image.id) !== pending
+      ) {
         throw new ApiError(
-          "activity_changed",
-          "The activity changed before this selection could be saved.",
+          "controller_changed",
+          "Controller ownership changed before the selection could be saved.",
+          409,
         );
       }
-      return requestJson(ROUTES.editSelection(folder.id), {
+      return requestJson(ROUTES.editSelection(pending.folderId), {
         method: "PATCH",
-        body: { image_id: image.id, selected: desired },
+        body: { image_id: pending.image.id, selected: pending.desired },
       });
     });
     state.selectionRequestTail = request.catch(() => {});
@@ -1641,12 +1733,23 @@
   function queuePosition(activity, folderId, imageId, epoch) {
     const mangaId = state.currentManga ? state.currentManga.id : folderId;
     const key = `${activity}:${mangaId}`;
-    state.positionQueue.set(key, { activity, folderId, imageId, epoch });
+    state.positionQueue.set(key, {
+      activity,
+      folderId,
+      imageId,
+      epoch,
+      ownershipEpoch: state.controllerEpoch,
+    });
     ensurePositionFlush();
   }
 
   function ensurePositionFlush() {
-    if (!state.positionFlushActive && state.positionQueue.size) {
+    if (
+      !state.connectionInterrupted
+      && state.ownsControl
+      && !state.positionFlushActive
+      && state.positionQueue.size
+    ) {
       state.positionFlushPromise = flushPositionQueue().catch(() => {});
     }
     return state.positionFlushPromise;
@@ -1688,7 +1791,18 @@
             );
             updateFolderSummary(state.currentFolder);
           }
-        } catch {
+        } catch (error) {
+          const ownershipIsCurrent = pending.ownershipEpoch === state.controllerEpoch;
+          if (ownershipIsCurrent && isUncertainSaveError(error)) {
+            if (!state.positionQueue.has(key)) {
+              state.positionQueue.set(key, pending);
+            }
+            state.connectionInterrupted = true;
+            if (!(error instanceof ApiError) || error.code !== "controller_changed") {
+              void handleSessionError(error, recoverConnection);
+            }
+            break;
+          }
           const failureStillRelevant = (
             !state.positionQueue.has(key)
             && state.activity === pending.activity
@@ -1707,6 +1821,23 @@
   function drainPendingMutations() {
     const drain = state.mutationBarrierTail.then(async () => {
       while (true) {
+        if (state.connectionInterrupted || !state.ownsControl) {
+          if (state.connectionInterrupted && state.ownsControl) {
+            showActionError(
+              "Confirm pending saves",
+              "Reconnect to the PC before leaving this view or starting a filesystem operation.",
+              recoverConnection,
+              "Retry",
+              false,
+            );
+          }
+          return false;
+        }
+        for (const pending of state.selectionPending.values()) {
+          if (!pending.inFlight) {
+            void commitSelection(pending);
+          }
+        }
         const positionTail = ensurePositionFlush();
         const selectionTail = state.selectionRequestTail;
         await Promise.allSettled([positionTail, selectionTail]);
@@ -1720,12 +1851,36 @@
           && state.positionQueue.size === 0
           && state.selectionPending.size === 0
         ) {
-          return;
+          return true;
         }
       }
     });
     state.mutationBarrierTail = drain.catch(() => {});
     return drain;
+  }
+
+  function retryPendingMutations() {
+    if (!state.ownsControl) {
+      return;
+    }
+    state.connectionInterrupted = false;
+    for (const pending of state.selectionPending.values()) {
+      pending.inFlight = false;
+      void commitSelection(pending);
+    }
+    ensurePositionFlush();
+  }
+
+  function isUncertainSaveError(error) {
+    if (error && error.name === "AbortError") {
+      return true;
+    }
+    return error instanceof ApiError && [
+      "network_error",
+      "controller_required",
+      "controller_transferred",
+      "controller_changed",
+    ].includes(error.code);
   }
 
   function isCurrentImage(folderId, imageId, epoch) {
@@ -1767,6 +1922,9 @@
       })
       .catch((error) => {
         if (error.name !== "AbortError" && token === state.imageRequestToken) {
+          if (isSessionGateError(error)) {
+            void handleSessionError(error, loadCurrentImage);
+          }
           elements.imageLoading.hidden = true;
           elements.imageDisplay.classList.add("is-loading");
           elements.imageError.hidden = false;
@@ -1880,7 +2038,10 @@
       return;
     }
     state.historyNavigationPending = true;
-    await drainPendingMutations();
+    if (!(await drainPendingMutations())) {
+      state.historyNavigationPending = false;
+      return;
+    }
     window.history.back();
     window.setTimeout(() => {
       state.historyNavigationPending = false;
@@ -1889,7 +2050,9 @@
 
   async function historyChanged(event) {
     const changeToken = ++state.historyChangeToken;
-    await drainPendingMutations();
+    if (!(await drainPendingMutations())) {
+      return;
+    }
     if (changeToken !== state.historyChangeToken) {
       return;
     }
@@ -1922,17 +2085,41 @@
     }
   }
 
-  function showActionError(title, message, retry = null) {
+  function showActionError(
+    title,
+    message,
+    retry = null,
+    retryLabel = "Retry",
+    dismissible = true,
+  ) {
     state.actionRetry = retry;
     elements.actionErrorTitle.textContent = title;
     elements.actionErrorMessage.textContent = message;
     elements.actionErrorRetry.hidden = typeof retry !== "function";
+    elements.actionErrorRetry.textContent = retryLabel;
+    elements.actionErrorDismiss.hidden = !dismissible;
     elements.actionError.hidden = false;
   }
 
   function hideActionError() {
     state.actionRetry = null;
+    elements.actionErrorDismiss.hidden = false;
     elements.actionError.hidden = true;
+  }
+
+  function updateControllerControls() {
+    const disabled = !state.ownsControl;
+    elements.libraryRefresh.disabled = disabled || state.rescanBusy;
+    elements.emptyRetry.disabled = disabled || state.rescanBusy;
+    elements.chooseRead.disabled = disabled || state.activityOpening || state.exportBusy;
+    elements.chooseEdit.disabled = disabled || state.activityOpening || state.exportBusy;
+    elements.chooseExport.disabled = disabled || state.activityOpening || state.exportBusy;
+    elements.folderPicker.disabled = disabled;
+    elements.imagePicker.disabled = disabled;
+    elements.selectedPicker.disabled = disabled || state.activity !== EDIT;
+    elements.selectionZone.disabled = disabled || state.activity !== EDIT;
+    elements.previousZone.disabled = disabled || !state.currentFolder;
+    elements.nextZone.disabled = disabled || !state.currentFolder;
   }
 
   function showToast(message, duration = 1_800) {
@@ -1966,8 +2153,10 @@
       return false;
     }
     return [
-      "lease_conflict",
-      "lease_expired",
+      "controller_occupied",
+      "controller_required",
+      "controller_transferred",
+      "controller_changed",
       "stale_snapshot",
       "invalid_snapshot",
     ].includes(error.code);

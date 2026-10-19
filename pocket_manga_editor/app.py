@@ -44,7 +44,7 @@ def main() -> int:
         status = service.start()
     except Exception:
         LOGGER.exception("Pocket Manga Editor could not start its web server.")
-        coordinator.disconnect_client()
+        coordinator.clear_controller()
         return 1
     if not status.running:
         LOGGER.error(
@@ -52,7 +52,7 @@ def main() -> int:
             status.error or "unknown listener error",
         )
         service.stop()
-        coordinator.disconnect_client()
+        coordinator.clear_controller()
         return 1
 
     if recovery.recovered_count:
@@ -115,7 +115,7 @@ def main() -> int:
         except Exception:
             LOGGER.exception("The web server could not be stopped cleanly.")
             exit_code = 1
-        coordinator.disconnect_client()
+        coordinator.clear_controller()
         LOGGER.info("Pocket Manga Editor stopped.")
     return exit_code
 

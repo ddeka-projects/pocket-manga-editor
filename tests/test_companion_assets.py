@@ -188,8 +188,7 @@ class WebAssetContractTests(unittest.TestCase):
     def test_javascript_uses_only_the_web_api_and_exact_write_payloads(self) -> None:
         required_routes = {
             'claim: "/api/controller/claim"',
-            'heartbeat: "/api/controller/heartbeat"',
-            'release: "/api/controller/release"',
+            'takeover: "/api/controller/takeover"',
             'library: "/api/library"',
             'rescan: "/api/library/rescan"',
             "`/api/manga/${encodeURIComponent(id)}?activity=${encodeURIComponent(activity)}`",
@@ -206,17 +205,20 @@ class WebAssetContractTests(unittest.TestCase):
                 self.assertIn(route, self.javascript)
 
         self.assertIn(
-            'body: { client_id: state.clientId, page_id: state.pageInstanceId }',
+            'body: { page_id: state.pageId }',
             self.javascript,
         )
-        self.assertIn('body: { image_id: image.id, selected: desired }', self.javascript)
+        self.assertIn(
+            'body: { image_id: pending.image.id, selected: pending.desired }',
+            self.javascript,
+        )
         self.assertIn('body: { image_id: pending.imageId }', self.javascript)
         self.assertIn('method: "PATCH"', self.javascript)
         self.assertNotIn('method: "PUT"', self.javascript)
-        self.assertIn('"X-Companion-Instance": state.clientId', self.javascript)
-        self.assertIn('"X-Companion-Page": state.pageInstanceId', self.javascript)
-        self.assertIn("window.sessionStorage.getItem", self.javascript)
-        self.assertIn("pageInstanceId: createOpaqueId()", self.javascript)
+        self.assertIn('"X-Controller-Page": state.pageId', self.javascript)
+        self.assertIn('"X-Controller-Token": controllerToken', self.javascript)
+        self.assertNotIn("sessionStorage", self.javascript)
+        self.assertIn("pageId: createOpaqueId()", self.javascript)
         self.assertIn("showImage(index, { persist: false })", self.javascript)
         self.assertIn('view: "activity"', self.javascript)
         self.assertIn('view: "reader"', self.javascript)
@@ -253,7 +255,7 @@ class WebAssetContractTests(unittest.TestCase):
         self.assertIn("state.activity = null", show_library)
         self.assertIn("state.currentFolder = null", show_library)
         self.assertIn(
-            'await chooseActivity(activity, { historyMode: "none" })',
+            'await chooseActivity(view.activity, { historyMode: "none" })',
             self.javascript,
         )
 
@@ -291,34 +293,53 @@ class WebAssetContractTests(unittest.TestCase):
             history_change.index('historyState.view === "activity"'),
         )
 
-    def test_server_first_startup_claims_one_controller_and_retries_contention(self) -> None:
-        self.assertIn("const HEARTBEAT_INTERVAL_MS = 5_000", self.javascript)
-        self.assertIn("const OCCUPIED_RETRY_INTERVAL_MS = 3_000", self.javascript)
+    def test_server_first_startup_uses_explicit_token_ownership_and_takeover(self) -> None:
+        self.assertNotIn("HEARTBEAT_INTERVAL", self.javascript)
+        self.assertNotIn("/api/controller/heartbeat", self.javascript)
 
         bootstrap = self.javascript.split(
             "async function bootstrap() {", 1
-        )[1].split("async function claimController", 1)[0]
-        self.assertIn("await claimController()", bootstrap)
+        )[1].split("async function acquireController", 1)[0]
+        self.assertIn("await acquireController()", bootstrap)
         self.assertNotIn("ROUTES.status", bootstrap)
         self.assertNotIn("pair", bootstrap.lower())
 
         occupied = self.javascript.split(
             "function showOccupied() {", 1
         )[1].split("function showUnavailable", 1)[0]
-        self.assertIn("Only one page can be active at a time.", occupied)
-        self.assertIn("OCCUPIED_RETRY_INTERVAL_MS", occupied)
-        self.assertIn("claimController({ quiet: true })", occupied)
+        self.assertIn("Take Control", occupied)
+        self.assertIn("acquireController({ takeover: true })", occupied)
+        self.assertNotIn("setTimeout", occupied)
 
-        self.assertIn(
-            'window.addEventListener("pagehide", releaseController)',
-            self.javascript,
-        )
-        release = self.javascript.split(
-            "function releaseController() {", 1
-        )[1].split("async function visibilityChanged", 1)[0]
-        self.assertIn("keepalive: true", release)
-        self.assertNotIn("positionFlushActive", release)
-        self.assertNotIn("selectionPending", release)
+        self.assertNotIn('window.addEventListener("pagehide"', self.javascript)
+        self.assertNotIn('window.addEventListener("offline"', self.javascript)
+        self.assertNotIn('window.addEventListener("visibilitychange"', self.javascript)
+        self.assertIn("controllerToken: null", self.javascript)
+        self.assertIn("controllerEpoch: 0", self.javascript)
+        self.assertIn("ownershipEpoch !== state.controllerEpoch", self.javascript)
+
+    def test_network_interruptions_retain_ui_and_unconfirmed_mutations(self) -> None:
+        session_error = self.javascript.split(
+            "async function handleSessionError(error, retry) {", 1
+        )[1].split("function showOccupied", 1)[0]
+        self.assertIn("Current screen retained", session_error)
+        self.assertIn("state.connectionInterrupted = true", session_error)
+        self.assertNotIn("showState({", session_error)
+        self.assertNotIn("clearReaderMedia", session_error)
+
+        selection = self.javascript.split(
+            "async function commitSelection(pending) {", 1
+        )[1].split("function queueSelectionRequest", 1)[0]
+        uncertain_branch = selection.split("if (isUncertainSaveError(error))", 1)[1]
+        self.assertNotIn("state.selectionPending.delete", uncertain_branch.split("return;", 1)[0])
+        self.assertIn("recoverConnection", uncertain_branch)
+
+        position = self.javascript.split(
+            "async function flushPositionQueue() {", 1
+        )[1].split("function drainPendingMutations", 1)[0]
+        self.assertIn("state.positionQueue.set(key, pending)", position)
+        self.assertIn("isUncertainSaveError(error)", position)
+        self.assertIn("retryPendingMutations", self.javascript)
 
     def test_rescan_drains_writes_and_replaces_the_library_snapshot(self) -> None:
         rescan = self.javascript.split(
@@ -332,7 +353,7 @@ class WebAssetContractTests(unittest.TestCase):
         self.assertIn("body: {}", rescan)
         self.assertIn("applyLibraryPayload(payload)", rescan)
         self.assertIn('elements.libraryRefresh.disabled = true', rescan)
-        self.assertIn('elements.libraryRefresh.disabled = false', rescan)
+        self.assertIn('elements.libraryRefresh.disabled = !state.ownsControl', rescan)
         self.assertIn(
             'elements.libraryRefresh.addEventListener("click", () => void rescanLibrary())',
             self.javascript,

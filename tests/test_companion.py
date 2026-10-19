@@ -16,11 +16,12 @@ from pocket_manga_editor.companion.api import (
     StreamingBody,
 )
 from pocket_manga_editor.companion.coordinator import CompanionCoordinator
-from pocket_manga_editor.companion.lease import (
-    ControllerLease,
-    LeaseConflictError,
-    LeaseError,
-    LeaseExpiredError,
+from pocket_manga_editor.companion.controller import (
+    ControllerError,
+    ControllerOccupiedError,
+    ControllerOwnership,
+    ControllerRequiredError,
+    ControllerTransferredError,
 )
 from pocket_manga_editor.companion.review import ReviewSaveError, ReviewService
 from pocket_manga_editor.companion.server import CompanionHTTPService
@@ -31,24 +32,12 @@ from pocket_manga_editor.companion.snapshot import (
 )
 from pocket_manga_editor.companion.state import (
     CompanionActivity,
-    OperationBusyError,
     RescanError,
     WrongActivityError,
 )
 from pocket_manga_editor.scanner import ScanError, scan_working_directory
 from pocket_manga_editor.storage import EditingStore, ReadingSnapshot, ReadingStore
 from pocket_manga_editor.workspace import manga_workspace_paths
-
-
-class FakeClock:
-    def __init__(self, value: float = 1_000.0) -> None:
-        self.value = value
-
-    def __call__(self) -> float:
-        return self.value
-
-    def advance(self, seconds: float) -> None:
-        self.value += seconds
 
 
 class CompanionFixture(unittest.TestCase):
@@ -92,47 +81,40 @@ class CompanionFixture(unittest.TestCase):
         )
 
 
-class ControllerLeaseTests(unittest.TestCase):
-    def test_one_exact_page_owns_and_renews_the_lease(self) -> None:
-        clock = FakeClock()
-        lease = ControllerLease(ttl_seconds=15, clock=clock)
-        claimed = lease.claim("browser", "page-one")
-        self.assertTrue(claimed.connected)
-        self.assertEqual(claimed.lease_expires_at, 1_015)
-        with self.assertRaises(LeaseConflictError):
-            lease.claim("browser", "page-two")
-        with self.assertRaises(LeaseConflictError):
-            lease.claim("other-browser", "page-one")
-        clock.advance(5)
-        self.assertEqual(
-            lease.heartbeat("browser", "page-one").lease_expires_at,
-            1_020,
-        )
+class ControllerOwnershipTests(unittest.TestCase):
+    def test_one_page_owns_until_explicit_release_or_takeover(self) -> None:
+        ownership = ControllerOwnership()
+        first = ownership.claim("page-one")
+        self.assertTrue(ownership.snapshot().connected)
+        with ownership.authorized(first.page_id, first.token):
+            pass
+        with self.assertRaises(ControllerOccupiedError):
+            ownership.claim("page-two")
 
-    def test_any_page_can_claim_immediately_after_expiry_or_release(self) -> None:
-        clock = FakeClock()
-        lease = ControllerLease(ttl_seconds=15, clock=clock)
-        lease.claim("first", "page")
-        clock.advance(15)
-        self.assertEqual(lease.claim("second", "page").instance_id, "second")
-        lease.release("second", "page")
-        self.assertEqual(lease.claim("third", "page").instance_id, "third")
-        lease.release("third", "page")
-        lease.release("third", "page")
+        second = ownership.claim("page-two", takeover=True)
+        with self.assertRaises(ControllerTransferredError):
+            with ownership.authorized(first.page_id, first.token):
+                pass
+        with ownership.authorized(second.page_id, second.token):
+            pass
 
-    def test_expired_wrong_and_invalid_identifiers_fail_closed(self) -> None:
-        clock = FakeClock()
-        lease = ControllerLease(ttl_seconds=15, clock=clock)
-        lease.claim("browser", "page")
-        with self.assertRaises(LeaseConflictError):
-            lease.authorize("browser", "other-page")
-        clock.advance(15)
-        with self.assertRaises(LeaseExpiredError):
-            lease.authorize("browser", "page")
-        with self.assertRaises(LeaseError):
-            lease.claim("bad id", "page")
-        with self.assertRaises(LeaseError):
-            lease.claim("browser", "")
+        ownership.release(second.page_id, second.token)
+        with self.assertRaises(ControllerRequiredError):
+            with ownership.authorized(second.page_id, second.token):
+                pass
+
+    def test_reclaim_rotates_token_and_invalid_identifiers_fail_closed(self) -> None:
+        ownership = ControllerOwnership()
+        first = ownership.claim("same-page")
+        second = ownership.claim("same-page")
+        self.assertNotEqual(first.token, second.token)
+        with self.assertRaises(ControllerTransferredError):
+            with ownership.authorized(first.page_id, first.token):
+                pass
+        with self.assertRaises(ControllerError):
+            ownership.claim("bad id")
+        with self.assertRaises(ControllerError):
+            ownership.claim("")
 
 
 class LibrarySnapshotTests(CompanionFixture):
@@ -289,37 +271,37 @@ class ReviewPersistenceTests(CompanionFixture):
 
 
 class CoordinatorTests(CompanionFixture):
-    CLIENT = "browser"
     PAGE = "page"
 
     def setUp(self) -> None:
         super().setUp()
         self.coordinator = CompanionCoordinator(self.root, self.scan_result)
-        self.coordinator.claim_controller(self.CLIENT, self.PAGE)
+        self.grant = self.coordinator.claim_controller(self.PAGE)
+        self.token = self.grant.token
 
-    def test_always_active_coordinator_persists_review_and_keeps_lease_on_error(self) -> None:
+    def test_always_active_coordinator_persists_review_and_keeps_controller_on_error(self) -> None:
         snapshot_id = self.coordinator.status().snapshot_id
-        library = self.coordinator.library(self.CLIENT, self.PAGE)
+        library = self.coordinator.library(self.PAGE, self.token)
         self.assertEqual(library["snapshot_id"], snapshot_id)
         manga_id = library["mangas"][0]["id"]
         manga = self.coordinator.open_manga(
-            self.CLIENT, manga_id, CompanionActivity.EDIT, self.PAGE
+            self.PAGE, self.token, manga_id, CompanionActivity.EDIT
         )["manga"]
         folder_id = manga["folders"][0]["id"]
         image_id = self.coordinator.folder(
-            self.CLIENT, folder_id, CompanionActivity.EDIT, self.PAGE
+            self.PAGE, self.token, folder_id, CompanionActivity.EDIT
         )["folder"]["images"][0]["id"]
         with patch.object(EditingStore, "set_selection", side_effect=OSError("disk")):
             with self.assertRaises(ReviewSaveError):
                 self.coordinator.set_selection(
-                    self.CLIENT,
+                    self.PAGE,
+                    self.token,
                     CompanionActivity.EDIT,
                     folder_id,
                     image_id,
                     True,
-                    self.PAGE,
                 )
-        self.assertTrue(self.coordinator.status().active_client)
+        self.assertTrue(self.coordinator.status().active_controller)
         self.assertEqual(self.coordinator.status().snapshot_id, snapshot_id)
 
     def test_rescan_swaps_only_a_complete_snapshot_and_retains_controller(self) -> None:
@@ -333,85 +315,108 @@ class CoordinatorTests(CompanionFixture):
             patch("pocket_manga_editor.companion.coordinator.LOGGER.exception"),
         ):
             with self.assertRaises(RescanError):
-                self.coordinator.rescan(self.CLIENT, self.PAGE)
+                self.coordinator.rescan(self.PAGE, self.token)
         self.assertEqual(self.coordinator.status().snapshot_id, original)
-        self.assertEqual(len(self.coordinator.library(self.CLIENT, self.PAGE)["mangas"]), 2)
+        self.assertEqual(len(self.coordinator.library(self.PAGE, self.token)["mangas"]), 2)
 
-        library = self.coordinator.rescan(self.CLIENT, self.PAGE)
+        library = self.coordinator.rescan(self.PAGE, self.token)
         self.assertNotEqual(library["snapshot_id"], original)
         self.assertEqual(len(library["mangas"]), 3)
-        self.assertTrue(self.coordinator.status().active_client)
+        self.assertTrue(self.coordinator.status().active_controller)
 
-    def test_long_operation_blocks_writes_but_not_heartbeat(self) -> None:
-        library = self.coordinator.library(self.CLIENT, self.PAGE)
+    def test_takeover_waits_for_an_authorized_durable_operation(self) -> None:
+        library = self.coordinator.library(self.PAGE, self.token)
         manga_id = library["mangas"][0]["id"]
         manga = self.coordinator.open_manga(
-            self.CLIENT, manga_id, CompanionActivity.EDIT, self.PAGE
+            self.PAGE, self.token, manga_id, CompanionActivity.EDIT
         )["manga"]
         folder_id = manga["folders"][0]["id"]
-        image_id = self.coordinator.folder(
-            self.CLIENT, folder_id, CompanionActivity.EDIT, self.PAGE
-        )["folder"]["images"][0]["id"]
+        folder = self.coordinator.folder(
+            self.PAGE, self.token, folder_id, CompanionActivity.EDIT
+        )["folder"]
+        image_id = folder["images"][0]["id"]
         started = threading.Event()
         finish = threading.Event()
+        takeover_done = threading.Event()
+        original_save = EditingStore.set_selection
 
-        def blocked_preview(*_args):
+        def blocked_save(store, *args, **kwargs):
             started.set()
             self.assertTrue(finish.wait(2))
-            return type(
-                "Preview",
-                (),
-                {
-                    "selected_folder_count": 0,
-                    "selected_image_count": 0,
-                    "output_exists": False,
-                    "unrecognized_entries": (),
-                },
-            )()
+            return original_save(store, *args, **kwargs)
 
         failures: list[BaseException] = []
 
-        def inspect() -> None:
+        def save_selection() -> None:
             try:
-                self.coordinator.export_preview(self.CLIENT, manga_id, self.PAGE)
-            except BaseException as exc:
-                failures.append(exc)
-
-        with patch(
-            "pocket_manga_editor.companion.coordinator.exporter_module.inspect_export",
-            side_effect=blocked_preview,
-        ):
-            thread = threading.Thread(target=inspect)
-            thread.start()
-            self.assertTrue(started.wait(1))
-            self.assertTrue(
-                self.coordinator.heartbeat_controller(self.CLIENT, self.PAGE).connected
-            )
-            with self.assertRaises(OperationBusyError):
                 self.coordinator.set_selection(
-                    self.CLIENT,
+                    self.PAGE,
+                    self.token,
                     CompanionActivity.EDIT,
                     folder_id,
                     image_id,
                     True,
-                    self.PAGE,
                 )
+            except BaseException as exc:
+                failures.append(exc)
+
+        replacement: list[str] = []
+
+        def takeover() -> None:
+            try:
+                replacement.append(
+                    self.coordinator.claim_controller(
+                        "other-page", takeover=True
+                    ).token
+                )
+            except BaseException as exc:
+                failures.append(exc)
+            finally:
+                takeover_done.set()
+
+        with patch.object(
+            EditingStore,
+            "set_selection",
+            autospec=True,
+            side_effect=blocked_save,
+        ):
+            thread = threading.Thread(target=save_selection)
+            thread.start()
+            self.assertTrue(started.wait(1))
+            takeover_thread = threading.Thread(target=takeover)
+            takeover_thread.start()
+            self.assertFalse(takeover_done.wait(0.05))
             finish.set()
             thread.join(2)
+            takeover_thread.join(2)
         self.assertFalse(thread.is_alive())
+        self.assertFalse(takeover_thread.is_alive())
         self.assertEqual(failures, [])
+        self.assertEqual(len(replacement), 1)
+        with self.assertRaises(ControllerTransferredError):
+            self.coordinator.library(self.PAGE, self.token)
+        self.assertEqual(
+            len(self.coordinator.library("other-page", replacement[0])["mangas"]),
+            2,
+        )
+        selected = EditingStore(self.root).load(self.scan_result.mangas[0])
+        self.assertEqual(
+            selected.folders[self.scan_result.mangas[0].folders[0].name].selected_images,
+            frozenset({"1.jpg"}),
+        )
 
 
 class CompanionAPITests(CompanionFixture):
     HOST = "desktop.local:8787"
     ORIGIN = "http://desktop.local:8787"
-    CLIENT = "browser-home-screen"
     PAGE = "page-instance-one"
 
     def setUp(self) -> None:
         super().setUp()
         self.coordinator = CompanionCoordinator(self.root, self.scan_result)
         self.api = CompanionAPI(self.coordinator, allowed_hosts={"desktop.local"})
+        self.controller_page = self.PAGE
+        self.controller_token = "x" * 43
 
     @staticmethod
     def payload(response: APIResponse) -> dict[str, object]:
@@ -427,8 +432,8 @@ class CompanionAPITests(CompanionFixture):
     ) -> dict[str, str]:
         headers = {"Host": host or self.HOST}
         if controller:
-            headers["X-Companion-Instance"] = self.CLIENT
-            headers["X-Companion-Page"] = self.PAGE
+            headers["X-Controller-Page"] = self.controller_page
+            headers["X-Controller-Token"] = self.controller_token
         if content_type is not None:
             headers["Content-Type"] = content_type
         if origin is not None:
@@ -455,13 +460,21 @@ class CompanionAPITests(CompanionFixture):
             client_address="192.168.1.25",
         )
 
-    def claim(self, client: str | None = None, page: str | None = None) -> APIResponse:
-        return self.json_request(
+    def claim(
+        self, page: str | None = None, *, takeover: bool = False
+    ) -> APIResponse:
+        page_id = page or self.PAGE
+        response = self.json_request(
             "POST",
-            "/api/controller/claim",
-            {"client_id": client or self.CLIENT, "page_id": page or self.PAGE},
+            "/api/controller/takeover" if takeover else "/api/controller/claim",
+            {"page_id": page_id},
             controller=False,
         )
+        if response.status == 200:
+            controller = self.payload(response)["controller"]
+            self.controller_page = str(controller["page_id"])
+            self.controller_token = str(controller["token"])
+        return response
 
     def get(self, target: str) -> APIResponse:
         return self.api.handle(
@@ -477,7 +490,7 @@ class CompanionAPITests(CompanionFixture):
         self.assertEqual(response.status, 200)
         return self.payload(response)
 
-    def test_status_and_claim_are_open_but_every_library_route_needs_lease(self) -> None:
+    def test_status_and_claim_are_open_but_every_library_route_needs_controller(self) -> None:
         status = self.api.handle(
             "GET",
             "/api/status",
@@ -488,7 +501,7 @@ class CompanionAPITests(CompanionFixture):
         self.assertEqual(self.payload(status)["status"], {"server": "available"})
         unclaimed = self.get("/api/library")
         self.assertEqual(unclaimed.status, 409)
-        self.assertEqual(self.payload(unclaimed)["error"]["code"], "lease_expired")
+        self.assertEqual(self.payload(unclaimed)["error"]["code"], "controller_required")
         self.assertEqual(self.claim().status, 200)
         self.assertEqual(self.get("/api/library").status, 200)
         self.assertEqual(
@@ -496,31 +509,46 @@ class CompanionAPITests(CompanionFixture):
             404,
         )
 
-    def test_claim_heartbeat_contention_release_and_exact_bodies(self) -> None:
+    def test_claim_takeover_release_and_exact_bodies(self) -> None:
         malformed = self.json_request(
             "POST",
             "/api/controller/claim",
-            {"client_id": self.CLIENT, "page_id": self.PAGE, "extra": True},
+            {"page_id": self.PAGE, "extra": True},
             controller=False,
         )
         self.assertEqual(malformed.status, 400)
         claimed = self.claim()
         self.assertEqual(claimed.status, 200)
         self.assertEqual(self.payload(claimed)["controller"]["page_id"], self.PAGE)
-        blocked = self.claim("second-browser", "second-page")
+        first_token = self.controller_token
+        blocked = self.claim("second-page")
         self.assertEqual(blocked.status, 423)
-        self.assertEqual(self.payload(blocked)["error"]["code"], "lease_conflict")
+        self.assertEqual(self.payload(blocked)["error"]["code"], "controller_occupied")
         heartbeat = self.json_request(
             "POST",
             "/api/controller/heartbeat",
-            {"client_id": self.CLIENT, "page_id": self.PAGE},
+            {"page_id": self.PAGE},
             controller=False,
         )
-        self.assertEqual(heartbeat.status, 200)
+        self.assertEqual(heartbeat.status, 404)
+
+        taken = self.claim("second-page", takeover=True)
+        self.assertEqual(taken.status, 200)
+        second_token = self.controller_token
+        self.controller_page = self.PAGE
+        self.controller_token = first_token
+        stale = self.get("/api/library")
+        self.assertEqual(stale.status, 423)
+        self.assertEqual(
+            self.payload(stale)["error"]["code"], "controller_transferred"
+        )
+        self.controller_page = "second-page"
+        self.controller_token = second_token
+        self.assertEqual(self.get("/api/library").status, 200)
         released = self.json_request(
             "POST",
             "/api/controller/release",
-            {"client_id": self.CLIENT, "page_id": self.PAGE},
+            {"page_id": "second-page", "token": second_token},
             controller=False,
         )
         self.assertEqual(released.status, 200)
@@ -531,7 +559,7 @@ class CompanionAPITests(CompanionFixture):
         response = self.api.handle(
             "GET",
             "/api/library",
-            {"Host": self.HOST, "X-Companion-Instance": self.CLIENT},
+            {"Host": self.HOST, "X-Controller-Page": self.PAGE},
             client_address="192.168.1.25",
         )
         self.assertEqual(response.status, 400)
@@ -615,7 +643,7 @@ class CompanionAPITests(CompanionFixture):
         self.assertEqual(stale.status, 409)
         self.assertEqual(self.payload(stale)["error"]["code"], "wrong_activity")
 
-    def test_images_are_lease_protected_validated_and_privately_cacheable(self) -> None:
+    def test_images_are_controller_protected_validated_and_privately_cacheable(self) -> None:
         self.assertEqual(self.claim().status, 200)
         manga = self.open_activity("read")["manga"]
         folder_id = manga["folders"][0]["id"]
@@ -677,7 +705,7 @@ class CompanionAPITests(CompanionFixture):
                 content_type="application/json",
                 origin="http://attacker.example",
             ),
-            json.dumps({"client_id": self.CLIENT, "page_id": self.PAGE}).encode(),
+            json.dumps({"page_id": self.PAGE}).encode(),
             client_address="192.168.1.25",
         )
         wrong_type = self.api.handle(
@@ -688,7 +716,7 @@ class CompanionAPITests(CompanionFixture):
                 content_type="text/plain",
                 origin=self.ORIGIN,
             ),
-            json.dumps({"client_id": self.CLIENT, "page_id": self.PAGE}).encode(),
+            json.dumps({"page_id": self.PAGE}).encode(),
             client_address="192.168.1.25",
         )
         self.assertEqual(cross_origin.status, 403)
@@ -758,7 +786,7 @@ class CompanionAPITests(CompanionFixture):
         self.assertEqual(result["selected_image_count"], 1)
         self.assertFalse(outsider.exists())
 
-    def test_rescan_returns_new_library_keeps_lease_and_retains_old_on_failure(self) -> None:
+    def test_rescan_returns_new_library_keeps_controller_and_retains_old_on_failure(self) -> None:
         claimed = self.payload(self.claim())
         previous = claimed["snapshot_id"]
         self.add_image("Series Three", "New", "1.jpg", b"new")
@@ -886,8 +914,8 @@ class CompanionHTTPServiceTests(CompanionFixture):
             response = connection.getresponse()
             shell = response.read()
             self.assertEqual(response.status, 200)
-            self.assertIn(b"/assets/app.js?v=always-on-web-v1", shell)
-            self.assertIn(b"/assets/styles.css?v=always-on-web-v1", shell)
+            self.assertIn(b"/assets/app.js?v=explicit-controller-v2", shell)
+            self.assertIn(b"/assets/styles.css?v=explicit-controller-v2", shell)
             self.assertIn(
                 "default-src 'self'",
                 response.getheader("Content-Security-Policy") or "",

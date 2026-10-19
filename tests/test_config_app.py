@@ -257,7 +257,7 @@ class ApplicationBootstrapTests(unittest.TestCase):
         )
         service.start.assert_called_once_with()
         service.stop.assert_called_once_with(timeout=10.0)
-        coordinator.disconnect_client.assert_called_once_with()
+        coordinator.clear_controller.assert_called_once_with()
         self.assertEqual(stop_event.wait_calls, 1)
 
     def test_unexpected_server_stop_returns_failure_and_still_cleans_up(self) -> None:
@@ -297,7 +297,7 @@ class ApplicationBootstrapTests(unittest.TestCase):
 
         self.assertEqual(result, 1)
         service.stop.assert_called_once_with(timeout=10.0)
-        coordinator.disconnect_client.assert_called_once_with()
+        coordinator.clear_controller.assert_called_once_with()
 
 
 class WindowsLauncherContractTests(unittest.TestCase):

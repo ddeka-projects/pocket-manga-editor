@@ -24,7 +24,12 @@ from ..exporter import (
     NothingSelectedError,
 )
 from .coordinator import CompanionCoordinator
-from .lease import LeaseConflictError, LeaseError, LeaseExpiredError
+from .controller import (
+    ControllerError,
+    ControllerOccupiedError,
+    ControllerRequiredError,
+    ControllerTransferredError,
+)
 from .review import (
     PositionMutation,
     ReviewError,
@@ -36,7 +41,6 @@ from .snapshot import MissingImageError, SnapshotError
 from .state import (
     CompanionActivity,
     CoordinatorError,
-    OperationBusyError,
     RescanError,
 )
 
@@ -148,45 +152,42 @@ class CompanionAPI:
                 return self._json(200, {"status": {"server": "available"}})
 
             if method == "POST" and segments == ["api", "controller", "claim"]:
-                client_id, page_id = self._controller_body(headers, body)
-                lease = self.coordinator.claim_controller(client_id, page_id)
+                page_id = self._claim_body(headers, body)
+                grant = self.coordinator.claim_controller(page_id)
                 return self._json(
                     200,
                     {
                         "controller": {
-                            "claimed": True,
-                            "client_id": client_id,
-                            "page_id": page_id,
-                            "lease_expires_at": lease.lease_expires_at,
+                            "owned": True,
+                            "page_id": grant.page_id,
+                            "token": grant.token,
                         },
                         "snapshot_id": self.coordinator.status().snapshot_id,
                     },
                 )
 
-            if method == "POST" and segments == ["api", "controller", "heartbeat"]:
-                client_id, page_id = self._controller_body(headers, body)
-                lease = self.coordinator.heartbeat_controller(client_id, page_id)
+            if method == "POST" and segments == ["api", "controller", "takeover"]:
+                page_id = self._claim_body(headers, body)
+                grant = self.coordinator.claim_controller(page_id, takeover=True)
                 return self._json(
                     200,
                     {
                         "controller": {
-                            "claimed": True,
-                            "client_id": client_id,
-                            "page_id": page_id,
-                            "lease_expires_at": lease.lease_expires_at,
+                            "owned": True,
+                            "page_id": grant.page_id,
+                            "token": grant.token,
                         },
                         "snapshot_id": self.coordinator.status().snapshot_id,
                     },
                 )
 
             if method == "POST" and segments == ["api", "controller", "release"]:
-                client_id, page_id = self._controller_body(headers, body)
-                self.coordinator.release_controller(client_id, page_id)
+                page_id, token = self._release_body(headers, body)
+                self.coordinator.release_controller(page_id, token)
                 return self._json(
                     200,
                     {
                         "released": True,
-                        "client_id": client_id,
                         "page_id": page_id,
                     },
                 )
@@ -255,27 +256,27 @@ class CompanionAPI:
                     404, "not_found", "The requested API route does not exist."
                 )
 
-            client_id, page_id = self._controller_from_headers(headers)
+            page_id, token = self._controller_from_headers(headers)
             if is_library:
                 return self._json(
-                    200, self.coordinator.library(client_id, page_id)
+                    200, self.coordinator.library(page_id, token)
                 )
             if is_rescan:
                 payload = self._json_body(headers, body)
                 self._require_keys(payload, set())
-                library = self.coordinator.rescan(client_id, page_id)
+                library = self.coordinator.rescan(page_id, token)
                 return self._json(200, {"rescanned": True, **library})
             if is_manga:
                 activity = self._activity_query(parsed_target.query)
                 return self._json(
                     200,
                     self.coordinator.open_manga(
-                        client_id, segments[2], activity, page_id
+                        page_id, token, segments[2], activity
                     ),
                 )
             if is_export_preview:
                 preview = self.coordinator.export_preview(
-                    client_id, segments[2], page_id
+                    page_id, token, segments[2]
                 )
                 unrecognized = [
                     str(value) for value in preview.unrecognized_entries
@@ -302,7 +303,7 @@ class CompanionAPI:
                         "confirm_unrecognized_output must be a boolean."
                     )
                 mutation = self.coordinator.export_manga(
-                    client_id, segments[2], confirmed, page_id
+                    page_id, token, segments[2], confirmed
                 )
                 return self._json(
                     200,
@@ -316,11 +317,11 @@ class CompanionAPI:
                 return self._json(
                     200,
                     self.coordinator.folder(
-                        client_id, segments[2], activity, page_id
+                        page_id, token, segments[2], activity
                     ),
                 )
             if is_image:
-                return self._image(client_id, page_id, segments[2], headers)
+                return self._image(page_id, token, segments[2], headers)
 
             payload = self._json_body(headers, body)
             self._require_keys(
@@ -334,11 +335,11 @@ class CompanionAPI:
             activity = CompanionActivity(segments[1])
             if is_position_write:
                 mutation = self.coordinator.set_position(
-                    client_id,
+                    page_id,
+                    token,
                     activity,
                     folder_id,
                     image_id,
-                    page_id,
                 )
                 return self._json(200, {"position": self._position(mutation)})
 
@@ -346,12 +347,12 @@ class CompanionAPI:
             if not isinstance(selected, bool):
                 raise RequestError("selected must be a boolean.")
             mutation = self.coordinator.set_selection(
-                client_id,
+                page_id,
+                token,
                 activity,
                 folder_id,
                 image_id,
                 selected,
-                page_id,
             )
             return self._json(200, {"selection": self._selection(mutation)})
         except Exception as exc:
@@ -397,13 +398,13 @@ class CompanionAPI:
 
     def _image(
         self,
-        client_id: str,
-        page_instance_id: str,
+        page_id: str,
+        token: str,
         image_id: str,
         headers: Mapping[str, str],
     ) -> APIResponse:
         snapshot, image = self.coordinator.image_for_delivery(
-            client_id, image_id, page_instance_id
+            page_id, token, image_id
         )
         source = Path(image.ref.path)
         extension = source.suffix.casefold()
@@ -438,14 +439,19 @@ class CompanionAPI:
             body,
         )
 
-    def _controller_body(
+    def _claim_body(self, headers: Mapping[str, str], body: bytes) -> str:
+        payload = self._json_body(headers, body)
+        self._require_keys(payload, {"page_id"})
+        return self._required_string(payload, "page_id", maximum=128)
+
+    def _release_body(
         self, headers: Mapping[str, str], body: bytes
     ) -> tuple[str, str]:
         payload = self._json_body(headers, body)
-        self._require_keys(payload, {"client_id", "page_id"})
+        self._require_keys(payload, {"page_id", "token"})
         return (
-            self._required_string(payload, "client_id", maximum=128),
             self._required_string(payload, "page_id", maximum=128),
+            self._required_string(payload, "token", maximum=128),
         )
 
     def _json_body(
@@ -509,13 +515,13 @@ class CompanionAPI:
     def _controller_from_headers(
         self, headers: Mapping[str, str]
     ) -> tuple[str, str]:
-        client_id = self._header(headers, "X-Companion-Instance")
-        if not client_id:
-            raise RequestError("X-Companion-Instance is required.")
-        page_instance_id = self._header(headers, "X-Companion-Page")
-        if not page_instance_id:
-            raise RequestError("X-Companion-Page is required.")
-        return client_id, page_instance_id
+        page_id = self._header(headers, "X-Controller-Page")
+        if not page_id:
+            raise RequestError("X-Controller-Page is required.")
+        token = self._header(headers, "X-Controller-Token")
+        if not token:
+            raise RequestError("X-Controller-Token is required.")
+        return page_id, token
 
     @staticmethod
     def _require_keys(
@@ -631,11 +637,13 @@ class CompanionAPI:
     def _exception_response(self, exc: BaseException) -> APIResponse:
         if isinstance(exc, RequestError):
             return self._error(exc.http_status, exc.code, str(exc))
-        if isinstance(exc, LeaseConflictError):
+        if isinstance(exc, ControllerOccupiedError):
             return self._error(423, exc.code, str(exc))
-        if isinstance(exc, LeaseExpiredError):
+        if isinstance(exc, ControllerRequiredError):
             return self._error(409, exc.code, str(exc))
-        if isinstance(exc, LeaseError):
+        if isinstance(exc, ControllerTransferredError):
+            return self._error(423, exc.code, str(exc))
+        if isinstance(exc, ControllerError):
             return self._error(400, exc.code, str(exc))
         if isinstance(exc, SnapshotError):
             return self._error(404, exc.code, str(exc))
@@ -650,8 +658,6 @@ class CompanionAPI:
             return self._error(409, exc.code, str(exc))
         if isinstance(exc, ReviewError):
             return self._error(400, exc.code, str(exc))
-        if isinstance(exc, OperationBusyError):
-            return self._error(409, exc.code, str(exc))
         if isinstance(exc, RescanError):
             return self._error(503, exc.code, str(exc))
         if isinstance(exc, ExportBusyError):

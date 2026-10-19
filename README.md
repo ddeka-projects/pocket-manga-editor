@@ -7,7 +7,7 @@ iPhone Home Screen app or a browser on the PC.
 
 There is no desktop GUI, account, cloud service, or permanent phone pairing.
 Any device on the trusted private LAN can open the app, and one browser page at
-a time owns the controller lease.
+a time owns an explicit controller token.
 
 ## Source library
 
@@ -136,10 +136,18 @@ the lower middle area toggles selection; tapping the center shows or hides the
 controls.
 
 Only one browser page can control the library at a time. Closing or navigating
-away releases ownership when the browser reports it. If that signal is lost,
-the in-memory heartbeat lease expires automatically after a short timeout. A
-server restart also clears ownership. There is no paired-device credential;
-the trusted private LAN is the authorization boundary.
+away does not depend on an unreliable browser shutdown signal: ownership stays
+with that page until another page chooses **Take Control** or the server
+restarts. Takeover is immediate after any save or export already being committed
+finishes. There is no heartbeat timeout, paired-device credential, or permanent
+ownership file; the trusted private LAN is the authorization boundary.
+
+A brief Wi-Fi interruption does not close the reader or surrender control. The
+browser keeps the current screen and marks uncertain position/selection writes
+as pending. Retrying with the same token is safe because those writes set an
+explicit value and are idempotent. If control moved to another page, the old
+page must explicitly take it back; the app then refreshes authoritative state
+instead of blindly replaying uncertain writes.
 
 See [Local web server behavior](docs/server-mode.md) for operational and
 security details.
@@ -211,5 +219,5 @@ Run the test suite with:
 ```
 
 The suite covers scanning and ordering, reading/editing persistence, safe path
-handling, whole-output export and crash recovery, controller leasing, HTTP/API
+handling, whole-output export and crash recovery, token ownership, HTTP/API
 security, image delivery, and web-client behavior.

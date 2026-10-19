@@ -51,18 +51,27 @@ or internet exposure.
 ## Exclusive controller
 
 The first page to open the application claims an unguessable, in-memory
-controller lease. Every library, reader, image, selection, rescan, and export
-request must present that page identity. A different tab or device receives an
-“open elsewhere” response.
+controller token. Every library, reader, image, selection, rescan, and export
+request must present both its page identity and token. A different tab or
+device receives an “open elsewhere” response and can choose **Take Control**.
 
-The owning page sends periodic heartbeats. Closing or navigating away sends a
-best-effort release, but browsers cannot guarantee delivery during termination
-or suspension. A missed release is therefore recovered by the short lease
-timeout. Reload/reconnect by the same live page can reclaim normally, and a
-server restart clears all lease state.
+Ownership has no timer and the browser sends no heartbeat or shutdown-time
+release. It remains valid through phone suspension and temporary Wi-Fi loss.
+An explicit takeover rotates the token immediately after any already-authorized
+durable operation finishes; requests carrying the old token are then rejected.
+This preserves single-controller behavior without guessing whether an absent
+heartbeat means a closed page or a sleeping phone. A server restart also clears
+ownership.
 
-The lease is deliberately not written to `.pocket-manga-editor`; a persisted
+Ownership is deliberately not written to `.pocket-manga-editor`; a persisted
 “currently open” marker could strand the app after a crash or power loss.
+
+The browser retains its current view on a network error. A position or
+selection request whose outcome is unknown remains visibly pending and can be
+retried with the same token; these operations set explicit values, so repeating
+an already-committed request is safe. After ownership transfer, the old page
+does not blindly replay uncertain writes. Taking control refreshes server state
+and tells the user when an unconfirmed save needs review.
 
 ## Read and Edit activities
 
@@ -76,7 +85,9 @@ to that manga and metadata domain before folder/image access is allowed:
 
 Position and selection responses are returned only after the corresponding
 atomic metadata write succeeds. The browser drains confirmed queued writes
-before changing activities, rescanning, or starting export.
+before changing activities, rescanning, or starting export. The controller
+token is held across each durable mutation, rescan, or export, so takeover
+cannot split one of those operations midway through its commit.
 
 ## Rescan
 
@@ -137,9 +148,9 @@ network profile is Private. `127.0.0.1` works only on the PC itself.
 
 ### App is open elsewhere
 
-Close or navigate away from the owning page. If it disappeared without sending
-release, wait briefly for its heartbeat lease to expire and try again. Stopping
-and starting the server also clears the lease.
+Use **Take Control** on the waiting page. Any filesystem mutation already being
+committed is allowed to finish first, then the previous page's token becomes
+invalid. Stopping and starting the server also clears ownership.
 
 ### Port already in use
 
