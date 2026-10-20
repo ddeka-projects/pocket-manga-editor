@@ -79,9 +79,7 @@ def scan_working_directory(working_directory: str | Path) -> ScanResult:
 def _scan_manga(root: Path, manga_path: Path) -> tuple[MangaRef | None, list[ScanIssue]]:
     issues: list[ScanIssue] = []
     try:
-        candidates = sorted(
-            manga_path.iterdir(), key=lambda path: natural_name_key(path.name)
-        )
+        candidates = sorted(manga_path.iterdir(), key=lambda path: natural_name_key(path.name))
     except OSError as exc:
         return None, [ScanIssue(manga_path, f"Could not read manga folder: {exc}")]
 
@@ -106,9 +104,7 @@ def _scan_folder(
     issues: list[ScanIssue],
 ) -> FolderRef | None:
     try:
-        candidates = sorted(
-            folder_path.iterdir(), key=lambda path: natural_name_key(path.name)
-        )
+        candidates = sorted(folder_path.iterdir(), key=lambda path: natural_name_key(path.name))
     except OSError as exc:
         issues.append(ScanIssue(folder_path, f"Could not read image folder: {exc}"))
         return None
@@ -120,9 +116,7 @@ def _scan_folder(
         kind = _direct_child_kind(folder_path, candidate, issues, "image")
         if kind != "file":
             if kind == "directory":
-                issues.append(
-                    ScanIssue(candidate, "A supported image name is not a regular file.")
-                )
+                issues.append(ScanIssue(candidate, "A supported image name is not a regular file."))
             continue
         try:
             resolved = candidate.resolve(strict=True)

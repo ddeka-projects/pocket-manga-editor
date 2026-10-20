@@ -29,6 +29,10 @@ class StorageError(OSError):
     """Raised when application state cannot be handled safely."""
 
 
+class ReadingStateError(StorageError):
+    """Raised when reading state cannot be read or replaced safely."""
+
+
 class EditingStateError(StorageError):
     """Raised when editing state cannot support safe destructive decisions."""
 
@@ -54,7 +58,7 @@ class EditingSnapshot:
 
 
 class ReadingStore:
-    """Persist phone-only reading bookmarks in one manga workspace."""
+    """Persist reading bookmarks in one manga workspace."""
 
     def __init__(self, working_directory: str | Path) -> None:
         self.working_directory = Path(working_directory)
@@ -69,15 +73,16 @@ class ReadingStore:
         validate_reading_workspace(paths)
         return _load_reading(paths.reading, manga)
 
-    def set_position(
-        self, manga: MangaRef, folder_name: str, image_name: str
-    ) -> ReadingSnapshot:
+    def set_position(self, manga: MangaRef, folder_name: str, image_name: str) -> ReadingSnapshot:
         with library_mutation_lock(self.working_directory) as root:
             folder = _folder_for(manga, folder_name)
             image = _image_for(folder, image_name)
             validate_live_manga_item(root, manga, folder, image)
             paths = _ensure_workspace(root, manga)
             validate_reading_workspace(paths)
+            # Refuse to overwrite damaged metadata, including changes made
+            # outside the app after the current reader was opened.
+            _load_reading(paths.reading, manga)
             snapshot = ReadingSnapshot(folder_name, image_name)
             _write_reading(paths.reading, snapshot)
             return snapshot
@@ -97,9 +102,7 @@ class EditingStore:
         root, _source = validate_live_manga_root(self.working_directory, manga)
         return self._load_locked(root, manga)
 
-    def set_position(
-        self, manga: MangaRef, folder_name: str, image_name: str
-    ) -> EditingSnapshot:
+    def set_position(self, manga: MangaRef, folder_name: str, image_name: str) -> EditingSnapshot:
         def update(snapshot: EditingSnapshot) -> EditingSnapshot:
             return replace(
                 snapshot,
@@ -126,9 +129,7 @@ class EditingStore:
             else:
                 selected_images.discard(image_name)
             if selected_images:
-                folders[folder_name] = EditingFolderState(
-                    frozenset(selected_images)
-                )
+                folders[folder_name] = EditingFolderState(frozenset(selected_images))
             else:
                 folders.pop(folder_name, None)
             return replace(snapshot, folders=folders, warnings=())
@@ -172,9 +173,7 @@ class EditingStore:
             ) from exc
         return _parse_editing(payload, manga)
 
-    def _write_locked(
-        self, root: Path, manga: MangaRef, snapshot: EditingSnapshot
-    ) -> None:
+    def _write_locked(self, root: Path, manga: MangaRef, snapshot: EditingSnapshot) -> None:
         """Write a validated snapshot while the caller holds the mutation lock."""
 
         validate_live_manga_root(root, manga)
@@ -224,10 +223,9 @@ def _load_reading(path: Path, manga: MangaRef) -> ReadingSnapshot:
         with path.open("r", encoding="utf-8") as handle:
             payload = json.load(handle)
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        return replace(
-            default,
-            warnings=(f"Reading metadata was invalid and was reset: {exc}",),
-        )
+        raise ReadingStateError(
+            f"Reading metadata for '{manga.name}' could not be read safely: {exc}"
+        ) from exc
 
     if (
         not isinstance(payload, dict)
@@ -239,20 +237,13 @@ def _load_reading(path: Path, manga: MangaRef) -> ReadingSnapshot:
         or not _safe_component(payload.get("last_folder"))
         or not _safe_image_name(payload.get("last_image"))
     ):
-        return replace(
-            default,
-            warnings=("Reading metadata used an invalid format and was reset.",),
-        )
+        raise ReadingStateError("Reading metadata uses an invalid or unsupported format.")
 
     folder = _folder_by_name(manga, payload["last_folder"])
-    if folder is None or payload["last_image"] not in {
-        image.name for image in folder.images
-    }:
+    if folder is None or payload["last_image"] not in {image.name for image in folder.images}:
         return replace(
             default,
-            warnings=(
-                "The saved reading position was missing and was reset to the first image.",
-            ),
+            warnings=("The saved reading position was missing and was reset to the first image.",),
         )
     return ReadingSnapshot(payload["last_folder"], payload["last_image"])
 
@@ -285,8 +276,7 @@ def _default_editing(manga: MangaRef) -> EditingSnapshot:
 def _parse_editing(payload: object, manga: MangaRef) -> EditingSnapshot:
     if (
         not isinstance(payload, dict)
-        or set(payload)
-        != {"schema_version", "last_folder", "last_image", "folders"}
+        or set(payload) != {"schema_version", "last_folder", "last_image", "folders"}
         or payload.get("schema_version") != STATE_SCHEMA_VERSION
         or isinstance(payload.get("schema_version"), bool)
         or not isinstance(payload.get("last_folder"), str)
@@ -315,9 +305,7 @@ def _parse_editing(payload: object, manga: MangaRef) -> EditingSnapshot:
                 f"Editing metadata contains an invalid folder entry for '{folder_name}'."
             )
         selected_values = value["selected_images"]
-        if any(
-            not _safe_image_name(image_name) for image_name in selected_values
-        ):
+        if any(not _safe_image_name(image_name) for image_name in selected_values):
             raise EditingStateError(
                 f"Editing metadata contains an unsafe image identity in '{folder_name}'."
             )
@@ -335,19 +323,13 @@ def _parse_editing(payload: object, manga: MangaRef) -> EditingSnapshot:
             else:
                 stale += 1
         if stale:
-            warnings.append(
-                f"Ignored {stale} stale selection(s) in '{folder_name}'."
-            )
+            warnings.append(f"Ignored {stale} stale selection(s) in '{folder_name}'.")
         if selected:
             folder_states[folder_name] = EditingFolderState(frozenset(selected))
 
     resume_folder = live_folders.get(last_folder)
-    if resume_folder is None or last_image not in {
-        image.name for image in resume_folder.images
-    }:
-        warnings.append(
-            "The saved editing position was missing and was reset to the first image."
-        )
+    if resume_folder is None or last_image not in {image.name for image in resume_folder.images}:
+        warnings.append("The saved editing position was missing and was reset to the first image.")
         first_folder = _first_folder(manga)
         last_folder = first_folder.name
         last_image = first_folder.images[0].name
@@ -367,21 +349,13 @@ def _editing_payload(manga: MangaRef, snapshot: EditingSnapshot) -> dict[str, An
         state = snapshot.folders[folder_name]
         folder = live_folders.get(folder_name)
         if folder is None:
-            raise EditingStateError(
-                f"Editing state contains a stale folder '{folder_name}'."
-            )
+            raise EditingStateError(f"Editing state contains a stale folder '{folder_name}'.")
         live_names = {image.name for image in folder.images}
-        if not state.selected_images or not set(state.selected_images).issubset(
-            live_names
-        ):
+        if not state.selected_images or not set(state.selected_images).issubset(live_names):
             raise EditingStateError(
                 f"Editing state for '{folder.name}' contains stale image names."
             )
-        selected = [
-            image.name
-            for image in folder.images
-            if image.name in state.selected_images
-        ]
+        selected = [image.name for image in folder.images if image.name in state.selected_images]
         folder_payload[folder.name] = {
             "selected_images": selected,
         }

@@ -16,20 +16,16 @@ import stat
 from typing import BinaryIO, Mapping
 from urllib.parse import parse_qsl, unquote, urlsplit
 
-from ..exporter import (
+from .exporter import (
     ExportBusyError,
     ExportConfirmationRequired,
     ExportError,
     ExportRecoveryError,
     NothingSelectedError,
 )
-from .coordinator import CompanionCoordinator
-from .controller import (
-    ControllerError,
-    ControllerOccupiedError,
-    ControllerRequiredError,
-    ControllerTransferredError,
-)
+from .service import LibraryService
+from .errors import AppError
+from .health import make_health
 from .review import (
     PositionMutation,
     ReviewError,
@@ -38,9 +34,9 @@ from .review import (
     SelectionMutation,
 )
 from .snapshot import MissingImageError, SnapshotError
-from .state import (
-    CompanionActivity,
-    CoordinatorError,
+from .activity import (
+    Activity,
+    ServiceError,
     RescanError,
 )
 
@@ -66,9 +62,7 @@ class APIResponse:
             while remaining:
                 chunk = self.body.stream.read(min(remaining, 256 * 1024))
                 if not chunk:
-                    raise OSError(
-                        "The streamed response ended before its declared length."
-                    )
+                    raise OSError("The streamed response ended before its declared length.")
                 chunks.append(chunk)
                 remaining -= len(chunk)
             return b"".join(chunks)
@@ -93,9 +87,12 @@ class StreamingBody:
             pass
 
 
-class RequestError(RuntimeError):
-    code = "bad_request"
+class RequestError(AppError):
+    code = "invalid_request"
     http_status = 400
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, self.http_status, self.code)
 
 
 class RequestForbidden(RequestError):
@@ -108,18 +105,16 @@ class UnsupportedContentType(RequestError):
     http_status = 415
 
 
-class CompanionAPI:
+class API:
     def __init__(
         self,
-        coordinator: CompanionCoordinator,
+        service: LibraryService,
         *,
         allowed_hosts: set[str] | frozenset[str] | None = None,
     ) -> None:
-        self.coordinator = coordinator
+        self.service = service
         self._allowed_hosts = {
-            value.casefold().rstrip(".")
-            for value in (allowed_hosts or ())
-            if value
+            value.casefold().rstrip(".") for value in (allowed_hosts or ()) if value
         }
         self._allowed_hosts.update({"localhost", "127.0.0.1", "::1"})
         try:
@@ -148,42 +143,45 @@ class CompanionAPI:
             parsed_target = urlsplit(target)
             segments = self._segments(parsed_target.path)
 
+            if method == "GET" and segments == ["health"]:
+                return self._json(200, make_health())
+
             if method == "GET" and segments == ["api", "status"]:
                 return self._json(200, {"status": {"server": "available"}})
 
             if method == "POST" and segments == ["api", "controller", "claim"]:
                 page_id = self._claim_body(headers, body)
-                grant = self.coordinator.claim_controller(page_id)
+                grant = self.service.claim_controller(page_id)
                 return self._json(
                     200,
                     {
                         "controller": {
                             "owned": True,
-                            "page_id": grant.page_id,
-                            "token": grant.token,
+                            "page_id": page_id,
+                            "token": grant["token"],
                         },
-                        "snapshot_id": self.coordinator.status().snapshot_id,
+                        "snapshot_id": self.service.status().snapshot_id,
                     },
                 )
 
             if method == "POST" and segments == ["api", "controller", "takeover"]:
                 page_id = self._claim_body(headers, body)
-                grant = self.coordinator.claim_controller(page_id, takeover=True)
+                grant = self.service.claim_controller(page_id, takeover=True)
                 return self._json(
                     200,
                     {
                         "controller": {
                             "owned": True,
-                            "page_id": grant.page_id,
-                            "token": grant.token,
+                            "page_id": page_id,
+                            "token": grant["token"],
                         },
-                        "snapshot_id": self.coordinator.status().snapshot_id,
+                        "snapshot_id": self.service.status().snapshot_id,
                     },
                 )
 
             if method == "POST" and segments == ["api", "controller", "release"]:
                 page_id, token = self._release_body(headers, body)
-                self.coordinator.release_controller(page_id, token)
+                self.service.release_controller(page_id, token)
                 return self._json(
                     200,
                     {
@@ -198,11 +196,7 @@ class CompanionAPI:
                 "library",
                 "rescan",
             ]
-            is_manga = (
-                method == "GET"
-                and len(segments) == 3
-                and segments[:2] == ["api", "manga"]
-            )
+            is_manga = method == "GET" and len(segments) == 3 and segments[:2] == ["api", "manga"]
             is_export_preview = (
                 method == "GET"
                 and len(segments) == 4
@@ -215,16 +209,8 @@ class CompanionAPI:
                 and segments[:2] == ["api", "manga"]
                 and segments[3] == "export"
             )
-            is_folder = (
-                method == "GET"
-                and len(segments) == 3
-                and segments[:2] == ["api", "folder"]
-            )
-            is_image = (
-                method == "GET"
-                and len(segments) == 3
-                and segments[:2] == ["api", "image"]
-            )
+            is_folder = method == "GET" and len(segments) == 3 and segments[:2] == ["api", "folder"]
+            is_image = method == "GET" and len(segments) == 3 and segments[:2] == ["api", "image"]
             is_position_write = (
                 method == "PATCH"
                 and len(segments) == 5
@@ -252,39 +238,29 @@ class CompanionAPI:
                     is_selection_write,
                 )
             ):
-                return self._error(
-                    404, "not_found", "The requested API route does not exist."
-                )
+                return self._error(404, "not_found", "The requested API route does not exist.")
 
             page_id, token = self._controller_from_headers(headers)
             if is_library:
-                return self._json(
-                    200, self.coordinator.library(page_id, token)
-                )
+                return self._json(200, self.service.library(page_id, token))
             if is_rescan:
                 payload = self._json_body(headers, body)
                 self._require_keys(payload, set())
-                library = self.coordinator.rescan(page_id, token)
+                library = self.service.rescan(page_id, token)
                 return self._json(200, {"rescanned": True, **library})
             if is_manga:
                 activity = self._activity_query(parsed_target.query)
                 return self._json(
                     200,
-                    self.coordinator.open_manga(
-                        page_id, token, segments[2], activity
-                    ),
+                    self.service.open_manga(page_id, token, segments[2], activity),
                 )
             if is_export_preview:
-                preview = self.coordinator.export_preview(
-                    page_id, token, segments[2]
-                )
-                unrecognized = [
-                    str(value) for value in preview.unrecognized_entries
-                ]
+                preview = self.service.export_preview(page_id, token, segments[2])
+                unrecognized = [str(value) for value in preview.unrecognized_entries]
                 return self._json(
                     200,
                     {
-                        "snapshot_id": self.coordinator.status().snapshot_id,
+                        "snapshot_id": self.service.status().snapshot_id,
                         "export": {
                             "selected_folder_count": preview.selected_folder_count,
                             "selected_image_count": preview.selected_image_count,
@@ -299,16 +275,12 @@ class CompanionAPI:
                 self._require_keys(payload, {"confirm_unrecognized_output"})
                 confirmed = payload.get("confirm_unrecognized_output")
                 if not isinstance(confirmed, bool):
-                    raise RequestError(
-                        "confirm_unrecognized_output must be a boolean."
-                    )
-                mutation = self.coordinator.export_manga(
-                    page_id, token, segments[2], confirmed
-                )
+                    raise RequestError("confirm_unrecognized_output must be a boolean.")
+                mutation = self.service.export_manga(page_id, token, segments[2], confirmed)
                 return self._json(
                     200,
                     {
-                        "snapshot_id": self.coordinator.status().snapshot_id,
+                        "snapshot_id": self.service.status().snapshot_id,
                         "export": asdict(mutation),
                     },
                 )
@@ -316,9 +288,7 @@ class CompanionAPI:
                 activity = self._activity_query(parsed_target.query)
                 return self._json(
                     200,
-                    self.coordinator.folder(
-                        page_id, token, segments[2], activity
-                    ),
+                    self.service.folder(page_id, token, segments[2], activity),
                 )
             if is_image:
                 return self._image(page_id, token, segments[2], headers)
@@ -326,15 +296,13 @@ class CompanionAPI:
             payload = self._json_body(headers, body)
             self._require_keys(
                 payload,
-                {"image_id"}
-                if is_position_write
-                else {"image_id", "selected"},
+                {"image_id"} if is_position_write else {"image_id", "selected"},
             )
             image_id = self._required_string(payload, "image_id", maximum=256)
             folder_id = segments[3]
-            activity = CompanionActivity(segments[1])
+            activity = Activity(segments[1])
             if is_position_write:
-                mutation = self.coordinator.set_position(
+                mutation = self.service.set_position(
                     page_id,
                     token,
                     activity,
@@ -346,7 +314,7 @@ class CompanionAPI:
             selected = payload.get("selected")
             if not isinstance(selected, bool):
                 raise RequestError("selected must be a boolean.")
-            mutation = self.coordinator.set_selection(
+            mutation = self.service.set_selection(
                 page_id,
                 token,
                 activity,
@@ -370,13 +338,9 @@ class CompanionAPI:
         if address.is_unspecified or not (
             address.is_private or address.is_loopback or address.is_link_local
         ):
-            raise RequestForbidden(
-                "Pocket Manga is available only from the local private network."
-            )
+            raise RequestForbidden("Pocket Manga is available only from the local private network.")
 
-    def validate_request(
-        self, headers: Mapping[str, str], *, mutating: bool
-    ) -> None:
+    def validate_request(self, headers: Mapping[str, str], *, mutating: bool) -> None:
         host_value = self._header(headers, "Host")
         if not host_value:
             raise RequestForbidden("A valid Host header is required.")
@@ -389,12 +353,10 @@ class CompanionAPI:
                 parsed = urlsplit(origin)
                 if parsed.scheme.casefold() != "http" or not parsed.netloc:
                     raise RequestForbidden("This request Origin is not allowed.")
-                if self._canonical_authority(
-                    parsed.netloc
-                ) != self._canonical_authority(host_value):
-                    raise RequestForbidden(
-                        "Cross-origin state changes are not allowed."
-                    )
+                if self._canonical_authority(parsed.netloc) != self._canonical_authority(
+                    host_value
+                ):
+                    raise RequestForbidden("Cross-origin state changes are not allowed.")
 
     def _image(
         self,
@@ -403,9 +365,7 @@ class CompanionAPI:
         image_id: str,
         headers: Mapping[str, str],
     ) -> APIResponse:
-        snapshot, image = self.coordinator.image_for_delivery(
-            page_id, token, image_id
-        )
+        snapshot, image = self.service.image_for_delivery(page_id, token, image_id)
         source = Path(image.ref.path)
         extension = source.suffix.casefold()
         if extension not in {".jpg", ".png"}:
@@ -413,9 +373,7 @@ class CompanionAPI:
         body, information = _open_validated_image(snapshot, image.id)
         mime = "image/jpeg" if extension == ".jpg" else "image/png"
         etag_value = hashlib.sha256(
-            f"{image.id}:{information.st_size}:{information.st_mtime_ns}".encode(
-                "ascii"
-            )
+            f"{image.id}:{information.st_size}:{information.st_mtime_ns}".encode("ascii")
         ).hexdigest()
         etag = f'"{etag_value}"'
         common = (
@@ -444,9 +402,7 @@ class CompanionAPI:
         self._require_keys(payload, {"page_id"})
         return self._required_string(payload, "page_id", maximum=128)
 
-    def _release_body(
-        self, headers: Mapping[str, str], body: bytes
-    ) -> tuple[str, str]:
+    def _release_body(self, headers: Mapping[str, str], body: bytes) -> tuple[str, str]:
         payload = self._json_body(headers, body)
         self._require_keys(payload, {"page_id", "token"})
         return (
@@ -454,19 +410,10 @@ class CompanionAPI:
             self._required_string(payload, "token", maximum=128),
         )
 
-    def _json_body(
-        self, headers: Mapping[str, str], body: bytes
-    ) -> dict[str, object]:
-        content_type = (
-            self._header(headers, "Content-Type")
-            .split(";", 1)[0]
-            .strip()
-            .casefold()
-        )
+    def _json_body(self, headers: Mapping[str, str], body: bytes) -> dict[str, object]:
+        content_type = self._header(headers, "Content-Type").split(";", 1)[0].strip().casefold()
         if content_type != "application/json":
-            raise UnsupportedContentType(
-                "State-changing requests must use application/json."
-            )
+            raise UnsupportedContentType("State-changing requests must use application/json.")
         if len(body) > MAX_JSON_BODY:
             raise RequestError("The JSON request body is too large.")
         try:
@@ -480,22 +427,15 @@ class CompanionAPI:
     @staticmethod
     def _segments(path: str) -> list[str]:
         try:
-            segments = [
-                unquote(part, errors="strict")
-                for part in path.split("/")
-                if part
-            ]
+            segments = [unquote(part, errors="strict") for part in path.split("/") if part]
         except UnicodeError as exc:
             raise RequestError("The request path is invalid.") from exc
-        if any(
-            part in {".", ".."} or "/" in part or "\\" in part
-            for part in segments
-        ):
+        if any(part in {".", ".."} or "/" in part or "\\" in part for part in segments):
             raise RequestError("The request path is unsafe.")
         return segments
 
     @staticmethod
-    def _activity_query(query: str) -> CompanionActivity:
+    def _activity_query(query: str) -> Activity:
         try:
             values = parse_qsl(
                 query,
@@ -508,35 +448,27 @@ class CompanionAPI:
         if len(values) != 1 or values[0][0] != "activity":
             raise RequestError("Exactly one activity query is required.")
         try:
-            return CompanionActivity(values[0][1])
+            return Activity(values[0][1])
         except ValueError as exc:
             raise RequestError("activity must be read or edit.") from exc
 
-    def _controller_from_headers(
-        self, headers: Mapping[str, str]
-    ) -> tuple[str, str]:
-        page_id = self._header(headers, "X-Controller-Page")
+    def _controller_from_headers(self, headers: Mapping[str, str]) -> tuple[str, str]:
+        page_id = self._header(headers, "X-Page-Id")
         if not page_id:
-            raise RequestError("X-Controller-Page is required.")
+            raise RequestError("X-Page-Id is required.")
         token = self._header(headers, "X-Controller-Token")
         if not token:
             raise RequestError("X-Controller-Token is required.")
         return page_id, token
 
     @staticmethod
-    def _require_keys(
-        payload: Mapping[str, object], expected: set[str]
-    ) -> None:
+    def _require_keys(payload: Mapping[str, object], expected: set[str]) -> None:
         if set(payload) != expected:
             names = ", ".join(sorted(expected)) or "no fields"
-            raise RequestError(
-                f"The JSON body must contain exactly: {names}."
-            )
+            raise RequestError(f"The JSON body must contain exactly: {names}.")
 
     @staticmethod
-    def _required_string(
-        payload: Mapping[str, object], key: str, *, maximum: int
-    ) -> str:
+    def _required_string(payload: Mapping[str, object], key: str, *, maximum: int) -> str:
         value = payload.get(key)
         if not isinstance(value, str) or not value or len(value) > maximum:
             raise RequestError(f"{key} is required.")
@@ -552,9 +484,8 @@ class CompanionAPI:
             return False
         if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
             address = address.ipv4_mapped
-        return (
-            not address.is_unspecified
-            and (address.is_private or address.is_loopback or address.is_link_local)
+        return not address.is_unspecified and (
+            address.is_private or address.is_loopback or address.is_link_local
         )
 
     @staticmethod
@@ -565,11 +496,7 @@ class CompanionAPI:
             _port = parsed.port
         except ValueError as exc:
             raise RequestForbidden("The Host header is invalid.") from exc
-        if (
-            not hostname
-            or parsed.username is not None
-            or parsed.password is not None
-        ):
+        if not hostname or parsed.username is not None or parsed.password is not None:
             raise RequestForbidden("The Host header is invalid.")
         return hostname
 
@@ -602,9 +529,7 @@ class CompanionAPI:
         *,
         extra_headers: tuple[tuple[str, str], ...] = (),
     ) -> APIResponse:
-        encoded = json.dumps(
-            {"ok": True, **payload}, ensure_ascii=False
-        ).encode("utf-8")
+        encoded = json.dumps({"ok": True, **payload}, ensure_ascii=False).encode("utf-8")
         return APIResponse(
             status,
             (
@@ -635,16 +560,8 @@ class CompanionAPI:
         )
 
     def _exception_response(self, exc: BaseException) -> APIResponse:
-        if isinstance(exc, RequestError):
-            return self._error(exc.http_status, exc.code, str(exc))
-        if isinstance(exc, ControllerOccupiedError):
-            return self._error(423, exc.code, str(exc))
-        if isinstance(exc, ControllerRequiredError):
-            return self._error(409, exc.code, str(exc))
-        if isinstance(exc, ControllerTransferredError):
-            return self._error(423, exc.code, str(exc))
-        if isinstance(exc, ControllerError):
-            return self._error(400, exc.code, str(exc))
+        if isinstance(exc, AppError):
+            return self._error(exc.status, exc.code, str(exc))
         if isinstance(exc, SnapshotError):
             return self._error(404, exc.code, str(exc))
         if isinstance(exc, ReviewSaveError):
@@ -681,7 +598,7 @@ class CompanionAPI:
                 "The manga export could not be completed safely. The previous "
                 "output was preserved; check the server log.",
             )
-        if isinstance(exc, CoordinatorError):
+        if isinstance(exc, ServiceError):
             return self._error(409, exc.code, str(exc))
         LOGGER.exception("Unhandled web API failure.")
         return self._error(
@@ -691,9 +608,7 @@ class CompanionAPI:
         )
 
 
-def _open_validated_image(
-    snapshot, image_id: str
-) -> tuple[StreamingBody, os.stat_result]:
+def _open_validated_image(snapshot, image_id: str) -> tuple[StreamingBody, os.stat_result]:
     """Open once, then prove the handle still names the validated mapped image."""
 
     try:
@@ -709,9 +624,7 @@ def _open_validated_image(
         descriptor = os.open(resolved_source, flags)
         try:
             opened = os.fstat(descriptor)
-            if not stat.S_ISREG(opened.st_mode) or not os.path.samestat(
-                before, opened
-            ):
+            if not stat.S_ISREG(opened.st_mode) or not os.path.samestat(before, opened):
                 raise OSError("source changed before it could be opened")
             snapshot.validate_live_image(image_id)
             after_path = source.resolve(strict=True)
@@ -725,6 +638,4 @@ def _open_validated_image(
             if descriptor >= 0:
                 os.close(descriptor)
     except (OSError, ValueError, SnapshotError) as exc:
-        raise MissingImageError(
-            "The source image is no longer safely available."
-        ) from exc
+        raise MissingImageError("The source image is no longer safely available.") from exc

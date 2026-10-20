@@ -30,9 +30,7 @@ class MangaWorkspacePaths:
     transactions: Path
 
 
-def manga_workspace_paths(
-    working_directory: str | Path, manga_name: str
-) -> MangaWorkspacePaths:
+def manga_workspace_paths(working_directory: str | Path, manga_name: str) -> MangaWorkspacePaths:
     """Return non-creating paths after validating their shared workspace parents."""
 
     root = _resolve_root(working_directory)
@@ -93,9 +91,7 @@ def validate_transaction_workspace(
     """Validate only the transient transaction root used during recovery discovery."""
 
     paths = _validate_workspace_identity(paths)
-    _validate_directory_if_present(
-        paths.transactions, paths.workspace, "transaction workspace"
-    )
+    _validate_directory_if_present(paths.transactions, paths.workspace, "transaction workspace")
     return paths
 
 
@@ -128,9 +124,7 @@ def validate_live_manga(working_directory: str | Path, manga: MangaRef) -> Path:
     return resolved_source
 
 
-def validate_live_manga_root(
-    working_directory: str | Path, manga: MangaRef
-) -> tuple[Path, Path]:
+def validate_live_manga_root(working_directory: str | Path, manga: MangaRef) -> tuple[Path, Path]:
     """Validate only the library and manga roots for an ordinary state load."""
 
     root = _resolve_root(working_directory)
@@ -196,17 +190,13 @@ def _validate_live_folder(resolved_source: Path, folder: FolderRef) -> Path:
     return resolved_folder
 
 
-def _validate_live_image(
-    resolved_folder: Path, folder: FolderRef, image: ImageRef
-) -> Path:
+def _validate_live_image(resolved_folder: Path, folder: FolderRef, image: ImageRef) -> Path:
     _validate_component(image.name, "image")
     if Path(image.name).suffix.casefold() not in {".jpg", ".png"}:
         raise WorkspaceError(f"Source image '{image.name}' is not JPG or PNG.")
     image_path = Path(image.path)
     if is_link_or_reparse(image_path):
-        raise WorkspaceError(
-            f"Source image '{folder.name}/{image.name}' cannot be a link."
-        )
+        raise WorkspaceError(f"Source image '{folder.name}/{image.name}' cannot be a link.")
     try:
         information = image_path.stat(follow_symlinks=False)
         resolved_image = image_path.resolve(strict=True)
@@ -250,9 +240,7 @@ def _resolve_root(working_directory: str | Path) -> Path:
 def _validate_manga_name(name: str) -> None:
     _validate_component(name, "manga")
     if name.casefold() == LOCK_FILENAME.casefold():
-        raise WorkspaceError(
-            f"Manga name '{name}' is reserved for the library mutation lock."
-        )
+        raise WorkspaceError(f"Manga name '{name}' is reserved for the library mutation lock.")
 
 
 def _validate_component(name: str, description: str) -> None:

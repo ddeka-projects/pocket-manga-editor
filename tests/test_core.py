@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import patch
 
 import pocket_manga_editor.exporter as exporter_module
-from pocket_manga_editor.config import ConfigurationError, load_configuration
+from pocket_manga_editor.config import ConfigurationError, load_settings
 from pocket_manga_editor.exporter import (
     ExportBusyError,
     ExportConfirmationRequired,
@@ -37,6 +37,7 @@ from pocket_manga_editor.storage import (
     STATE_SCHEMA_VERSION,
     EditingStateError,
     EditingStore,
+    ReadingStateError,
     ReadingStore,
 )
 from pocket_manga_editor.workspace import WorkspaceError, manga_workspace_paths
@@ -85,7 +86,7 @@ class ConfigurationTests(RepositoryFixture):
             encoding="utf-8",
         )
 
-        configuration = load_configuration(env_file, environ={})
+        configuration = load_settings(env_file, environ={})
 
         self.assertEqual(configuration.working_directory, library.resolve())
         self.assertEqual(configuration.host, "0.0.0.0")
@@ -103,7 +104,7 @@ class ConfigurationTests(RepositoryFixture):
             encoding="utf-8",
         )
 
-        configuration = load_configuration(
+        configuration = load_settings(
             env_file,
             environ={
                 "POCKET_MANGA_EDITOR_WORKING_DIRECTORY": str(process_library),
@@ -118,17 +119,15 @@ class ConfigurationTests(RepositoryFixture):
 
     def test_configuration_rejects_relative_missing_and_linked_library_paths(self) -> None:
         with self.assertRaisesRegex(ConfigurationError, "absolute"):
-            load_configuration(
+            load_settings(
                 self.root / "missing.env",
                 environ={"POCKET_MANGA_EDITOR_WORKING_DIRECTORY": "relative"},
             )
         with self.assertRaises(ConfigurationError):
-            load_configuration(
+            load_settings(
                 self.root / "missing.env",
                 environ={
-                    "POCKET_MANGA_EDITOR_WORKING_DIRECTORY": str(
-                        self.root / "does-not-exist"
-                    )
+                    "POCKET_MANGA_EDITOR_WORKING_DIRECTORY": str(self.root / "does-not-exist")
                 },
             )
 
@@ -140,7 +139,7 @@ class ConfigurationTests(RepositoryFixture):
         except OSError as exc:
             self.skipTest(f"Directory links are unavailable: {exc}")
         with self.assertRaisesRegex(ConfigurationError, "link|junction"):
-            load_configuration(
+            load_settings(
                 self.root / "missing.env",
                 environ={"POCKET_MANGA_EDITOR_WORKING_DIRECTORY": str(alias)},
             )
@@ -157,14 +156,12 @@ class ConfigurationTests(RepositoryFixture):
         ):
             with self.subTest(name=name, value=value):
                 with self.assertRaises(ConfigurationError):
-                    load_configuration(
-                        self.root / "missing.env", environ={**base, name: value}
-                    )
+                    load_settings(self.root / "missing.env", environ={**base, name: value})
 
         malformed = self.root / ".env"
         malformed.write_text("this is not an assignment\n", encoding="utf-8")
         with self.assertRaisesRegex(ConfigurationError, "line 1"):
-            load_configuration(malformed, environ=base)
+            load_settings(malformed, environ=base)
 
 
 class ScannerTests(RepositoryFixture):
@@ -203,9 +200,7 @@ class ScannerTests(RepositoryFixture):
     def test_ignores_empty_nested_direct_and_unrelated_content(self) -> None:
         self.add_image("Series", "Valid", "cover.jpg")
         (self.root / "Series" / "Empty").mkdir()
-        (self.root / "Series" / "Valid" / "notes.txt").write_text(
-            "ignored", encoding="utf-8"
-        )
+        (self.root / "Series" / "Valid" / "notes.txt").write_text("ignored", encoding="utf-8")
         nested = self.root / "Series" / "Nested" / "Inside"
         nested.mkdir(parents=True)
         (nested / "nested.jpg").write_bytes(b"ignored")
@@ -224,15 +219,9 @@ class ScannerTests(RepositoryFixture):
         (outside / "escape.jpg").write_bytes(b"outside")
         self.add_image("Safe", "Folder", "safe.jpg")
         try:
-            (self.root / "Linked Manga").symlink_to(
-                self.root / "Safe", target_is_directory=True
-            )
-            (self.root / "Safe" / "Linked Folder").symlink_to(
-                outside, target_is_directory=True
-            )
-            (self.root / "Safe" / "Folder" / "linked.jpg").symlink_to(
-                outside / "escape.jpg"
-            )
+            (self.root / "Linked Manga").symlink_to(self.root / "Safe", target_is_directory=True)
+            (self.root / "Safe" / "Linked Folder").symlink_to(outside, target_is_directory=True)
+            (self.root / "Safe" / "Folder" / "linked.jpg").symlink_to(outside / "escape.jpg")
         except OSError as exc:
             self.skipTest(f"Symbolic links are unavailable: {exc}")
 
@@ -277,8 +266,9 @@ class ScannerTests(RepositoryFixture):
             st_file_attributes=getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400),
         )
 
-        with patch("pocket_manga_editor.path_safety.os.name", "nt"), patch.object(
-            Path, "lstat", return_value=information
+        with (
+            patch("pocket_manga_editor.path_safety.os.name", "nt"),
+            patch.object(Path, "lstat", return_value=information),
         ):
             self.assertTrue(is_link_or_reparse(candidate))
 
@@ -341,9 +331,7 @@ class FilesystemOperationTests(RepositoryFixture):
         def mounted_root_stat(candidate: Path, *args, **kwargs):
             information = real_stat(candidate, *args, **kwargs)
             if candidate == tree:
-                return SimpleNamespace(
-                    st_mode=information.st_mode, st_dev=parent_device + 1
-                )
+                return SimpleNamespace(st_mode=information.st_mode, st_dev=parent_device + 1)
             return information
 
         with patch.object(Path, "stat", mounted_root_stat):
@@ -363,9 +351,11 @@ class FilesystemOperationTests(RepositoryFixture):
             opened_flags.append(flags)
             return real_open(path, flags, *args, **kwargs)
 
-        with patch.object(exporter_module, "_WINDOWS_FILE_SYNC", True), patch.object(
-            exporter_module.os, "open", side_effect=record_open
-        ), patch.object(exporter_module.os, "fsync") as fsync:
+        with (
+            patch.object(exporter_module, "_WINDOWS_FILE_SYNC", True),
+            patch.object(exporter_module.os, "open", side_effect=record_open),
+            patch.object(exporter_module.os, "fsync") as fsync,
+        ):
             exporter_module._fsync_file(staged)
 
         access_mode_mask = getattr(os, "O_ACCMODE", os.O_WRONLY | os.O_RDWR)
@@ -480,9 +470,7 @@ class StoreTests(RepositoryFixture):
                     "last_folder": "Renamed Folder",
                     "last_image": "missing.jpg",
                     "folders": {
-                        "Folder 1": {
-                            "selected_images": ["1.jpg", "renamed.png", "gone.png"]
-                        },
+                        "Folder 1": {"selected_images": ["1.jpg", "renamed.png", "gone.png"]},
                         "Old Folder": {"selected_images": ["old.jpg"]},
                     },
                 }
@@ -555,21 +543,44 @@ class StoreTests(RepositoryFixture):
                 with self.assertRaises(EditingStateError):
                     self.editing.load(self.manga_ref)
 
-    def test_malformed_reading_soft_resets_but_editing_fails_closed(self) -> None:
+    def test_malformed_metadata_fails_closed_without_overwriting_bytes(self) -> None:
         reading_path = self.reading.path_for(self.manga_ref)
         reading_path.parent.mkdir(parents=True)
         reading_path.write_bytes(b"\xff")
         editing_path = self.editing.path_for(self.manga_ref)
         editing_path.write_bytes(b"\xff")
 
-        reading = self.reading.load(self.manga_ref)
-
-        self.assertEqual(reading.last_folder, "Folder 1")
-        self.assertEqual(len(reading.warnings), 1)
+        with self.assertRaises(ReadingStateError):
+            self.reading.load(self.manga_ref)
+        with self.assertRaises(ReadingStateError):
+            self.reading.set_position(self.manga_ref, "Folder 1", "1.jpg")
         with self.assertRaises(EditingStateError):
             self.editing.load(self.manga_ref)
         with self.assertRaises(EditingStateError):
+            self.editing.set_selection(self.manga_ref, "Folder 1", "1.jpg", True)
+        with self.assertRaises(EditingStateError):
             export_manga(self.root, self.manga_ref)
+        self.assertEqual(reading_path.read_bytes(), b"\xff")
+        self.assertEqual(editing_path.read_bytes(), b"\xff")
+
+    def test_failed_metadata_replace_preserves_confirmed_position_and_selections(self) -> None:
+        self.reading.set_position(self.manga_ref, "Folder 1", "1.jpg")
+        self.editing.set_selection(self.manga_ref, "Folder 1", "1.jpg", True)
+        reading_path = self.reading.path_for(self.manga_ref)
+        editing_path = self.editing.path_for(self.manga_ref)
+        before_reading = reading_path.read_bytes()
+        before_editing = editing_path.read_bytes()
+        with patch(
+            "pocket_manga_editor.storage.os.replace",
+            side_effect=PermissionError("disk refused replacement"),
+        ):
+            with self.assertRaises(PermissionError):
+                self.reading.set_position(self.manga_ref, "Folder 2", "10.jpg")
+            with self.assertRaises(PermissionError):
+                self.editing.set_selection(self.manga_ref, "Folder 1", "1.jpg", False)
+        self.assertEqual(reading_path.read_bytes(), before_reading)
+        self.assertEqual(editing_path.read_bytes(), before_editing)
+        self.assertEqual(list(reading_path.parent.glob("*.tmp")), [])
 
     def test_old_schema_is_a_clean_break(self) -> None:
         reading_path = self.reading.path_for(self.manga_ref)
@@ -598,7 +609,8 @@ class StoreTests(RepositoryFixture):
             encoding="utf-8",
         )
 
-        self.assertEqual(self.reading.load(self.manga_ref).last_folder, "Folder 1")
+        with self.assertRaises(ReadingStateError):
+            self.reading.load(self.manga_ref)
         with self.assertRaises(EditingStateError):
             self.editing.load(self.manga_ref)
 
@@ -676,22 +688,14 @@ class ExporterTests(RepositoryFixture):
 
     def select(self, *identities: tuple[str, str]) -> None:
         for folder_name, image_name in identities:
-            self.editing.set_selection(
-                self.manga_ref, folder_name, image_name, True
-            )
+            self.editing.set_selection(self.manga_ref, folder_name, image_name, True)
 
     def deselect(self, *identities: tuple[str, str]) -> None:
         for folder_name, image_name in identities:
-            self.editing.set_selection(
-                self.manga_ref, folder_name, image_name, False
-            )
+            self.editing.set_selection(self.manga_ref, folder_name, image_name, False)
 
     def target(self, folder_name: str, image_name: str) -> Path:
-        return (
-            self.workspace.output
-            / folder_name
-            / exported_image_name(folder_name, image_name)
-        )
+        return self.workspace.output / folder_name / exported_image_name(folder_name, image_name)
 
     def test_inspection_and_first_export_use_exact_fresh_tree(self) -> None:
         self.select(
@@ -914,12 +918,13 @@ class ExporterTests(RepositoryFixture):
                 raise OSError("simulated interruption before commit marker")
             return real_atomic_write(path, payload)
 
-        with patch.object(
-            exporter_module, "atomic_write_json", side_effect=interrupt_commit
-        ), patch.object(
-            exporter_module,
-            "_rollback_prepared",
-            return_value=["simulated process termination"],
+        with (
+            patch.object(exporter_module, "atomic_write_json", side_effect=interrupt_commit),
+            patch.object(
+                exporter_module,
+                "_rollback_prepared",
+                return_value=["simulated process termination"],
+            ),
         ):
             with self.assertRaises(ExportRecoveryError):
                 export_manga(self.root, self.manga_ref)
@@ -939,21 +944,22 @@ class ExporterTests(RepositoryFixture):
 
         def interrupt_cleanup(transaction: Path, _transaction_root: Path) -> None:
             staged_file = next(
-                entry
-                for entry in (transaction / "new-output").rglob("*")
-                if entry.is_file()
+                entry for entry in (transaction / "new-output").rglob("*") if entry.is_file()
             )
             staged_file.unlink()
             raise OSError("simulated partial staging cleanup")
 
-        with patch.object(
-            exporter_module,
-            "_revalidate_sources",
-            side_effect=ExportConflict("simulated pre-commit failure"),
-        ), patch.object(
-            exporter_module,
-            "_cleanup_transaction",
-            side_effect=interrupt_cleanup,
+        with (
+            patch.object(
+                exporter_module,
+                "_revalidate_sources",
+                side_effect=ExportConflict("simulated pre-commit failure"),
+            ),
+            patch.object(
+                exporter_module,
+                "_cleanup_transaction",
+                side_effect=interrupt_cleanup,
+            ),
         ):
             with self.assertRaises(ExportRecoveryError):
                 export_manga(self.root, self.manga_ref)
@@ -1045,9 +1051,7 @@ class ExporterTests(RepositoryFixture):
         result = export_manga(self.root, manga)
 
         expected = (
-            result.output_directory
-            / "Part\\One"
-            / exported_image_name("Part\\One", "page\\1.jpg")
+            result.output_directory / "Part\\One" / exported_image_name("Part\\One", "page\\1.jpg")
         )
         self.assertEqual(expected.read_bytes(), b"slash")
 

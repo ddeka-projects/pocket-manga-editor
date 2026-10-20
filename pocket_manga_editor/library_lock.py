@@ -34,15 +34,11 @@ def library_mutation_lock(working_directory: str | Path) -> Iterator[Path]:
 
     raw_root = Path(working_directory).expanduser()
     if is_link_or_reparse(raw_root):
-        raise LibraryLockError(
-            "The working directory cannot be a symbolic link or junction."
-        )
+        raise LibraryLockError("The working directory cannot be a symbolic link or junction.")
     try:
         root = raw_root.resolve(strict=True)
     except OSError as exc:
-        raise LibraryLockError(
-            f"The working directory could not be resolved: {exc}"
-        ) from exc
+        raise LibraryLockError(f"The working directory could not be resolved: {exc}") from exc
     if not root.is_dir():
         raise LibraryLockError(f"The working directory is not a folder: {root}")
 
@@ -51,9 +47,7 @@ def library_mutation_lock(working_directory: str | Path) -> Iterator[Path]:
         if is_link_or_reparse(metadata) or not metadata.is_dir():
             raise LibraryLockError("The app metadata folder is not a safe directory.")
         if not metadata.resolve().is_relative_to(root):
-            raise LibraryLockError(
-                "The app metadata folder points outside the working directory."
-            )
+            raise LibraryLockError("The app metadata folder points outside the working directory.")
     try:
         metadata.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
@@ -98,9 +92,7 @@ def library_mutation_lock(working_directory: str | Path) -> Iterator[Path]:
         if hasattr(errno, "EWOULDBLOCK"):
             busy_errors.add(errno.EWOULDBLOCK)
         if exc.errno in busy_errors:
-            raise LibraryBusyError(
-                "Another library mutation is already in progress."
-            ) from exc
+            raise LibraryBusyError("Another library mutation is already in progress.") from exc
         raise LibraryLockError(f"Could not acquire the library mutation lock: {exc}") from exc
 
     try:

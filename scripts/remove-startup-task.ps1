@@ -1,43 +1,20 @@
 #requires -Version 5.1
-
 [CmdletBinding()]
-param(
-    [string]$TaskName = "Pocket Manga Editor",
-    [switch]$RemoveFirewall
-)
-
-Set-StrictMode -Version Latest
-$ErrorActionPreference = "Stop"
-
+param([string]$TaskName = "", [switch]$RemoveFirewall)
+. (Join-Path $PSScriptRoot "windows-common.ps1")
+if (-not $TaskName) { $TaskName = $PocketAppName }
+Assert-PocketTaskName $TaskName
+if ($RemoveFirewall -and -not (Test-PocketAdministrator)) { throw "-RemoveFirewall requires PowerShell as Administrator under the same Windows account. No changes were made." }
+$task = Get-PocketTask $TaskName
+if ($null -ne $task) {
+    Stop-PocketTask $TaskName
+    Unregister-ScheduledTask -TaskName $TaskName -TaskPath "\" -Confirm:$false -ErrorAction Stop
+    Write-Host "Stopped and removed '$TaskName'."
+}
+else { Write-Host "Scheduled task not found: $TaskName" }
 if ($RemoveFirewall) {
-    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $principalCheck = New-Object Security.Principal.WindowsPrincipal($identity)
-    if (-not $principalCheck.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        throw "-RemoveFirewall needs an elevated PowerShell for the same Windows user. No changes were made."
-    }
+    Get-NetFirewallRule -DisplayName "$PocketAppName (Private LAN)" -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction Stop
+    Write-Host "Removed this app's firewall rule."
 }
-
-$taskNames = @($TaskName)
-if ($TaskName -eq "Pocket Manga Editor") {
-    $taskNames += "Pocket Manga Editor Server"
-}
-foreach ($name in $taskNames) {
-    $task = Get-ScheduledTask -TaskName $name -TaskPath "\" -ErrorAction SilentlyContinue
-    if ($null -ne $task) {
-        Stop-ScheduledTask -TaskName $name -TaskPath "\"
-        Unregister-ScheduledTask -TaskName $name -TaskPath "\" -Confirm:$false
-        Write-Host "Removed '$name'." -ForegroundColor Green
-    }
-}
-
-if ($RemoveFirewall) {
-    foreach ($name in @("Pocket Manga Editor (Private LAN)", "Pocket Manga Editor Server (Private LAN)")) {
-        Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue |
-            Remove-NetFirewallRule
-    }
-    Write-Host "Removed the Pocket Manga Editor firewall rule." -ForegroundColor Green
-}
-else {
-    Write-Host "Firewall was left as configured. To also remove its rules, run this script elevated with -RemoveFirewall."
-}
-Write-Host "The library, .env, virtual environment, metadata, output, and logs were not deleted."
+else { Write-Host "Firewall unchanged. To also remove its rule, run elevated with -RemoveFirewall." }
+Write-Host "Configuration, application data, media, and backups were retained."

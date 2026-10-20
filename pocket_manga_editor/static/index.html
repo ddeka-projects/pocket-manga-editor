@@ -14,10 +14,10 @@
     <meta name="format-detection" content="telephone=no">
     <title>Pocket Manga</title>
     <link rel="manifest" href="/manifest.webmanifest">
-    <link rel="icon" href="/assets/icon.svg" type="image/svg+xml">
-    <link rel="apple-touch-icon" href="/assets/icon-180.png">
-    <link rel="stylesheet" href="/assets/styles.css">
-    <script src="/assets/app.js" defer></script>
+    <link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+    <link rel="apple-touch-icon" href="/static/icon-180.png">
+    <link rel="stylesheet" href="/static/styles.css">
+    <script src="/static/app.js" defer></script>
   </head>
   <body>
     <div id="app" class="app-shell">
@@ -66,6 +66,7 @@
             </button>
           </header>
 
+          <button id="release-control" class="secondary-button" type="button">Release Control</button>
           <div id="library-summary" class="library-summary" aria-live="polite"></div>
           <div id="library-notice" class="notice" role="status" hidden></div>
           <div id="library-list" class="manga-list" role="list"></div>

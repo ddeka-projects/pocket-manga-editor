@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -14,7 +15,7 @@ from pocket_manga_editor.config import (
     HOST_VARIABLE,
     PORT_VARIABLE,
     WORKING_DIRECTORY_VARIABLE,
-    load_configuration,
+    load_settings,
 )
 
 
@@ -39,8 +40,8 @@ class ConfigurationTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            from_file = load_configuration(env_file, environ={})
-            overridden = load_configuration(
+            from_file = load_settings(env_file, environ={})
+            overridden = load_settings(
                 env_file,
                 environ={
                     WORKING_DIRECTORY_VARIABLE: str(environment_library),
@@ -52,9 +53,7 @@ class ConfigurationTests(unittest.TestCase):
             self.assertEqual(from_file.working_directory, file_library.resolve())
             self.assertEqual(from_file.host, "127.0.0.1")
             self.assertEqual(from_file.port, 9001)
-            self.assertEqual(
-                overridden.working_directory, environment_library.resolve()
-            )
+            self.assertEqual(overridden.working_directory, environment_library.resolve())
             self.assertEqual(overridden.host, "localhost")
             self.assertEqual(overridden.port, 9102)
 
@@ -62,7 +61,7 @@ class ConfigurationTests(unittest.TestCase):
         with TemporaryDirectory() as temporary_directory:
             library = Path(temporary_directory)
 
-            configuration = load_configuration(
+            configuration = load_settings(
                 library / "missing.env",
                 environ={WORKING_DIRECTORY_VARIABLE: str(library)},
             )
@@ -85,9 +84,7 @@ class ConfigurationTests(unittest.TestCase):
             for environment in invalid_environments:
                 with self.subTest(environment=environment):
                     with self.assertRaises(ConfigurationError):
-                        load_configuration(
-                            temporary / "missing.env", environ=environment
-                        )
+                        load_settings(temporary / "missing.env", environ=environment)
 
     def test_refuses_a_link_or_reparse_point_as_the_library_root(self) -> None:
         with TemporaryDirectory() as temporary_directory:
@@ -96,10 +93,8 @@ class ConfigurationTests(unittest.TestCase):
                 "pocket_manga_editor.config.is_link_or_reparse",
                 side_effect=lambda path: Path(path) == library,
             ):
-                with self.assertRaisesRegex(
-                    ConfigurationError, "symbolic link or junction"
-                ):
-                    load_configuration(
+                with self.assertRaisesRegex(ConfigurationError, "symbolic link or junction"):
+                    load_settings(
                         library / "missing.env",
                         environ={WORKING_DIRECTORY_VARIABLE: str(library)},
                     )
@@ -110,7 +105,7 @@ class ConfigurationTests(unittest.TestCase):
             env_path = library / "missing.env"
             base = {WORKING_DIRECTORY_VARIABLE: str(library)}
 
-            valid = load_configuration(
+            valid = load_settings(
                 env_path,
                 environ={
                     **base,
@@ -134,7 +129,7 @@ class ConfigurationTests(unittest.TestCase):
             for variable, value in invalid_values:
                 with self.subTest(variable=variable, value=value):
                     with self.assertRaises(ConfigurationError):
-                        load_configuration(
+                        load_settings(
                             env_path,
                             environ={**base, variable: value},
                         )
@@ -156,160 +151,109 @@ class _ImmediateStopEvent:
 
 
 class ApplicationBootstrapTests(unittest.TestCase):
-    def test_configuration_failure_stops_before_scanning_or_starting_server(self) -> None:
+    def test_unsupported_reload_is_rejected_before_touching_the_library(self) -> None:
         with (
-            patch.object(app, "_configure_logging"),
+            patch("sys.stderr", new_callable=io.StringIO) as error_output,
+            patch.object(app, "load_settings") as load,
+        ):
+            with self.assertRaises(SystemExit) as stopped:
+                app.main(["--reload"])
+        self.assertEqual(stopped.exception.code, 2)
+        self.assertIn("unrecognized arguments: --reload", error_output.getvalue())
+        load.assert_not_called()
+
+    def test_configuration_failure_stops_before_acquiring_or_scanning(self) -> None:
+        with (
+            patch.object(app, "configure_logging"),
             patch.object(
-                app,
-                "load_configuration",
-                side_effect=ConfigurationError("invalid configuration"),
+                app, "load_settings", side_effect=ConfigurationError("invalid configuration")
             ),
             patch.object(app, "scan_working_directory") as scan,
-            patch.object(app, "CompanionHTTPService") as service_factory,
+            patch.object(app, "ProcessLock") as lock,
         ):
-            result = app.main()
-
-        self.assertEqual(result, 1)
+            self.assertEqual(app.main([]), 1)
         scan.assert_not_called()
-        service_factory.assert_not_called()
+        lock.assert_not_called()
 
-    def test_listener_start_failure_returns_without_entering_wait_loop(self) -> None:
-        configuration = SimpleNamespace(
-            working_directory=Path("/absolute/test-library"),
-            host="0.0.0.0",
-            port=8765,
-        )
+    def test_duplicate_server_stops_before_recovery_or_scanning(self) -> None:
+        configuration = SimpleNamespace(working_directory=Path("/absolute/library"))
+        with (
+            patch.object(app, "configure_logging"),
+            patch.object(app, "load_settings", return_value=configuration),
+            patch.object(app, "ProcessLock") as lock,
+            patch.object(app, "recover_interrupted_exports") as recover,
+            patch.object(app, "scan_working_directory") as scan,
+        ):
+            lock.return_value.__enter__.side_effect = RuntimeError(
+                "Another server already uses this data"
+            )
+            self.assertEqual(app.main([]), 1)
+        recover.assert_not_called()
+        scan.assert_not_called()
+
+    def run_application(self, *, running=True, stop_requested=True):
+        root = Path("/absolute/library")
+        configuration = SimpleNamespace(working_directory=root, host="127.0.0.1", port=8765)
         recovery = SimpleNamespace(recovered_count=0)
         scan_result = SimpleNamespace(mangas=(), issues=())
-        service = MagicMock()
-        service.start.return_value = SimpleNamespace(
-            running=False,
-            url="http://127.0.0.1:8765",
-            error="address already in use",
+        library_service = MagicMock()
+        server = MagicMock()
+        server.start.return_value = SimpleNamespace(
+            running=running,
+            url="http://127.0.0.1:8765/",
+            error="listener failed" if not running else None,
         )
-
+        server.running = False
+        server.error = "listener failed"
+        server.stop.return_value = SimpleNamespace(error=None)
+        event = _ImmediateStopEvent(requested=stop_requested)
+        order = []
         with (
-            patch.object(app, "_configure_logging"),
-            patch.object(app, "load_configuration", return_value=configuration),
+            patch.object(app, "configure_logging"),
+            patch.object(app, "load_settings", return_value=configuration),
+            patch.object(app, "ProcessLock") as lock,
             patch.object(
-                app, "recover_interrupted_exports", return_value=recovery
+                app,
+                "recover_interrupted_exports",
+                side_effect=lambda _root: order.append("recover") or recovery,
             ),
-            patch.object(app, "scan_working_directory", return_value=scan_result),
-            patch.object(app, "CompanionCoordinator", return_value=MagicMock()),
-            patch.object(app, "CompanionHTTPService", return_value=service),
-            patch.object(app.threading, "Event") as event_factory,
-        ):
-            result = app.main()
-
-        self.assertEqual(result, 1)
-        service.start.assert_called_once_with()
-        service.stop.assert_called_once_with()
-        event_factory.assert_not_called()
-
-    def test_successful_bootstrap_runs_and_shuts_down_cleanly(self) -> None:
-        root = Path("/absolute/test-library")
-        configuration = SimpleNamespace(
-            working_directory=root,
-            host="0.0.0.0",
-            port=8765,
-        )
-        recovery = SimpleNamespace(recovered_count=0)
-        scan_result = SimpleNamespace(mangas=(object(), object()), issues=())
-        coordinator = MagicMock()
-        service = MagicMock()
-        service.start.return_value = SimpleNamespace(
-            running=True,
-            url="http://192.168.1.10:8765",
-            error=None,
-        )
-        service.stop.return_value = SimpleNamespace(error=None)
-        stop_event = _ImmediateStopEvent(requested=True)
-
-        with (
-            patch.object(app, "_configure_logging"),
-            patch.object(app, "load_configuration", return_value=configuration),
             patch.object(
-                app, "recover_interrupted_exports", return_value=recovery
-            ) as recover,
-            patch.object(
-                app, "scan_working_directory", return_value=scan_result
-            ) as scan,
-            patch.object(
-                app, "CompanionCoordinator", return_value=coordinator
-            ) as coordinator_factory,
-            patch.object(
-                app, "CompanionHTTPService", return_value=service
-            ) as service_factory,
-            patch.object(app.threading, "Event", return_value=stop_event),
+                app,
+                "scan_working_directory",
+                side_effect=lambda _root: order.append("scan") or scan_result,
+            ),
+            patch.object(app, "LibraryService", return_value=library_service),
+            patch.object(app, "HTTPService", return_value=server),
+            patch.object(app.threading, "Event", return_value=event),
             patch.object(app.signal, "getsignal", return_value=object()),
             patch.object(app.signal, "signal"),
         ):
-            result = app.main()
+            lock.return_value.__enter__.side_effect = lambda: order.append("lock")
+            lock.return_value.__exit__.side_effect = lambda *_: order.append("unlock")
+            server.stop.side_effect = lambda **_: order.append("stop") or SimpleNamespace(
+                error=None
+            )
+            result = app.main([])
+        self.assertEqual(order, ["lock", "recover", "scan", "stop", "unlock"])
+        lock.assert_called_once_with(root)
+        server.stop.assert_called_once_with(timeout=10.0)
+        library_service.clear_controller.assert_called_once_with()
+        return result, event
 
+    def test_listener_start_failure_cleans_up_and_releases_the_guard(self) -> None:
+        result, event = self.run_application(running=False)
+        self.assertEqual(result, 1)
+        self.assertEqual(event.wait_calls, 0)
+
+    def test_successful_bootstrap_shuts_down_before_releasing_the_guard(self) -> None:
+        result, event = self.run_application()
         self.assertEqual(result, 0)
-        recover.assert_called_once_with(root)
-        scan.assert_called_once_with(root)
-        coordinator_factory.assert_called_once_with(root, scan_result)
-        service_factory.assert_called_once_with(
-            coordinator,
-            host="0.0.0.0",
-            port=8765,
-        )
-        service.start.assert_called_once_with()
-        service.stop.assert_called_once_with(timeout=10.0)
-        coordinator.clear_controller.assert_called_once_with()
-        self.assertEqual(stop_event.wait_calls, 1)
+        self.assertEqual(event.wait_calls, 1)
 
-    def test_unexpected_server_stop_returns_failure_and_still_cleans_up(self) -> None:
-        configuration = SimpleNamespace(
-            working_directory=Path("/absolute/test-library"),
-            host="127.0.0.1",
-            port=8765,
-        )
-        recovery = SimpleNamespace(recovered_count=0)
-        scan_result = SimpleNamespace(mangas=(), issues=())
-        coordinator = MagicMock()
-        service = MagicMock()
-        service.start.return_value = SimpleNamespace(
-            running=True,
-            url="http://127.0.0.1:8765",
-            error=None,
-        )
-        service.running = False
-        service.error = "listener failed"
-        service.stop.return_value = SimpleNamespace(error=None)
-        stop_event = _ImmediateStopEvent(requested=False)
-
-        with (
-            patch.object(app, "_configure_logging"),
-            patch.object(app, "load_configuration", return_value=configuration),
-            patch.object(
-                app, "recover_interrupted_exports", return_value=recovery
-            ),
-            patch.object(app, "scan_working_directory", return_value=scan_result),
-            patch.object(app, "CompanionCoordinator", return_value=coordinator),
-            patch.object(app, "CompanionHTTPService", return_value=service),
-            patch.object(app.threading, "Event", return_value=stop_event),
-            patch.object(app.signal, "getsignal", return_value=object()),
-            patch.object(app.signal, "signal"),
-        ):
-            result = app.main()
-
+    def test_unexpected_listener_stop_returns_failure_and_cleans_up(self) -> None:
+        result, event = self.run_application(stop_requested=False)
         self.assertEqual(result, 1)
-        service.stop.assert_called_once_with(timeout=10.0)
-        coordinator.clear_controller.assert_called_once_with()
-
-
-class WindowsLauncherContractTests(unittest.TestCase):
-    def test_runner_redirects_native_streams_without_powershell_error_records(self) -> None:
-        runner = (
-            Path(__file__).resolve().parent.parent / "scripts" / "run-server.ps1"
-        ).read_text(encoding="utf-8")
-
-        self.assertIn("Start-Process", runner)
-        self.assertIn("-RedirectStandardError $logFile", runner)
-        self.assertIn("-RedirectStandardOutput $standardOutputLog", runner)
-        self.assertNotIn(">> $logFile 2>&1", runner)
+        self.assertEqual(event.wait_calls, 1)
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@
   const ROUTES = Object.freeze({
     claim: "/api/controller/claim",
     takeover: "/api/controller/takeover",
+    release: "/api/controller/release",
     library: "/api/library",
     rescan: "/api/library/rescan",
     manga: (id, activity) => (
@@ -36,6 +37,7 @@
     stateDetail: element("state-detail"),
     libraryScreen: element("library-screen"),
     libraryRefresh: element("library-refresh"),
+    releaseControl: element("release-control"),
     librarySummary: element("library-summary"),
     libraryNotice: element("library-notice"),
     libraryList: element("library-list"),
@@ -158,6 +160,7 @@
       }
     });
     elements.libraryRefresh.addEventListener("click", () => void rescanLibrary());
+    elements.releaseControl.addEventListener("click", () => void releaseController());
     elements.emptyRetry.addEventListener("click", () => void rescanLibrary());
     elements.backToLibrary.addEventListener("click", navigateBackAfterMutations);
     elements.chooseRead.addEventListener("click", () => void chooseActivity(READ));
@@ -239,7 +242,7 @@
     const headers = new Headers(options.headers || {});
     headers.set("Accept", "application/json");
     if (needsController) {
-      headers.set("X-Controller-Page", state.pageId);
+      headers.set("X-Page-Id", state.pageId);
       headers.set("X-Controller-Token", controllerToken);
     }
     let body;
@@ -300,7 +303,7 @@
         method: "GET",
         headers: {
           Accept: "image/avif,image/webp,image/png,image/jpeg,*/*;q=0.5",
-          "X-Controller-Page": state.pageId,
+          "X-Page-Id": state.pageId,
           "X-Controller-Token": controllerToken,
         },
         credentials: "same-origin",
@@ -486,24 +489,39 @@
     }
   }
 
-  function loseControl(message) {
+  async function releaseController() {
+    if (!state.ownsControl || !(await drainPendingMutations())) {
+      return;
+    }
+    try {
+      await requestJson(ROUTES.release, {
+        method: "POST",
+        body: { page_id: state.pageId, token: state.controllerToken },
+      });
+      state.ownsControl = false;
+      state.controllerToken = null;
+      state.controllerEpoch += 1;
+      updateControllerControls();
+      showState({
+        kicker: "Control released",
+        title: "Ready when you are",
+        message: "Take control here or open the app on another device.",
+        loading: false,
+        actionLabel: "Take Control",
+        action: () => acquireController(),
+      });
+    } catch (error) {
+      await handleSessionError(error, releaseController);
+    }
+  }
+
+  function loseControl() {
     state.ownsControl = false;
     state.controllerToken = null;
     state.controllerEpoch += 1;
     state.connectionInterrupted = false;
     updateControllerControls();
-    const action = () => acquireController({ takeover: true });
-    if (hasVisibleAppView()) {
-      showActionError(
-        "Control moved elsewhere",
-        message || "Another page took control. This screen has been kept in place.",
-        action,
-        "Take Control",
-        false,
-      );
-    } else {
-      showOccupied();
-    }
+    showOccupied();
   }
 
   async function handleSessionError(error, retry) {
@@ -2110,6 +2128,7 @@
   function updateControllerControls() {
     const disabled = !state.ownsControl;
     elements.libraryRefresh.disabled = disabled || state.rescanBusy;
+    elements.releaseControl.disabled = disabled || state.rescanBusy || state.exportBusy;
     elements.emptyRetry.disabled = disabled || state.rescanBusy;
     elements.chooseRead.disabled = disabled || state.activityOpening || state.exportBusy;
     elements.chooseEdit.disabled = disabled || state.activityOpening || state.exportBusy;

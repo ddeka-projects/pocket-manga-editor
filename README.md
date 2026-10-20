@@ -43,7 +43,7 @@ C:\Manga Library\
 
 ## First-time Windows setup
 
-Python 3.10 or newer is required. Open PowerShell in the repository and run:
+Python 3.11 or newer is required. Open PowerShell in the repository and run:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\bootstrap-windows.ps1
@@ -64,20 +64,15 @@ junction. Do not use `~` or a relative path. Prefer a local disk that is
 available as soon as you sign in. Real Windows environment variables override
 values from `.env`.
 
-This development release intentionally does not migrate metadata created by
-the former desktop/completion builds. Before its first run, move aside any old
-output you want to keep and remove the old manga workspace under
-`.pocket-manga-editor`; the server will create the smaller metadata format as
-you use it.
-
 For a manual foreground run:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\run-server.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\run-dev.ps1
 ```
 
-Server output is appended under `logs\`. Open `http://127.0.0.1:8765/` on the
-PC. From another trusted LAN device, use the PC's stable private IPv4 address,
+Server output is written to `logs\server.log` (5 MiB per file, with three
+rotated backups). Open `http://127.0.0.1:8765/` on the PC. From another trusted
+LAN device, use the PC's stable private IPv4 address,
 for example `http://192.168.1.20:8765/`.
 
 ## Start automatically at your logon
@@ -89,8 +84,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-startup-task.ps1
 ```
 
 This installs and immediately starts **Pocket Manga Editor** at your user logon
-with limited privileges, duplicate instances ignored, no runtime limit, and
-restart after failure. The PC must remain signed in and awake.
+with limited privileges, a console-free Python process, no runtime limit,
+and restart after failure. A second server using the same library is refused,
+even when launched manually on another port. The PC must remain signed in and awake.
 
 For first-time phone access or after changing the port, run the following from
 **PowerShell as Administrator using the same Windows account**:
@@ -121,7 +117,12 @@ Removal stops and unregisters the task. Firewall rules stay in place unless
 metadata, and output.
 
 After updating the code, rerun `bootstrap-windows.ps1` to apply any future
-requirement changes, then restart the scheduled task or run the installer again.
+requirement changes, then double-click `restart-server.cmd` in the repository
+root. It stops and waits for **Pocket Manga Editor**, starts it again, and
+checks `/health`. It asks
+for administrator access only if the task permissions require it and keeps
+the result visible. Finish active saves and exports before restarting.
+Reinstall the task after changing setup scripts or moving the repository.
 
 ## Web application
 
@@ -145,7 +146,9 @@ controls.
 Only one browser page can control the library at a time. Closing or navigating
 away does not depend on an unreliable browser shutdown signal: ownership stays
 with that page until another page chooses **Take Control** or the server
-restarts. Takeover is immediate after any save or export already being committed
+restarts. **Release Control** on the library screen gives up ownership
+deliberately. Other pages show a waiting screen until they take control.
+Takeover is immediate after any save or export already being committed
 finishes. There is no heartbeat timeout, paired-device credential, or permanent
 ownership file; the trusted private LAN is the authorization boundary.
 
@@ -156,7 +159,7 @@ explicit value and are idempotent. If control moved to another page, the old
 page must explicitly take it back; the app then refreshes authoritative state
 instead of blindly replaying uncertain writes.
 
-See [Local web server behavior](docs/server-mode.md) for operational and
+See [Application design](docs/design.md) for operational and
 security details.
 
 ## App-managed workspace
@@ -182,6 +185,15 @@ crash-recovery state only while an export is being committed or cleaned up.
 Everything under `.pocket-manga-editor` is application-managed. Do not edit it
 or add files that need to be preserved. The user may move a completed `output`
 folder elsewhere and may manually delete source or workspace folders.
+
+For a backup, stop the server and copy the entire `.pocket-manga-editor`
+folder to a location outside the library, together with `.env`. To restore,
+stop the server and restore that folder into the same library. Source images
+need their own backup; Git does not contain them or your workspace. Export
+transaction recovery protects interrupted replacements; it is not a backup.
+Malformed reading or editing metadata produces an error and remains untouched.
+Restore a known-good copy before continuing; stale positions referring to
+removed images instead return to the first available image with a warning.
 
 There is intentionally no **Complete Manga** operation. Export does not delete
 source files or clear reading/selections.
@@ -225,6 +237,14 @@ Run the test suite with:
 .venv\Scripts\python -m unittest discover -s tests -v
 ```
 
+Install `requirements-dev.txt` for development tools. Check the common Python
+format with `python -m black --check pocket_manga_editor scripts tests` from
+the activated virtual environment. PowerShell lifecycle checks use `powershell`
+or `pwsh` when available; real Task Scheduler, UAC, and iPhone behavior still
+need verification on Windows and the phone.
+
 The suite covers scanning and ordering, reading/editing persistence, safe path
 handling, whole-output export and crash recovery, token ownership, HTTP/API
-security, image delivery, and web-client behavior.
+security, image delivery, and web-client behavior. Optional JavaScript behavior
+checks use Node.js on Windows or JavaScriptCore on macOS; the app itself requires
+neither runtime.

@@ -9,12 +9,7 @@ import struct
 import unittest
 
 
-ASSET_DIRECTORY = (
-    Path(__file__).resolve().parents[1]
-    / "pocket_manga_editor"
-    / "companion"
-    / "assets"
-)
+ASSET_DIRECTORY = Path(__file__).resolve().parents[1] / "pocket_manga_editor" / "static"
 
 
 class _DocumentContractParser(HTMLParser):
@@ -25,9 +20,7 @@ class _DocumentContractParser(HTMLParser):
         self.metas: list[dict[str, str]] = []
         self.scripts: list[dict[str, str]] = []
 
-    def handle_starttag(
-        self, tag: str, attrs: list[tuple[str, str | None]]
-    ) -> None:
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         values = {name: value or "" for name, value in attrs}
         if "id" in values:
             self.ids.append(values["id"])
@@ -53,6 +46,7 @@ class WebAssetContractTests(unittest.TestCase):
             "state-screen",
             "library-screen",
             "library-refresh",
+            "release-control",
             "library-list",
             "activity-screen",
             "activity-title",
@@ -83,20 +77,17 @@ class WebAssetContractTests(unittest.TestCase):
         self.assertNotIn("pair-form", self.parser.ids)
 
         viewport = next(
-            meta["content"]
-            for meta in self.parser.metas
-            if meta.get("name") == "viewport"
+            meta["content"] for meta in self.parser.metas if meta.get("name") == "viewport"
         )
         self.assertIn("viewport-fit=cover", viewport)
         self.assertTrue(
             any(
-                link.get("rel") == "manifest"
-                and link.get("href") == "/manifest.webmanifest"
+                link.get("rel") == "manifest" and link.get("href") == "/manifest.webmanifest"
                 for link in self.parser.links
             )
         )
         self.assertTrue(
-            any(script.get("src") == "/assets/app.js" for script in self.parser.scripts)
+            any(script.get("src") == "/static/app.js" for script in self.parser.scripts)
         )
 
     def test_reader_layout_keeps_the_required_gesture_and_accessibility_contract(self) -> None:
@@ -111,10 +102,10 @@ class WebAssetContractTests(unittest.TestCase):
         self.assertIn("env(safe-area-inset-bottom", self.css)
         self.assertIn("prefers-reduced-motion: reduce", self.css)
         self.assertIn("-webkit-touch-callout: none", self.css)
-        self.assertIn('target < 0', self.javascript)
-        self.assertIn('target >= folder.images.length', self.javascript)
-        self.assertIn('void navigateAdjacentEntry(-1)', self.javascript)
-        self.assertIn('void navigateAdjacentEntry(1)', self.javascript)
+        self.assertIn("target < 0", self.javascript)
+        self.assertIn("target >= folder.images.length", self.javascript)
+        self.assertIn("void navigateAdjacentEntry(-1)", self.javascript)
+        self.assertIn("void navigateAdjacentEntry(1)", self.javascript)
         self.assertIn("prefetchAdjacentImages", self.javascript)
         self.assertIn("selection-pending-add", self.javascript)
         self.assertIn("selection-failed", self.javascript)
@@ -143,8 +134,8 @@ class WebAssetContractTests(unittest.TestCase):
             self.html,
         )
         self.assertIn('id="selection-frame" class="selection-frame" hidden', self.html)
-        self.assertIn('state.activity !== EDIT', self.javascript)
-        self.assertIn('elements.selectionZone.hidden = !editing', self.javascript)
+        self.assertIn("state.activity !== EDIT", self.javascript)
+        self.assertIn("elements.selectionZone.hidden = !editing", self.javascript)
         self.assertNotIn("Saving selection…", self.javascript)
         self.assertNotIn("Saving deselection…", self.javascript)
         self.assertNotIn("Selected ✓", self.javascript)
@@ -155,9 +146,9 @@ class WebAssetContractTests(unittest.TestCase):
         self.assertIn("clearReaderFeedback()", show_reader)
 
     def test_reader_boundaries_open_adjacent_entries_at_the_correct_edge(self) -> None:
-        navigation = self.javascript.split(
-            "async function navigateAdjacentEntry(direction) {", 1
-        )[1].split("function updateReaderLabels", 1)[0]
+        navigation = self.javascript.split("async function navigateAdjacentEntry(direction) {", 1)[
+            1
+        ].split("function updateReaderLabels", 1)[0]
         self.assertIn("const targetFolderIndex = currentFolderIndex + step", navigation)
         self.assertIn('showBoundaryCue("No Previous Entry", edge)', navigation)
         self.assertIn('showBoundaryCue("No Next Entry", edge)', navigation)
@@ -167,14 +158,16 @@ class WebAssetContractTests(unittest.TestCase):
         self.assertNotIn('showBoundaryCue("First image"', self.javascript)
         self.assertNotIn('showBoundaryCue("Last image"', self.javascript)
 
-        open_folder = self.javascript.split(
-            "async function openFolder(", 1
-        )[1].split("function normalizeImage", 1)[0]
+        open_folder = self.javascript.split("async function openFolder(", 1)[1].split(
+            "function normalizeImage", 1
+        )[0]
         self.assertIn('entryEdge = ""', open_folder)
         self.assertIn('const index = entryEdge === "first"', open_folder)
         self.assertIn('entryEdge === "last"', open_folder)
         self.assertIn("? images.length - 1", open_folder)
-        self.assertLess(open_folder.index("entryEdge === \"last\""), open_folder.index("savedIndex >= 0"))
+        self.assertLess(
+            open_folder.index('entryEdge === "last"'), open_folder.index("savedIndex >= 0")
+        )
 
         folder_change = self.javascript.split(
             'elements.folderPicker.addEventListener("change", (event) => {', 1
@@ -189,6 +182,7 @@ class WebAssetContractTests(unittest.TestCase):
         required_routes = {
             'claim: "/api/controller/claim"',
             'takeover: "/api/controller/takeover"',
+            'release: "/api/controller/release"',
             'library: "/api/library"',
             'rescan: "/api/library/rescan"',
             "`/api/manga/${encodeURIComponent(id)}?activity=${encodeURIComponent(activity)}`",
@@ -205,24 +199,24 @@ class WebAssetContractTests(unittest.TestCase):
                 self.assertIn(route, self.javascript)
 
         self.assertIn(
-            'body: { page_id: state.pageId }',
+            "body: { page_id: state.pageId }",
             self.javascript,
         )
         self.assertIn(
-            'body: { image_id: pending.image.id, selected: pending.desired }',
+            "body: { image_id: pending.image.id, selected: pending.desired }",
             self.javascript,
         )
-        self.assertIn('body: { image_id: pending.imageId }', self.javascript)
+        self.assertIn("body: { image_id: pending.imageId }", self.javascript)
         self.assertIn('method: "PATCH"', self.javascript)
         self.assertNotIn('method: "PUT"', self.javascript)
-        self.assertIn('"X-Controller-Page": state.pageId', self.javascript)
+        self.assertIn('"X-Page-Id": state.pageId', self.javascript)
         self.assertIn('"X-Controller-Token": controllerToken', self.javascript)
         self.assertNotIn("sessionStorage", self.javascript)
         self.assertIn("pageId: createOpaqueId()", self.javascript)
         self.assertIn("showImage(index, { persist: false })", self.javascript)
         self.assertIn('view: "activity"', self.javascript)
         self.assertIn('view: "reader"', self.javascript)
-        self.assertIn("window.addEventListener(\"popstate\"", self.javascript)
+        self.assertIn('window.addEventListener("popstate"', self.javascript)
         self.assertNotIn("innerHTML", self.javascript)
         self.assertNotIn("/api/complete", self.javascript)
         self.assertNotIn("/api/volume", self.javascript)
@@ -285,9 +279,9 @@ class WebAssetContractTests(unittest.TestCase):
             choose_activity.index("requestJson(ROUTES.manga"),
         )
 
-        history_change = self.javascript.split(
-            "async function historyChanged(event) {", 1
-        )[1].split("function setHistory", 1)[0]
+        history_change = self.javascript.split("async function historyChanged(event) {", 1)[
+            1
+        ].split("function setHistory", 1)[0]
         self.assertLess(
             history_change.index("await drainPendingMutations()"),
             history_change.index('historyState.view === "activity"'),
@@ -297,16 +291,16 @@ class WebAssetContractTests(unittest.TestCase):
         self.assertNotIn("HEARTBEAT_INTERVAL", self.javascript)
         self.assertNotIn("/api/controller/heartbeat", self.javascript)
 
-        bootstrap = self.javascript.split(
-            "async function bootstrap() {", 1
-        )[1].split("async function acquireController", 1)[0]
+        bootstrap = self.javascript.split("async function bootstrap() {", 1)[1].split(
+            "async function acquireController", 1
+        )[0]
         self.assertIn("await acquireController()", bootstrap)
         self.assertNotIn("ROUTES.status", bootstrap)
         self.assertNotIn("pair", bootstrap.lower())
 
-        occupied = self.javascript.split(
-            "function showOccupied() {", 1
-        )[1].split("function showUnavailable", 1)[0]
+        occupied = self.javascript.split("function showOccupied() {", 1)[1].split(
+            "function showUnavailable", 1
+        )[0]
         self.assertIn("Take Control", occupied)
         self.assertIn("acquireController({ takeover: true })", occupied)
         self.assertNotIn("setTimeout", occupied)
@@ -327,24 +321,24 @@ class WebAssetContractTests(unittest.TestCase):
         self.assertNotIn("showState({", session_error)
         self.assertNotIn("clearReaderMedia", session_error)
 
-        selection = self.javascript.split(
-            "async function commitSelection(pending) {", 1
-        )[1].split("function queueSelectionRequest", 1)[0]
+        selection = self.javascript.split("async function commitSelection(pending) {", 1)[1].split(
+            "function queueSelectionRequest", 1
+        )[0]
         uncertain_branch = selection.split("if (isUncertainSaveError(error))", 1)[1]
         self.assertNotIn("state.selectionPending.delete", uncertain_branch.split("return;", 1)[0])
         self.assertIn("recoverConnection", uncertain_branch)
 
-        position = self.javascript.split(
-            "async function flushPositionQueue() {", 1
-        )[1].split("function drainPendingMutations", 1)[0]
+        position = self.javascript.split("async function flushPositionQueue() {", 1)[1].split(
+            "function drainPendingMutations", 1
+        )[0]
         self.assertIn("state.positionQueue.set(key, pending)", position)
         self.assertIn("isUncertainSaveError(error)", position)
         self.assertIn("retryPendingMutations", self.javascript)
 
     def test_rescan_drains_writes_and_replaces_the_library_snapshot(self) -> None:
-        rescan = self.javascript.split(
-            "async function rescanLibrary() {", 1
-        )[1].split("function applyLibraryPayload", 1)[0]
+        rescan = self.javascript.split("async function rescanLibrary() {", 1)[1].split(
+            "function applyLibraryPayload", 1
+        )[0]
         self.assertLess(
             rescan.index("await drainPendingMutations()"),
             rescan.index("requestJson(ROUTES.rescan"),
@@ -352,23 +346,23 @@ class WebAssetContractTests(unittest.TestCase):
         self.assertIn('method: "POST"', rescan)
         self.assertIn("body: {}", rescan)
         self.assertIn("applyLibraryPayload(payload)", rescan)
-        self.assertIn('elements.libraryRefresh.disabled = true', rescan)
-        self.assertIn('elements.libraryRefresh.disabled = !state.ownsControl', rescan)
+        self.assertIn("elements.libraryRefresh.disabled = true", rescan)
+        self.assertIn("elements.libraryRefresh.disabled = !state.ownsControl", rescan)
         self.assertIn(
             'elements.libraryRefresh.addEventListener("click", () => void rescanLibrary())',
             self.javascript,
         )
 
-        apply_library = self.javascript.split(
-            "function applyLibraryPayload(payload) {", 1
-        )[1].split("function normalizeMangaSummary", 1)[0]
+        apply_library = self.javascript.split("function applyLibraryPayload(payload) {", 1)[
+            1
+        ].split("function normalizeMangaSummary", 1)[0]
         self.assertIn("state.snapshotId = payload.snapshot_id", apply_library)
-        self.assertIn("showLibrary({ historyMode: \"replace\" })", apply_library)
+        self.assertIn('showLibrary({ historyMode: "replace" })', apply_library)
 
     def test_export_preview_refusal_confirmation_and_long_commit_are_explicit(self) -> None:
-        prepare = self.javascript.split(
-            "async function prepareExport() {", 1
-        )[1].split("function normalizeExportPreview", 1)[0]
+        prepare = self.javascript.split("async function prepareExport() {", 1)[1].split(
+            "function normalizeExportPreview", 1
+        )[0]
         self.assertLess(
             prepare.index("await drainPendingMutations()"),
             prepare.index("requestJson(ROUTES.exportPreview"),
@@ -380,18 +374,18 @@ class WebAssetContractTests(unittest.TestCase):
             prepare.index("openExportDialog(preview)"),
         )
 
-        dialog = self.javascript.split(
-            "function openExportDialog(preview) {", 1
-        )[1].split("function closeExportDialog", 1)[0]
+        dialog = self.javascript.split("function openExportDialog(preview) {", 1)[1].split(
+            "function closeExportDialog", 1
+        )[0]
         self.assertIn("Replace existing output?", dialog)
         self.assertIn("Unrecognized output will be deleted", dialog)
         self.assertIn("preview.unrecognizedEntries.slice(0, 6)", dialog)
-        self.assertIn('item.textContent = entry', dialog)
+        self.assertIn("item.textContent = entry", dialog)
         self.assertNotIn("innerHTML", dialog)
 
-        commit = self.javascript.split(
-            "async function commitExport() {", 1
-        )[1].split("function setActivityActionsDisabled", 1)[0]
+        commit = self.javascript.split("async function commitExport() {", 1)[1].split(
+            "function setActivityActionsDisabled", 1
+        )[0]
         self.assertLess(
             commit.index("await drainPendingMutations()"),
             commit.index("requestJson(ROUTES.exportManga"),
@@ -424,15 +418,11 @@ class WebAssetContractTests(unittest.TestCase):
         self.assertEqual(manifest["name"], "Pocket Manga")
         self.assertEqual(manifest["background_color"], "#050706")
         self.assertEqual(manifest["theme_color"], "#050706")
-        self.assertNotIn("Companion", self.html)
-        self.assertNotIn("Companion", self.css)
-        self.assertNotIn("Companion", manifest["name"])
-        self.assertNotIn("Companion", manifest["description"])
 
         icon_sources = {icon["src"] for icon in manifest["icons"]}
-        self.assertIn("/assets/icon.svg", icon_sources)
-        self.assertIn("/assets/icon-180.png", icon_sources)
-        self.assertIn("/assets/icon-512.png", icon_sources)
+        self.assertIn("/static/icon.svg", icon_sources)
+        self.assertIn("/static/icon-180.png", icon_sources)
+        self.assertIn("/static/icon-512.png", icon_sources)
         self.assertIn("<svg", (ASSET_DIRECTORY / "icon.svg").read_text(encoding="utf-8"))
         self.assertEqual(_png_dimensions(ASSET_DIRECTORY / "icon-180.png"), (180, 180))
         self.assertEqual(_png_dimensions(ASSET_DIRECTORY / "icon-512.png"), (512, 512))

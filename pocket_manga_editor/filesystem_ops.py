@@ -81,9 +81,7 @@ def prepare_managed_path(path: str | Path) -> os.stat_result:
     parent = target.parent
     if parent != target:
         if is_link_or_reparse(parent):
-            raise OSError(
-                errno.ELOOP, "Managed path parent cannot be a link", str(parent)
-            )
+            raise OSError(errno.ELOOP, "Managed path parent cannot be a link", str(parent))
         parent_information = parent.stat(follow_symlinks=False)
         if information.st_dev != parent_information.st_dev:
             raise OSError(
@@ -126,9 +124,7 @@ def _prepare_managed_path(path: Path, *, root_device: int) -> os.stat_result:
     return information
 
 
-def _add_owner_access(
-    path: Path, information: os.stat_result, *, directory: bool
-) -> None:
+def _add_owner_access(path: Path, information: os.stat_result, *, directory: bool) -> None:
     current = stat.S_IMODE(information.st_mode)
     required = stat.S_IRUSR | stat.S_IWUSR
     if directory:
@@ -145,7 +141,7 @@ def _add_owner_access(
 
 
 def _retry_read_only_removal(function, path: str, exception_info) -> None:
-    """One fail-closed chmod-and-retry hook for Python 3.10 ``rmtree``."""
+    """One fail-closed chmod-and-retry hook for ``rmtree``."""
 
     candidate = Path(path)
     if not os.path.lexists(candidate):
@@ -156,9 +152,7 @@ def _retry_read_only_removal(function, path: str, exception_info) -> None:
             stat.S_ISREG(information.st_mode) or stat.S_ISDIR(information.st_mode)
         ):
             raise OSError(errno.EPERM, "Unsafe path encountered during removal", path)
-        _add_owner_access(
-            candidate, information, directory=stat.S_ISDIR(information.st_mode)
-        )
+        _add_owner_access(candidate, information, directory=stat.S_ISDIR(information.st_mode))
         function(path)
     except BaseException:
         original = exception_info[1]

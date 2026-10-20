@@ -125,17 +125,13 @@ def exported_image_name(folder_name: str, image_name: str) -> str:
     return f"{folder_name}__{image_name}"
 
 
-def manga_output_directory(
-    working_directory: str | Path, manga: MangaRef
-) -> Path:
+def manga_output_directory(working_directory: str | Path, manga: MangaRef) -> Path:
     validate_live_manga(working_directory, manga)
     workspace = manga_workspace_paths(working_directory, manga.name)
     return validate_output_workspace(workspace).output
 
 
-def inspect_export(
-    working_directory: str | Path, manga: MangaRef
-) -> ExportPreview:
+def inspect_export(working_directory: str | Path, manga: MangaRef) -> ExportPreview:
     """Describe a prospective full replacement without changing output."""
 
     try:
@@ -231,16 +227,12 @@ def _export_manga_locked(
         workspace.transactions.mkdir(parents=False, exist_ok=True)
         _fsync_directory(workspace.workspace)
     except OSError as exc:
-        raise ExportError(
-            f"Could not create the export transaction workspace: {exc}"
-        ) from exc
+        raise ExportError(f"Could not create the export transaction workspace: {exc}") from exc
     workspace = validate_export_workspace(manga_workspace_paths(root, manga.name))
 
     try:
         transaction = Path(
-            tempfile.mkdtemp(
-                prefix=_EXPORT_TRANSACTION_PREFIX, dir=workspace.transactions
-            )
+            tempfile.mkdtemp(prefix=_EXPORT_TRANSACTION_PREFIX, dir=workspace.transactions)
         )
     except OSError as exc:
         raise ExportError(f"Could not create an export transaction: {exc}") from exc
@@ -289,9 +281,7 @@ def _export_manga_locked(
         if had_output:
             _rename_no_replace(workspace.output, old_output)
             if not _tree_matches(old_output, old_output_digest):
-                raise ExportConflict(
-                    "Manga output changed immediately before it was staged."
-                )
+                raise ExportConflict("Manga output changed immediately before it was staged.")
         _rename_no_replace(new_output, workspace.output)
         if not _tree_matches(workspace.output, new_output_digest):
             raise ExportConflict("New manga output changed while it was installed.")
@@ -332,13 +322,10 @@ def _export_manga_locked(
             try:
                 _cleanup_transaction(transaction, workspace.transactions)
             except (OSError, ExportError) as cleanup_exc:
-                rollback_errors.append(
-                    f"could not remove export staging: {cleanup_exc}"
-                )
+                rollback_errors.append(f"could not remove export staging: {cleanup_exc}")
         if rollback_errors:
             raise ExportRecoveryError(
-                "Export failed and rollback was incomplete: "
-                + "; ".join(rollback_errors)
+                "Export failed and rollback was incomplete: " + "; ".join(rollback_errors)
             ) from exc
         if isinstance(exc, ExportError):
             raise
@@ -364,9 +351,7 @@ def _selected_images(
         for image in folder.images:
             if image.name not in selected:
                 continue
-            relative = Path(folder.name) / exported_image_name(
-                folder.name, image.name
-            )
+            relative = Path(folder.name) / exported_image_name(folder.name, image.name)
             _validate_destination_path(workspace, relative)
             _record_collision(seen_targets, relative, (folder.name, image.name))
             desired.append(_DesiredImage(folder, image, relative))
@@ -385,15 +370,11 @@ def _unrecognized_output_entries(
     for folder in manga.folders:
         _record_folder_collision(allowed_folders, folder.name)
         for image in folder.images:
-            relative = Path(folder.name) / exported_image_name(
-                folder.name, image.name
-            )
+            relative = Path(folder.name) / exported_image_name(folder.name, image.name)
             key = _path_key(relative)
             previous = allowed_files.get(key)
             if previous is not None and previous != relative:
-                raise ExportConflict(
-                    f"Source output paths '{previous}' and '{relative}' collide."
-                )
+                raise ExportConflict(f"Source output paths '{previous}' and '{relative}' collide.")
             allowed_files[key] = relative
 
     unrecognized: list[str] = []
@@ -407,8 +388,7 @@ def _unrecognized_output_entries(
             )
         else:
             recognized = (
-                len(relative.parts) == 2
-                and allowed_files.get(_path_key(relative)) == relative
+                len(relative.parts) == 2 and allowed_files.get(_path_key(relative)) == relative
             )
         if not recognized:
             suffix = "/" if stat.S_ISDIR(information.st_mode) else ""
@@ -429,9 +409,7 @@ def recover_interrupted_exports_locked(root: Path) -> ExportRecoveryResult:
             metadata.iterdir(), key=lambda path: natural_name_key(path.name)
         )
     except OSError as exc:
-        raise ExportRecoveryError(
-            f"Could not inspect export transactions: {exc}"
-        ) from exc
+        raise ExportRecoveryError(f"Could not inspect export transactions: {exc}") from exc
 
     committed_count = 0
     rolled_back_count = 0
@@ -542,9 +520,7 @@ def _rollback_prepared(
     return errors
 
 
-def _load_journal(
-    path: Path, manga_name: str, transaction_id: str
-) -> dict[str, object]:
+def _load_journal(path: Path, manga_name: str, transaction_id: str) -> dict[str, object]:
     if is_link_or_reparse(path) or not path.is_file():
         raise ExportRecoveryError(f"Export journal '{path}' is not a safe file.")
     try:
@@ -577,9 +553,7 @@ def _load_journal(
     ):
         raise ExportRecoveryError(f"Export journal '{path}' has an invalid format.")
     if payload["had_output"] != (payload["old_output_digest"] is not None):
-        raise ExportRecoveryError(
-            f"Export journal '{path}' has inconsistent output state."
-        )
+        raise ExportRecoveryError(f"Export journal '{path}' has inconsistent output state.")
     return payload
 
 
@@ -587,9 +561,7 @@ def _discard_markerless_transaction(transaction: Path) -> None:
     try:
         entries = tuple(transaction.iterdir())
     except OSError as exc:
-        raise ExportRecoveryError(
-            f"Could not inspect markerless export staging: {exc}"
-        ) from exc
+        raise ExportRecoveryError(f"Could not inspect markerless export staging: {exc}") from exc
     for entry in entries:
         if entry.name == "old-output":
             raise ExportRecoveryError(
@@ -613,9 +585,7 @@ def _cleanup_transaction(transaction: Path, transaction_root: Path) -> None:
     try:
         entries = tuple(transaction.iterdir())
     except OSError as exc:
-        raise ExportRecoveryError(
-            f"Could not inspect export cleanup staging: {exc}"
-        ) from exc
+        raise ExportRecoveryError(f"Could not inspect export cleanup staging: {exc}") from exc
     allowed = {"new-output", "old-output", _JOURNAL_NAME}
     for entry in entries:
         if entry.name not in allowed and not _is_journal_temporary(entry):
@@ -625,9 +595,7 @@ def _cleanup_transaction(transaction: Path, transaction_root: Path) -> None:
         if entry.name in {"new-output", "old-output"}:
             _validate_safe_tree(entry)
         elif is_link_or_reparse(entry) or not entry.is_file():
-            raise ExportRecoveryError(
-                f"Export cleanup marker is not a safe file: '{entry}'."
-            )
+            raise ExportRecoveryError(f"Export cleanup marker is not a safe file: '{entry}'.")
 
     for name in ("new-output", "old-output"):
         payload = transaction / name
@@ -650,9 +618,7 @@ def _validate_safe_tree(root: Path) -> dict[str, Path]:
     try:
         root_device = root.stat(follow_symlinks=False).st_dev
         if root_device != root.parent.stat(follow_symlinks=False).st_dev:
-            raise ExportError(
-                f"Managed output is a mounted filesystem boundary: '{root}'."
-            )
+            raise ExportError(f"Managed output is a mounted filesystem boundary: '{root}'.")
     except OSError as exc:
         raise ExportError(f"Could not inspect managed output '{root}': {exc}") from exc
     paths: dict[str, Path] = {}
@@ -674,20 +640,13 @@ def _validate_safe_tree(root: Path) -> dict[str, Path]:
                     raise ExportError(
                         f"Managed output crosses a mounted filesystem boundary: '{path}'."
                     )
-                if not (
-                    stat.S_ISDIR(information.st_mode)
-                    or stat.S_ISREG(information.st_mode)
-                ):
-                    raise ExportError(
-                        f"Managed output contains an unsupported entry: '{path}'."
-                    )
+                if not (stat.S_ISDIR(information.st_mode) or stat.S_ISREG(information.st_mode)):
+                    raise ExportError(f"Managed output contains an unsupported entry: '{path}'.")
                 relative = path.relative_to(root)
                 key = _path_key(relative)
                 existing = paths.get(key)
                 if existing is not None and existing != relative:
-                    raise ExportConflict(
-                        f"Output paths '{existing}' and '{relative}' collide."
-                    )
+                    raise ExportConflict(f"Output paths '{existing}' and '{relative}' collide.")
                 paths[key] = relative
     except ExportError:
         raise
@@ -862,9 +821,7 @@ def _sha256_source(folder: FolderRef, image: ImageRef) -> str:
             flags |= os.O_NOFOLLOW
         descriptor = os.open(resolved, flags)
         opened_before = os.fstat(descriptor)
-        if not stat.S_ISREG(opened_before.st_mode) or not os.path.samestat(
-            before, opened_before
-        ):
+        if not stat.S_ISREG(opened_before.st_mode) or not os.path.samestat(before, opened_before):
             raise OSError("source changed before it could be hashed")
         digest = hashlib.sha256()
         with os.fdopen(descriptor, "rb") as handle:
@@ -939,9 +896,7 @@ def _rename_no_replace(source: Path, destination: Path) -> None:
             ) from exc
         raise
     if os.path.lexists(source) or not os.path.lexists(destination):
-        raise ExportRecoveryError(
-            f"Could not verify installed export destination '{destination}'."
-        )
+        raise ExportRecoveryError(f"Could not verify installed export destination '{destination}'.")
 
 
 def _record_collision(
@@ -999,9 +954,7 @@ def _require_transaction_directory(path: Path, parent: Path) -> None:
         if path.resolve(strict=True).parent != parent.resolve(strict=True):
             raise ExportRecoveryError(f"Export staging '{path}' escapes its workspace.")
     except OSError as exc:
-        raise ExportRecoveryError(
-            f"Could not resolve export staging '{path}': {exc}"
-        ) from exc
+        raise ExportRecoveryError(f"Could not resolve export staging '{path}': {exc}") from exc
 
 
 def _fsync_directory(path: Path) -> None:

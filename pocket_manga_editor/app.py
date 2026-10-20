@@ -1,107 +1,117 @@
-"""Foreground bootstrap for the always-on local web server."""
+"""Load settings, recover the library, and run the local web application."""
 
 from __future__ import annotations
 
+import argparse
 import logging
 import signal
 import sys
 import threading
 
-from .companion import CompanionCoordinator, CompanionHTTPService
-from .config import ConfigurationError, load_configuration
+from .config import ConfigurationError, Settings, load_settings
 from .exporter import ExportError, recover_interrupted_exports
+from .logging_setup import configure_logging
+from .process_lock import ProcessLock
 from .scanner import ScanError, scan_working_directory
+from .server import HTTPService
+from .service import LibraryService
 
 
 LOGGER = logging.getLogger(__name__)
 
 
-def main() -> int:
-    """Validate configuration, recover state, and serve until terminated."""
+def main(argv: list[str] | None = None) -> int:
+    """Hold the data-location guard until every HTTP worker has stopped."""
 
-    _configure_logging()
+    parser = argparse.ArgumentParser(description="Pocket Manga Editor local server")
+    parser.parse_args(argv)
     try:
-        configuration = load_configuration()
-        recovery = recover_interrupted_exports(configuration.working_directory)
-        scan_result = scan_working_directory(configuration.working_directory)
-        coordinator = CompanionCoordinator(
-            configuration.working_directory,
-            scan_result,
-        )
-        service = CompanionHTTPService(
-            coordinator,
-            host=configuration.host,
-            port=configuration.port,
-        )
-    except (ConfigurationError, ExportError, ScanError, OSError, ValueError) as exc:
+        configure_logging(console=sys.stderr is not None)
+    except (OSError, ValueError) as exc:
+        if sys.stderr is not None:
+            print(
+                f"Pocket Manga Editor could not open its server log: {exc}",
+                file=sys.stderr,
+            )
+        return 1
+
+    try:
+        settings = load_settings()
+        with ProcessLock(settings.working_directory):
+            return _serve(settings)
+    except (
+        ConfigurationError,
+        ExportError,
+        ScanError,
+        OSError,
+        ValueError,
+        RuntimeError,
+    ) as exc:
         LOGGER.error("Pocket Manga Editor could not start: %s", exc)
         return 1
     except Exception:
         LOGGER.exception("Pocket Manga Editor failed during startup.")
         return 1
 
-    try:
-        status = service.start()
-    except Exception:
-        LOGGER.exception("Pocket Manga Editor could not start its web server.")
-        coordinator.clear_controller()
-        return 1
-    if not status.running:
-        LOGGER.error(
-            "Pocket Manga Editor could not start its web server: %s",
-            status.error or "unknown listener error",
-        )
-        service.stop()
-        coordinator.clear_controller()
-        return 1
 
-    if recovery.recovered_count:
-        LOGGER.info(
-            "Recovered %d interrupted export transaction(s).",
-            recovery.recovered_count,
-        )
-    if scan_result.issues:
-        LOGGER.warning(
-            "Library scan completed with %d ignored item(s).",
-            len(scan_result.issues),
-        )
-        for issue in scan_result.issues:
-            LOGGER.warning("Ignored %s: %s", issue.path, issue.message)
-    LOGGER.info(
-        "Pocket Manga Editor is serving %s (%d manga).",
-        status.url,
-        len(scan_result.mangas),
-    )
-
-    stop_requested = threading.Event()
+def _serve(settings: Settings) -> int:
+    recovery = recover_interrupted_exports(settings.working_directory)
+    scan_result = scan_working_directory(settings.working_directory)
+    service = LibraryService(settings.working_directory, scan_result)
+    server = HTTPService(service, host=settings.host, port=settings.port)
     previous_handlers: dict[int, object] = {}
-
-    def request_stop(signum, _frame) -> None:
-        LOGGER.info("Shutdown requested by signal %s.", signum)
-        stop_requested.set()
-
-    for signal_name in ("SIGINT", "SIGTERM", "SIGBREAK"):
-        signum = getattr(signal, signal_name, None)
-        if signum is None:
-            continue
-        try:
-            previous_handlers[signum] = signal.getsignal(signum)
-            signal.signal(signum, request_stop)
-        except (OSError, RuntimeError, ValueError):
-            continue
-
     exit_code = 0
     try:
+        status = server.start()
+        if not status.running:
+            LOGGER.error(
+                "Could not start the web server: %s",
+                status.error or "unknown listener error",
+            )
+            return 1
+
+        if recovery.recovered_count:
+            LOGGER.info(
+                "Recovered %d interrupted export transaction(s).",
+                recovery.recovered_count,
+            )
+        for issue in scan_result.issues:
+            LOGGER.warning("Ignored %s: %s", issue.path, issue.message)
+        LOGGER.info(
+            "Pocket Manga Editor is serving %s (%d manga).",
+            status.url,
+            len(scan_result.mangas),
+        )
+
+        stop_requested = threading.Event()
+
+        def request_stop(signum, _frame) -> None:
+            LOGGER.info("Shutdown requested by signal %s.", signum)
+            stop_requested.set()
+
+        for signal_name in ("SIGINT", "SIGTERM", "SIGBREAK"):
+            signum = getattr(signal, signal_name, None)
+            if signum is None:
+                continue
+            try:
+                previous_handlers[signum] = signal.getsignal(signum)
+                signal.signal(signum, request_stop)
+            except (OSError, RuntimeError, ValueError):
+                continue
+
         while not stop_requested.wait(0.5):
-            if not service.running:
+            if not server.running:
                 LOGGER.error(
                     "The web server stopped unexpectedly: %s",
-                    service.error or "unknown server error",
+                    server.error or "unknown server error",
                 )
                 exit_code = 1
                 break
     except KeyboardInterrupt:
-        stop_requested.set()
+        pass
+    except Exception:
+        LOGGER.exception("The web server failed.")
+        exit_code = 1
     finally:
         for signum, previous in previous_handlers.items():
             try:
@@ -109,25 +119,16 @@ def main() -> int:
             except (OSError, RuntimeError, ValueError):
                 pass
         try:
-            stopped = service.stop(timeout=10.0)
+            stopped = server.stop(timeout=10.0)
             if stopped.error:
                 LOGGER.warning("Web server shutdown warning: %s", stopped.error)
+                exit_code = 1
         except Exception:
             LOGGER.exception("The web server could not be stopped cleanly.")
             exit_code = 1
-        coordinator.clear_controller()
+        service.clear_controller()
         LOGGER.info("Pocket Manga Editor stopped.")
     return exit_code
-
-
-def _configure_logging() -> None:
-    if logging.getLogger().handlers:
-        return
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        stream=sys.stderr,
-    )
 
 
 if __name__ == "__main__":

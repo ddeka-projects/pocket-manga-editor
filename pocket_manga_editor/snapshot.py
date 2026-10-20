@@ -8,8 +8,8 @@ import secrets
 from types import MappingProxyType
 from typing import Callable, Mapping
 
-from ..models import FolderRef, ImageRef, MangaRef, ScanResult
-from ..path_safety import is_link_or_reparse
+from .models import FolderRef, ImageRef, MangaRef, ScanResult
+from .path_safety import is_link_or_reparse
 
 
 class SnapshotError(RuntimeError):
@@ -125,14 +125,10 @@ class LibrarySnapshot:
                 for image in folder.images:
                     if Path(image.path).parent != folder_path:
                         raise SnapshotError("A scanned image does not belong to its folder.")
-                    _validate_image_path(
-                        root, resolved_manga, resolved_folder, image
-                    )
+                    _validate_image_path(root, resolved_manga, resolved_folder, image)
                     image_id = opaque_id("i")
                     image_ids.append(image_id)
-                    image_map[image_id] = ImageSnapshotEntry(
-                        image_id, folder_id, image
-                    )
+                    image_map[image_id] = ImageSnapshotEntry(image_id, folder_id, image)
 
                 folder_map[folder_id] = FolderSnapshotEntry(
                     folder_id, manga_id, folder, tuple(image_ids)
@@ -156,35 +152,25 @@ class LibrarySnapshot:
         try:
             return self._manga_by_id[manga_id]
         except (KeyError, TypeError) as exc:
-            raise SnapshotLookupError(
-                "This manga ID is not in the active snapshot."
-            ) from exc
+            raise SnapshotLookupError("This manga ID is not in the active snapshot.") from exc
 
     def folder(self, folder_id: str) -> FolderSnapshotEntry:
         try:
             return self._folder_by_id[folder_id]
         except (KeyError, TypeError) as exc:
-            raise SnapshotLookupError(
-                "This folder ID is not in the active snapshot."
-            ) from exc
+            raise SnapshotLookupError("This folder ID is not in the active snapshot.") from exc
 
     def image(self, image_id: str) -> ImageSnapshotEntry:
         try:
             return self._image_by_id[image_id]
         except (KeyError, TypeError) as exc:
-            raise SnapshotLookupError(
-                "This image ID is not in the active snapshot."
-            ) from exc
+            raise SnapshotLookupError("This image ID is not in the active snapshot.") from exc
 
-    def image_in_folder(
-        self, folder_id: str, image_id: str
-    ) -> ImageSnapshotEntry:
+    def image_in_folder(self, folder_id: str, image_id: str) -> ImageSnapshotEntry:
         folder = self.folder(folder_id)
         image = self.image(image_id)
         if image.folder_id != folder.id:
-            raise SnapshotLookupError(
-                "This image does not belong to the requested folder."
-            )
+            raise SnapshotLookupError("This image does not belong to the requested folder.")
         return image
 
     def validate_live_image(self, image_id: str) -> ImageSnapshotEntry:

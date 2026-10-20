@@ -7,14 +7,14 @@ import logging
 from pathlib import Path
 import threading
 
-from .. import exporter as exporter_module
-from ..models import ScanResult
-from ..scanner import scan_working_directory
-from .controller import ControllerGrant, ControllerOwnership
+from . import exporter as exporter_module
+from .models import ScanResult
+from .scanner import scan_working_directory
+from .controller import ControllerOwnership
 from .review import PositionMutation, ReviewService, SelectionMutation
 from .snapshot import ImageSnapshotEntry, LibrarySnapshot
-from .state import (
-    CompanionActivity,
+from .activity import (
+    Activity,
     RescanError,
     WrongActivityError,
 )
@@ -24,9 +24,8 @@ LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
-class CoordinatorStatus:
+class ServiceStatus:
     active_controller: bool
-    active_page_id: str | None
     snapshot_id: str
 
 
@@ -41,10 +40,10 @@ class ExportMutation:
 class _ActivityBinding:
     page_id: str
     manga_id: str
-    activity: CompanionActivity
+    activity: Activity
 
 
-class CompanionCoordinator:
+class LibraryService:
     """Own the live library snapshot, one controller, and filesystem mutations."""
 
     def __init__(
@@ -66,9 +65,7 @@ class CompanionCoordinator:
         with self._lock:
             return self._snapshot.working_directory
 
-    def claim_controller(
-        self, page_id: str, *, takeover: bool = False
-    ) -> ControllerGrant:
+    def claim_controller(self, page_id: str, *, takeover: bool = False) -> dict[str, str]:
         with self._controller.claimed(page_id, takeover=takeover) as grant:
             with self._lock:
                 self._activity_binding = None
@@ -97,14 +94,12 @@ class CompanionCoordinator:
         page_id: str,
         token: str,
         manga_id: str,
-        activity: CompanionActivity,
+        activity: Activity,
     ) -> dict[str, object]:
         with self._controller.authorized(page_id, token):
             with self._lock:
                 self._review.snapshot.manga(manga_id)
-                self._activity_binding = _ActivityBinding(
-                    page_id, manga_id, activity
-                )
+                self._activity_binding = _ActivityBinding(page_id, manga_id, activity)
                 return self._review.manga_payload(manga_id, activity)
 
     def folder(
@@ -112,51 +107,41 @@ class CompanionCoordinator:
         page_id: str,
         token: str,
         folder_id: str,
-        activity: CompanionActivity,
+        activity: Activity,
     ) -> dict[str, object]:
         with self._controller.authorized(page_id, token):
             with self._lock:
-                self._require_activity_locked(
-                    page_id, activity, folder_id=folder_id
-                )
+                self._require_activity_locked(page_id, activity, folder_id=folder_id)
                 return self._review.folder_payload(folder_id, activity)
 
     def set_position(
         self,
         page_id: str,
         token: str,
-        activity: CompanionActivity,
+        activity: Activity,
         folder_id: str,
         image_id: str,
     ) -> PositionMutation:
         with self._controller.authorized(page_id, token):
             with self._lock:
-                self._require_activity_locked(
-                    page_id, activity, folder_id=folder_id
-                )
+                self._require_activity_locked(page_id, activity, folder_id=folder_id)
                 return self._review.set_position(activity, folder_id, image_id)
 
     def set_selection(
         self,
         page_id: str,
         token: str,
-        activity: CompanionActivity,
+        activity: Activity,
         folder_id: str,
         image_id: str,
         selected: bool,
     ) -> SelectionMutation:
         with self._controller.authorized(page_id, token):
             with self._lock:
-                self._require_activity_locked(
-                    page_id, activity, folder_id=folder_id
-                )
-                if activity is not CompanionActivity.EDIT:
-                    raise WrongActivityError(
-                        "Selections are available only in Edit activity."
-                    )
-                return self._review.set_selection(
-                    activity, folder_id, image_id, selected
-                )
+                self._require_activity_locked(page_id, activity, folder_id=folder_id)
+                if activity is not Activity.EDIT:
+                    raise WrongActivityError("Selections are available only in Edit activity.")
+                return self._review.set_selection(activity, folder_id, image_id, selected)
 
     def image_for_delivery(
         self, page_id: str, token: str, image_id: str
@@ -164,9 +149,7 @@ class CompanionCoordinator:
         with self._controller.authorized(page_id, token):
             with self._lock:
                 image = self._review.snapshot.image(image_id)
-                self._require_activity_locked(
-                    page_id, None, folder_id=image.folder_id
-                )
+                self._require_activity_locked(page_id, None, folder_id=image.folder_id)
                 return self._review.snapshot, image
 
     def rescan(self, page_id: str, token: str) -> dict[str, object]:
@@ -178,12 +161,9 @@ class CompanionCoordinator:
                 snapshot = LibrarySnapshot.build(root, scan_result)
                 review = ReviewService(snapshot)
             except Exception as exc:
-                LOGGER.exception(
-                    "Library rescan failed; retaining the prior snapshot."
-                )
+                LOGGER.exception("Library rescan failed; retaining the prior snapshot.")
                 raise RescanError(
-                    "The library could not be rescanned; the previous library "
-                    "is still active."
+                    "The library could not be rescanned; the previous library " "is still active."
                 ) from exc
 
             with self._lock:
@@ -217,34 +197,35 @@ class CompanionCoordinator:
                 confirm_unrecognized_output=confirm_unrecognized_output,
             )
             for warning in result.warnings:
-                LOGGER.warning(
-                    "Export cleanup warning for %s: %s", manga.name, warning
-                )
+                LOGGER.warning("Export cleanup warning for %s: %s", manga.name, warning)
             public_warnings = (
                 (
-                    "Export succeeded, but temporary cleanup is pending. "
-                    "The server will retry it automatically."
-                ),
-            ) if result.warnings else ()
+                    (
+                        "Export succeeded, but temporary cleanup is pending. "
+                        "The server will retry it automatically."
+                    ),
+                )
+                if result.warnings
+                else ()
+            )
             return ExportMutation(
                 result.folder_count,
                 result.image_count,
                 public_warnings,
             )
 
-    def status(self) -> CoordinatorStatus:
+    def status(self) -> ServiceStatus:
         controller = self._controller.snapshot()
         with self._lock:
-            return CoordinatorStatus(
-                controller.connected,
-                controller.page_id,
+            return ServiceStatus(
+                controller["claimed"],
                 self._snapshot.snapshot_id,
             )
 
     def _require_activity_locked(
         self,
         page_id: str,
-        activity: CompanionActivity | None,
+        activity: Activity | None,
         *,
         folder_id: str,
     ) -> None:
@@ -254,11 +235,7 @@ class CompanionCoordinator:
             or binding.page_id != page_id
             or (activity is not None and binding.activity is not activity)
         ):
-            raise WrongActivityError(
-                "Choose the matching Read or Edit activity before continuing."
-            )
+            raise WrongActivityError("Choose the matching Read or Edit activity before continuing.")
         folder = self._snapshot.folder(folder_id)
         if folder.manga_id != binding.manga_id:
-            raise WrongActivityError(
-                "This folder is outside the chosen manga activity."
-            )
+            raise WrongActivityError("This folder is outside the chosen manga activity.")

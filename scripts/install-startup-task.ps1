@@ -1,124 +1,26 @@
 #requires -Version 5.1
-
 [CmdletBinding()]
-param(
-    [string]$TaskName = "Pocket Manga Editor",
-    [switch]$ConfigureFirewall
-)
-
-Set-StrictMode -Version Latest
-$ErrorActionPreference = "Stop"
-
+param([string]$TaskName = "", [switch]$ConfigureFirewall)
+. (Join-Path $PSScriptRoot "windows-common.ps1")
+if (-not $TaskName) { $TaskName = $PocketAppName }
+Assert-PocketTaskName $TaskName
+if ($ConfigureFirewall -and -not (Test-PocketAdministrator)) { throw "-ConfigureFirewall requires PowerShell as Administrator under the same Windows account. No changes were made." }
+$pythonw = Get-PocketPython -Windowless
+$runner = Join-Path $PSScriptRoot "run-server-background.pyw"
+if (-not (Test-Path -LiteralPath $runner -PathType Leaf)) { throw "Background launcher missing: $runner" }
+$settings = Get-PocketSettings
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-$principalCheck = New-Object Security.Principal.WindowsPrincipal($identity)
-if ($ConfigureFirewall -and -not $principalCheck.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    throw "-ConfigureFirewall needs an elevated PowerShell for the same Windows user. Omit it if the rule is already configured."
-}
-
-$repositoryRoot = Split-Path -Parent $PSScriptRoot
-$virtualPython = Join-Path $repositoryRoot ".venv\Scripts\python.exe"
-$environmentFile = Join-Path $repositoryRoot ".env"
-$runScript = Join-Path $PSScriptRoot "run-server.ps1"
-$firewallRuleName = "Pocket Manga Editor (Private LAN)"
-
-if (-not (Test-Path -LiteralPath $virtualPython -PathType Leaf)) {
-    throw "The virtual environment is missing. Run scripts\bootstrap-windows.ps1 first."
-}
-if (-not (Test-Path -LiteralPath $environmentFile -PathType Leaf)) {
-    throw ".env is missing. Run scripts\bootstrap-windows.ps1, then configure the library path."
-}
-
-Push-Location -LiteralPath $repositoryRoot
-try {
-    $configuredPort = & $virtualPython -c (
-        "from pocket_manga_editor.config import load_configuration; print(load_configuration().port)"
-    )
-    if ($LASTEXITCODE -ne 0) {
-        throw "The Pocket Manga Editor configuration is invalid. Correct .env before installing startup."
-    }
-}
-finally {
-    Pop-Location
-}
-$configuredPort = [int](($configuredPort | Select-Object -Last 1).Trim())
-
-$powerShell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
-$actionArguments = (
-    '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"' -f $runScript
-)
-$action = New-ScheduledTaskAction `
-    -Execute $powerShell `
-    -Argument $actionArguments `
-    -WorkingDirectory $repositoryRoot
+$action = New-ScheduledTaskAction -Execute $pythonw -Argument ('-B "{0}"' -f $runner) -WorkingDirectory $PocketRoot
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $identity.Name
-$settings = New-ScheduledTaskSettingsSet `
-    -MultipleInstances IgnoreNew `
-    -RestartCount 999 `
-    -RestartInterval (New-TimeSpan -Minutes 1) `
-    -StartWhenAvailable `
-    -ExecutionTimeLimit ([TimeSpan]::Zero) `
-    -AllowStartIfOnBatteries `
-    -DontStopIfGoingOnBatteries
-$taskPrincipal = New-ScheduledTaskPrincipal `
-    -UserId $identity.Name `
-    -LogonType Interactive `
-    -RunLevel Limited
-
-# Retire the old SYSTEM task before starting the renamed user-logon task.
-$taskNames = @($TaskName)
-if ($TaskName -eq "Pocket Manga Editor") {
-    $taskNames += "Pocket Manga Editor Server"
-}
-foreach ($name in $taskNames) {
-    $existingTask = Get-ScheduledTask -TaskName $name -TaskPath "\" -ErrorAction SilentlyContinue
-    if ($null -eq $existingTask) { continue }
-    Stop-ScheduledTask -TaskName $name -TaskPath "\"
-    $deadline = (Get-Date).AddSeconds(30)
-    do {
-        $existingTask = Get-ScheduledTask -TaskName $name -TaskPath "\"
-        if ($existingTask.State -notin @("Running", "Queued")) { break }
-        if ((Get-Date) -ge $deadline) { throw "Timed out stopping '$name'. No replacement server was started." }
-        Start-Sleep -Milliseconds 250
-    } while ($true)
-    if ($name -ne $TaskName) {
-        Unregister-ScheduledTask -TaskName $name -TaskPath "\" -Confirm:$false
-        Write-Host "Removed legacy scheduled task: $name"
-    }
-}
-
-Register-ScheduledTask `
-    -TaskName $TaskName `
-    -TaskPath "\" `
-    -Action $action `
-    -Trigger $trigger `
-    -Settings $settings `
-    -Principal $taskPrincipal `
-    -Description "Runs Pocket Manga Editor when $($identity.Name) signs in." `
-    -Force | Out-Null
-
-if ($ConfigureFirewall) {
-    foreach ($ruleName in @($firewallRuleName, "Pocket Manga Editor Server (Private LAN)")) {
-        Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue |
-            Remove-NetFirewallRule
-    }
-    New-NetFirewallRule `
-        -DisplayName $firewallRuleName `
-        -Direction Inbound `
-        -Action Allow `
-        -Protocol TCP `
-        -LocalPort $configuredPort `
-        -Profile Private `
-        -RemoteAddress LocalSubnet | Out-Null
-}
-
-Start-ScheduledTask -TaskName $TaskName -TaskPath "\"
-
-Write-Host "Installed and started '$TaskName'." -ForegroundColor Green
-Write-Host "Runs at logon as $($identity.Name), with limited privileges."
-if ($ConfigureFirewall) {
-    Write-Host "Allowed TCP port $configuredPort only from the local subnet on Private networks." -ForegroundColor Green
-}
-else {
-    Write-Host "Firewall was left as configured. To add Private/LocalSubnet rules, run this script elevated with -ConfigureFirewall."
-}
-Write-Host "Server output is written under $repositoryRoot\logs." -ForegroundColor Green
+$principal = New-ScheduledTaskPrincipal -UserId $identity.Name -LogonType Interactive -RunLevel Limited
+$taskSettings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+$previousHealth = Get-PocketHealth $settings
+$previousInstance = if ($null -ne $previousHealth) { [string]$previousHealth.instance_id } else { "" }
+Stop-PocketTask $TaskName
+Register-ScheduledTask -TaskName $TaskName -TaskPath "\" -Action $action -Trigger $trigger -Principal $principal -Settings $taskSettings -Description "Runs $PocketAppName when $($identity.Name) signs in." -Force | Out-Null
+if ($ConfigureFirewall) { Set-PocketFirewall -Port $settings.port }
+Start-ScheduledTask -TaskName $TaskName -TaskPath "\" -ErrorAction Stop
+Wait-PocketServer -TaskName $TaskName -Settings $settings -PreviousInstance $previousInstance
+Write-Host "Installed and started '$TaskName' at user logon with limited privileges." -ForegroundColor Green
+Write-Host "Log: $(Join-Path $PocketRoot 'logs\server.log')"
+if (-not $ConfigureFirewall) { Write-Host "Firewall unchanged. To configure Private/LocalSubnet access, run elevated with -ConfigureFirewall." }

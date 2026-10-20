@@ -1,4 +1,4 @@
-# Local web server behavior
+# Application design
 
 Pocket Manga Editor has one runtime and one interface: a Python process owns the
 filesystem, and browsers use the web application it serves over the trusted
@@ -12,18 +12,19 @@ At process startup the server:
 1. loads `.env` beside the repository, with real environment variables taking
    precedence;
 2. validates the absolute existing library directory and bind host/port;
-3. acquires and completes any interrupted export recovery work;
-4. scans direct manga, entry, and image children into an immutable snapshot;
-5. starts the HTTP listener; and
-6. remains in the foreground until Windows or the operator stops it.
+3. acquires an operating-system lifetime guard for this app and library;
+4. completes any interrupted export recovery work;
+5. scans direct manga, entry, and image children into an immutable snapshot;
+6. starts the HTTP listener with a public `/health` readiness endpoint; and
+7. serves until Windows or the operator stops it.
 
 An invalid configuration, unsafe metadata path, unrecoverable transaction,
 failed scan, or occupied port is fatal. The process exits nonzero so Task
-Scheduler can retry it, and diagnostic output is retained under `logs\` by the
-Windows launcher.
-
-The server-first metadata schema is a deliberate development clean break. It
-does not import desktop-era export history or completion state.
+Scheduler can retry it, and diagnostic output is retained in `logs\server.log`
+with bounded rotation.
+The lifetime guard is outside the library and is released automatically if
+the server exits or crashes. It blocks another copy even on a different port;
+short mutation locks remain in place underneath it.
 
 The scheduled task uses the script and virtual environment at their absolute
 repository paths. Its current working directory is also set explicitly, so its
@@ -56,7 +57,8 @@ request must present both its page identity and token. A different tab or
 device receives an “open elsewhere” response and can choose **Take Control**.
 
 Ownership has no timer and the browser sends no heartbeat or shutdown-time
-release. It remains valid through phone suspension and temporary Wi-Fi loss.
+release. The library screen offers **Release Control** for an explicit release.
+Ownership remains valid through phone suspension and temporary Wi-Fi loss.
 An explicit takeover rotates the token immediately after any already-authorized
 durable operation finishes; requests carrying the old token are then rejected.
 This preserves single-controller behavior without guessing whether an absent
@@ -133,8 +135,11 @@ duplicate instances ignored, unlimited runtime, and retry after failure.
 Normal installation and removal use ordinary PowerShell. Add `-ConfigureFirewall`
 to installation or `-RemoveFirewall` to removal from an elevated PowerShell under
 that same Windows account to change this app's Private/LocalSubnet firewall rule.
-Otherwise firewall rules are left untouched. `scripts/run-server.ps1` uses the
-repository's `.venv` and appends output to a dated log file.
+Otherwise firewall rules are left untouched. `scripts/run-dev.ps1` uses the
+repository's `.venv` in the foreground. Scheduled startup uses a console-free
+Python launcher and records diagnostics in `logs\server.log`.
+Double-click `restart-server.cmd` after code updates to restart the exact task
+and wait for HTTP readiness. Finish active saves and exports first.
 `scripts/remove-startup-task.ps1` removes the task without touching application data.
 
 The server is available after that user signs in, while the PC remains awake.
@@ -145,7 +150,7 @@ is moved, reinstall the task so its absolute action path is updated.
 
 ### Connection refused
 
-Confirm the task is running, inspect the newest file under `logs\`, check that
+Confirm the task is running, inspect `logs\server.log`, check that
 the PC still owns the address used by the Home Screen shortcut, and ensure the
 network profile is Private. `127.0.0.1` works only on the PC itself.
 
@@ -172,3 +177,19 @@ alone is not a substitute for a server scan.
 Do not manually move transaction payloads while recovery is possible. Stop
 duplicate processes, inspect the exact error in the server log, and preserve the
 reported manga workspace until its old/new output state can be reconciled.
+
+## Code layout
+
+`app.py` assembles startup and shutdown; `config.py` validates frozen `Settings`;
+`env.py` parses literal settings; `server.py` handles HTTP transport; `api.py`
+validates routes and translates errors; `service.py` coordinates the library;
+`controller.py` holds the in-memory page owner. `static/` contains the no-build
+browser interface. `snapshot.py` and `review.py` support reader operations.
+`storage.py`, `workspace.py`, `path_safety.py`, `library_lock.py`, and
+`exporter.py` retain the separate metadata and transactional-export guarantees.
+`process_lock.py`, `errors.py`, and `logging_setup.py` follow the same small
+conventions as the other Pocket repositories without a shared runtime package.
+
+Configuration is UTF-8, optionally with a BOM. Matching outer quotes are
+removed; backslashes and `#` inside values remain literal. Duplicate assignments
+and malformed values are errors. Process environment variables override `.env`.

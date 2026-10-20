@@ -15,15 +15,15 @@ import threading
 import time
 from urllib.parse import urlsplit
 
-from ..path_safety import is_link_or_reparse
+from .path_safety import is_link_or_reparse
 from .api import (
     APIResponse,
-    CompanionAPI,
+    API,
     MAX_JSON_BODY,
     RequestError,
     StreamingBody,
 )
-from .coordinator import CompanionCoordinator
+from .service import LibraryService
 
 
 LOGGER = logging.getLogger(__name__)
@@ -31,7 +31,7 @@ LOGGER = logging.getLogger(__name__)
 
 DEFAULT_PORT = 8765
 MAX_HTTP_WORKERS = 16
-_CLIENT_PROTOCOL_ASSET_VERSION = "explicit-controller-v2"
+_CLIENT_PROTOCOL_ASSET_VERSION = "explicit-controller-v3"
 _HOSTNAME = re.compile(
     r"^(?=.{1,253}\.?$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*"
     r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.?$"
@@ -60,7 +60,7 @@ class HTTPServiceStatus:
     lan_address_available: bool
 
 
-class _CompanionHTTPServer(ThreadingHTTPServer):
+class _HTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = os.name != "nt"
     request_queue_size = MAX_HTTP_WORKERS
@@ -73,9 +73,7 @@ class _CompanionHTTPServer(ThreadingHTTPServer):
         super().__init__(server_address, handler, bind_and_activate=False)
         try:
             if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
-                self.socket.setsockopt(
-                    socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1
-                )
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
             self.server_bind()
             self.server_activate()
         except BaseException:
@@ -132,31 +130,31 @@ class _CompanionHTTPServer(ThreadingHTTPServer):
         LOGGER.exception("Unhandled HTTP worker failure from %s.", address)
 
 
-class CompanionHTTPService:
-    """Own one stable HTTP listener without depending on Qt or asyncio."""
+class HTTPService:
+    """Own the local HTTP listener and its worker lifecycle."""
 
     def __init__(
         self,
-        coordinator: CompanionCoordinator,
+        service: LibraryService,
         *,
         host: str = "0.0.0.0",
         port: int = DEFAULT_PORT,
         public_host: str | None = None,
-        assets_directory: str | Path | None = None,
+        static_directory: str | Path | None = None,
         allowed_hosts: set[str] | frozenset[str] | None = None,
     ) -> None:
-        self.coordinator = coordinator
+        self.service = service
         self._lock = threading.RLock()
         self._host = self._validate_host(host, allow_wildcard=True)
         self._port = self._validate_port(port)
         self._configured_public_host = self._validate_public_host(public_host)
-        self._assets = (
-            Path(assets_directory)
-            if assets_directory is not None
-            else Path(__file__).with_name("assets")
+        self._static = (
+            Path(static_directory)
+            if static_directory is not None
+            else Path(__file__).with_name("static")
         )
         self._extra_allowed_hosts = set(allowed_hosts or ())
-        self._server: _CompanionHTTPServer | None = None
+        self._server: _HTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._error: str | None = None
         self._public_host, self._lan_available = self._choose_public_host()
@@ -168,10 +166,10 @@ class CompanionHTTPService:
             self._public_host, self._lan_available = self._choose_public_host()
             allowed = set(self._extra_allowed_hosts)
             allowed.update({self._public_host, self._host})
-            api = CompanionAPI(self.coordinator, allowed_hosts=allowed)
+            api = API(self.service, allowed_hosts=allowed)
             handler = self._handler(api)
             try:
-                server = _CompanionHTTPServer((self._host, self._port), handler)
+                server = _HTTPServer((self._host, self._port), handler)
             except OSError as exc:
                 self._server = None
                 self._thread = None
@@ -241,9 +239,7 @@ class CompanionHTTPService:
         )
         validated_port = self._validate_port(port) if port is not None else None
         validated_public = (
-            self._validate_public_host(public_host or None)
-            if public_host is not None
-            else None
+            self._validate_public_host(public_host or None) if public_host is not None else None
         )
         self.stop()
         with self._lock:
@@ -275,7 +271,7 @@ class CompanionHTTPService:
         with self._lock:
             return self._status_locked()
 
-    def _serve(self, server: _CompanionHTTPServer) -> None:
+    def _serve(self, server: _HTTPServer) -> None:
         try:
             server.serve_forever(poll_interval=0.25)
         except OSError as exc:
@@ -297,8 +293,8 @@ class CompanionHTTPService:
                 if self._server is server:
                     self._server = None
 
-    def _handler(self, api: CompanionAPI) -> type[BaseHTTPRequestHandler]:
-        assets = self._assets
+    def _handler(self, api: API) -> type[BaseHTTPRequestHandler]:
+        assets = self._static
 
         class Handler(BaseHTTPRequestHandler):
             server_version = "PocketManga"
@@ -312,7 +308,9 @@ class CompanionHTTPService:
             def do_GET(self) -> None:  # noqa: N802 - stdlib handler contract
                 if self._reject_if_stopping(api) or self._reject_if_nonlocal(api):
                     return
-                if urlsplit(self.path).path.startswith("/api/"):
+                if urlsplit(self.path).path == "/health" or urlsplit(self.path).path.startswith(
+                    "/api/"
+                ):
                     self._send_api(api.handle("GET", self.path, self.headers))
                     return
                 try:
@@ -334,7 +332,9 @@ class CompanionHTTPService:
             def do_HEAD(self) -> None:  # noqa: N802
                 if self._reject_if_stopping(api) or self._reject_if_nonlocal(api):
                     return
-                if urlsplit(self.path).path.startswith("/api/"):
+                if urlsplit(self.path).path == "/health" or urlsplit(self.path).path.startswith(
+                    "/api/"
+                ):
                     self._send_api(
                         api._error(405, "method_not_allowed", "This method is not allowed."),
                         head=True,
@@ -353,20 +353,18 @@ class CompanionHTTPService:
             def do_OPTIONS(self) -> None:  # noqa: N802
                 self._reject_method(api)
 
-            def _reject_method(self, api: CompanionAPI) -> None:
+            def _reject_method(self, api: API) -> None:
                 self.close_connection = True
                 if self._reject_if_nonlocal(api):
                     return
                 try:
                     api.validate_request(self.headers, mutating=True)
-                    response = api._error(
-                        405, "method_not_allowed", "This method is not allowed."
-                    )
+                    response = api._error(405, "method_not_allowed", "This method is not allowed.")
                 except RequestError as exc:
                     response = api._exception_response(exc)
                 self._send_api(response)
 
-            def _reject_if_stopping(self, api: CompanionAPI) -> bool:
+            def _reject_if_stopping(self, api: API) -> bool:
                 if not bool(getattr(self.server, "stopping", False)):
                     return False
                 self.close_connection = True
@@ -379,7 +377,7 @@ class CompanionHTTPService:
                 )
                 return True
 
-            def _dispatch_mutation(self, api: CompanionAPI, method: str) -> None:
+            def _dispatch_mutation(self, api: API, method: str) -> None:
                 if self._reject_if_stopping(api) or self._reject_if_nonlocal(api):
                     return
                 raw_length = self.headers.get("Content-Length", "")
@@ -387,9 +385,7 @@ class CompanionHTTPService:
                     length = int(raw_length)
                 except ValueError:
                     self.close_connection = True
-                    self._send_api(
-                        api._error(400, "bad_request", "Content-Length is invalid.")
-                    )
+                    self._send_api(api._error(400, "bad_request", "Content-Length is invalid."))
                     return
                 if length < 0 or length > MAX_JSON_BODY:
                     self.close_connection = True
@@ -402,7 +398,7 @@ class CompanionHTTPService:
                     return
                 self._send_api(api.handle(method, self.path, self.headers, body))
 
-            def _reject_if_nonlocal(self, api: CompanionAPI) -> bool:
+            def _reject_if_nonlocal(self, api: API) -> bool:
                 try:
                     api.validate_peer(str(self.client_address[0]))
                 except RequestError as exc:
@@ -411,7 +407,7 @@ class CompanionHTTPService:
                     return True
                 return False
 
-            def _static_response(self, assets_root: Path) -> APIResponse:
+            def _static_response(self, static_root: Path) -> APIResponse:
                 path = urlsplit(self.path).path
                 name: str | None = None
                 if path in {"/", "/index.html"}:
@@ -420,13 +416,13 @@ class CompanionHTTPService:
                     name = "manifest.webmanifest"
                 elif path in {"/icon.svg", "/icon-180.png", "/icon-512.png"}:
                     name = path[1:]
-                elif path.startswith("/assets/"):
-                    candidate = path.removeprefix("/assets/")
+                elif path.startswith("/static/"):
+                    candidate = path.removeprefix("/static/")
                     if "/" not in candidate and candidate in _ASSET_NAMES:
                         name = candidate
                 if name is None or name not in _ASSET_NAMES:
                     return api._error(404, "not_found", "The requested asset does not exist.")
-                source = assets_root / name
+                source = static_root / name
                 if is_link_or_reparse(source) or not source.is_file():
                     if name == "index.html":
                         body = (
@@ -438,7 +434,10 @@ class CompanionHTTPService:
                         )
                         return APIResponse(
                             200,
-                            (("Content-Type", "text/html; charset=utf-8"), ("Content-Length", str(len(body)))),
+                            (
+                                ("Content-Type", "text/html; charset=utf-8"),
+                                ("Content-Length", str(len(body))),
+                            ),
                             body,
                         )
                     return api._error(404, "not_found", "The requested asset does not exist.")
@@ -448,30 +447,34 @@ class CompanionHTTPService:
                     return api._error(500, "asset_error", "The asset could not be read.")
                 if name == "index.html":
                     body = body.replace(
-                        b'src="/assets/app.js"',
+                        b'src="/static/app.js"',
                         (
-                            b'src="/assets/app.js?v='
+                            b'src="/static/app.js?v='
                             + _CLIENT_PROTOCOL_ASSET_VERSION.encode("ascii")
                             + b'"'
                         ),
                         1,
                     )
                     body = body.replace(
-                        b'href="/assets/styles.css"',
+                        b'href="/static/styles.css"',
                         (
-                            b'href="/assets/styles.css?v='
+                            b'href="/static/styles.css?v='
                             + _CLIENT_PROTOCOL_ASSET_VERSION.encode("ascii")
                             + b'"'
                         ),
                         1,
                     )
-                content_type = {
-                    ".webmanifest": "application/manifest+json",
-                    ".svg": "image/svg+xml",
-                    ".js": "text/javascript; charset=utf-8",
-                    ".css": "text/css; charset=utf-8",
-                    ".html": "text/html; charset=utf-8",
-                }.get(source.suffix.casefold()) or mimetypes.guess_type(source.name)[0] or "application/octet-stream"
+                content_type = (
+                    {
+                        ".webmanifest": "application/manifest+json",
+                        ".svg": "image/svg+xml",
+                        ".js": "text/javascript; charset=utf-8",
+                        ".css": "text/css; charset=utf-8",
+                        ".html": "text/html; charset=utf-8",
+                    }.get(source.suffix.casefold())
+                    or mimetypes.guess_type(source.name)[0]
+                    or "application/octet-stream"
+                )
                 return APIResponse(
                     200,
                     (
@@ -479,9 +482,11 @@ class CompanionHTTPService:
                         ("Content-Length", str(len(body))),
                         (
                             "Cache-Control",
-                            "no-cache"
-                            if name in {"index.html", "app.js", "styles.css"}
-                            else "public, max-age=3600",
+                            (
+                                "no-cache"
+                                if name in {"index.html", "app.js", "styles.css"}
+                                else "public, max-age=3600"
+                            ),
                         ),
                     ),
                     body,
@@ -495,13 +500,12 @@ class CompanionHTTPService:
                     for name, value in response.headers:
                         self.send_header(name, value)
                     if "content-length" not in seen:
-                        length = (
-                            streaming.length
-                            if streaming is not None
-                            else len(response.body)
-                        )
+                        length = streaming.length if streaming is not None else len(response.body)
                         self.send_header("Content-Length", str(length))
-                    self.send_header("Content-Security-Policy", "default-src 'self'; img-src 'self' data: blob:; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
+                    self.send_header(
+                        "Content-Security-Policy",
+                        "default-src 'self'; img-src 'self' data: blob:; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+                    )
                     self.send_header("Referrer-Policy", "no-referrer")
                     self.send_header("X-Frame-Options", "DENY")
                     self.end_headers()
@@ -512,9 +516,7 @@ class CompanionHTTPService:
                         else:
                             remaining = streaming.length
                             while remaining:
-                                chunk = streaming.stream.read(
-                                    min(remaining, 256 * 1024)
-                                )
+                                chunk = streaming.stream.read(min(remaining, 256 * 1024))
                                 if not chunk:
                                     self.close_connection = True
                                     return
@@ -533,11 +535,7 @@ class CompanionHTTPService:
         return Handler
 
     def _status_locked(self) -> HTTPServiceStatus:
-        running = (
-            self._server is not None
-            and self._thread is not None
-            and self._thread.is_alive()
-        )
+        running = self._server is not None and self._thread is not None and self._thread.is_alive()
         return HTTPServiceStatus(
             running,
             self._host,
@@ -559,7 +557,11 @@ class CompanionHTTPService:
 
     def _choose_public_host(self) -> tuple[str, bool]:
         if self._configured_public_host:
-            return self._configured_public_host, self._configured_public_host not in {"127.0.0.1", "::1", "localhost"}
+            return self._configured_public_host, self._configured_public_host not in {
+                "127.0.0.1",
+                "::1",
+                "localhost",
+            }
         if self._host not in {"0.0.0.0", "::", "127.0.0.1", "::1", "localhost"}:
             return self._host, True
         discovered = _discover_lan_ipv4()
@@ -585,9 +587,7 @@ class CompanionHTTPService:
                 raise ValueError("The server host must be a hostname or IP address.")
         else:
             if address.version == 6:
-                raise ValueError(
-                    "Pocket Manga currently requires an IPv4 bind/display address."
-                )
+                raise ValueError("Pocket Manga currently requires an IPv4 bind/display address.")
             if not allow_wildcard and address.is_unspecified:
                 raise ValueError("The displayed server host cannot be a wildcard address.")
         return value
@@ -622,6 +622,11 @@ def _discover_lan_ipv4() -> str | None:
             address = ipaddress.ip_address(value)
         except ValueError:
             continue
-        if address.version == 4 and address.is_private and not address.is_loopback and not address.is_unspecified:
+        if (
+            address.version == 4
+            and address.is_private
+            and not address.is_loopback
+            and not address.is_unspecified
+        ):
             return str(address)
     return None
