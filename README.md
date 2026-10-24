@@ -139,9 +139,11 @@ entry starts at its first image; crossing backward into the previous entry
 starts at its last image.
 
 The web reader preserves the immediate navigation behavior: it displays the
-prefetched neighboring image without a decorative transition. In Edit, tapping
-the lower middle area toggles selection; tapping the center shows or hides the
-controls.
+prefetched neighboring image without a decorative transition. In Edit, the
+full-width strip along the bottom of the screen is tinted light green; tapping it
+toggles selection. The tint stays visible even when the controls are hidden and
+is faint enough that a long page remains readable through it. Tapping the center
+shows or hides the controls. Read has no selection strip.
 
 Only one browser page can control the library at a time. Closing or navigating
 away does not depend on an unreliable browser shutdown signal: ownership stays

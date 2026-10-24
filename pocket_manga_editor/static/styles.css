@@ -785,8 +785,11 @@ select:focus-visible {
   margin: 0;
   padding: 0;
   border: 0;
+  /* A faint, always-visible tint marks the Edit selection area without
+     hiding page content that extends into it. */
+  border-top: 1px solid rgb(69 224 111 / 30%);
   border-radius: 0;
-  background: transparent;
+  background: rgb(69 224 111 / 9%);
   touch-action: manipulation;
 }
 
