@@ -68,10 +68,26 @@ ownership.
 Ownership is deliberately not written to `.pocket-manga-editor`; a persisted
 “currently open” marker could strand the app after a crash or power loss.
 
-The browser retains its current view on a network error. A position or
-selection request whose outcome is unknown remains visibly pending and can be
-retried with the same token; these operations set explicit values, so repeating
-an already-committed request is safe. After ownership transfer, the old page
+The browser retains its current view on a network error. Position and
+selection requests set explicit values, so repeating an already-committed
+request with the same token is safe. They use a 5-second request timeout and
+retry quietly on network failure:
+
+- Positions are latest-wins and best-effort. Failed saves retry in the
+  background (after 1, 2, and 4 seconds) and on the next page turn, without a
+  message. Draining before a view change drops a position that just failed
+  rather than blocking navigation.
+- A selection remains visibly pending through two quick retries. Only then is
+  the connection marked interrupted, and the user retries explicitly. Draining
+  still requires every selection to be confirmed.
+
+Server answers such as a transferred controller or a stale snapshot are not
+retried; they are handled immediately.
+
+Each HTTP response is sent with `Connection: close`. Reusing an idle keep-alive
+connection can race the server closing it, and browsers do not resend a failed
+`PATCH` or `POST` automatically, so the app opens a fresh connection per
+request. On a LAN the extra handshake is negligible. After ownership transfer, the old page
 does not blindly replay uncertain writes. Taking control refreshes server state
 and tells the user when an unconfirmed save needs review.
 

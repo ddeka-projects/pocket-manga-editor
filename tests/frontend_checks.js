@@ -58,6 +58,89 @@ async function checks() {
   try { await pending; } catch (error) { staleRejected = error.code === "controller_changed"; }
   assert(staleRejected, "A late response from an older owner cannot replace current state");
   assert(intervals === 0, "Ownership never creates background polling");
+
+  await transientSaveChecks();
+}
+
+async function transientSaveChecks() {
+  const { state, ensurePositionFlush, drainPendingMutations, setSelection } = client;
+  // Retry delays are short; request timeouts (5s+) are never fired here.
+  const timers = [];
+  window.setTimeout = (callback, delay) => { timers.push({ callback, delay }); return timers.length; };
+  const settle = async () => { for (let i = 0; i < 20; i += 1) await Promise.resolve(); };
+  const runRetryTimers = async () => {
+    const due = timers.splice(0).filter((timer) => timer.delay < 5_000);
+    due.forEach((timer) => timer.callback());
+    await settle();
+    await state.positionFlushPromise;
+    await state.selectionRequestTail;
+    await settle();
+  };
+  const banner = () => element("action-error-title").textContent;
+  const position = () => ({ activity: "read", folderId: "folder", imageId: "page-19", epoch: state.activityEpoch, ownershipEpoch: state.controllerEpoch });
+  state.ownsControl = true;
+  state.controllerToken = "replacement-token";
+  element("action-error-title").textContent = "";
+
+  let online = false;
+  let sent = 0;
+  transport = async () => {
+    sent += 1;
+    if (!online) throw new Error("The network connection was lost.");
+    return reply({ ok: true, position: {} });
+  };
+  state.positionQueue.set("read:manga", position());
+  await ensurePositionFlush();
+  assert(!state.connectionInterrupted && banner() === "", "A missed position save does not interrupt reading");
+  assert(state.positionQueue.size === 1, "The latest position is kept for a quiet retry");
+  online = true;
+  await runRetryTimers();
+  assert(sent === 2 && state.positionQueue.size === 0, "The position is saved by the quiet retry");
+
+  online = false;
+  state.positionQueue.set("read:manga", position());
+  assert(await drainPendingMutations(), "Leaving a view does not wait on a missed position");
+  assert(state.positionQueue.size === 0 && banner() === "", "The missed position is dropped silently");
+  timers.length = 0;
+
+  state.activity = "edit";
+  const folder = { id: "folder", revision: 0, images: [], selectedCount: 0 };
+  const blip = { id: "blip-page", selected: false };
+  let failures = 1;
+  transport = async () => {
+    if (failures > 0) {
+      failures -= 1;
+      throw new Error("The network connection was lost.");
+    }
+    return reply({ ok: true, selection: { selected: true, revision: 1 } });
+  };
+  await setSelection(folder, blip, true, state.activityEpoch);
+  assert(state.selectionPending.has("blip-page"), "A selection stays pending during its quiet retry");
+  assert(!state.connectionInterrupted && banner() === "", "One failed selection attempt shows no banner");
+  await runRetryTimers();
+  assert(!state.selectionPending.has("blip-page") && blip.selected, "The quiet retry confirms the selection");
+  assert(banner() === "", "A recovered selection never showed a banner");
+
+  const down = { id: "down-page", selected: false };
+  let attempts = 0;
+  transport = async () => {
+    attempts += 1;
+    throw new Error("The network connection was lost.");
+  };
+  await setSelection(folder, down, true, state.activityEpoch);
+  await runRetryTimers();
+  assert(!state.connectionInterrupted, "Quiet retries continue before reporting");
+  await runRetryTimers();
+  assert(attempts === 3, "A selection is attempted three times in total");
+  assert(state.connectionInterrupted && banner() === "Connection interrupted", "Persistent failure asks the user to retry");
+  assert(state.selectionPending.has("down-page") && !down.selected, "An unconfirmed selection is kept, not assumed");
+
+  state.selectionPending.clear();
+  state.connectionInterrupted = false;
+  transport = async () => reply({ ok: false, error: { code: "controller_transferred", message: "Moved." } }, 409);
+  state.positionQueue.set("read:manga", position());
+  await ensurePositionFlush();
+  assert(!state.ownsControl && element("state-action").textContent === "Take Control", "Losing control is still reported immediately");
 }
 checks().then(
   () => { if (typeof print === "function") print("Frontend behavior checks passed"); else console.log("Frontend behavior checks passed"); },

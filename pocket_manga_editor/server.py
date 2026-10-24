@@ -508,6 +508,10 @@ class HTTPService:
                     )
                     self.send_header("Referrer-Policy", "no-referrer")
                     self.send_header("X-Frame-Options", "DENY")
+                    # One request per connection. Reused idle connections race
+                    # the server-side close, and browsers do not resend a
+                    # failed PATCH/POST on their own.
+                    self.send_header("Connection", "close")
                     self.end_headers()
                     if not head:
                         if streaming is None:

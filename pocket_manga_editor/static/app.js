@@ -3,6 +3,11 @@
 (() => {
   const REQUEST_TIMEOUT_MS = 15_000;
   const EXPORT_TIMEOUT_MS = 10 * 60_000;
+  // Position and selection saves are small, idempotent LAN writes. They retry
+  // quietly before the user is asked to intervene.
+  const SAVE_TIMEOUT_MS = 5_000;
+  const POSITION_RETRY_DELAYS_MS = [1_000, 2_000, 4_000];
+  const SELECTION_RETRY_DELAYS_MS = [500, 1_500];
   const READ = "read";
   const EDIT = "edit";
 
@@ -133,6 +138,8 @@
     positionQueue: new Map(),
     positionFlushActive: false,
     positionFlushPromise: Promise.resolve(),
+    positionRetryTimer: 0,
+    positionRetryAttempt: 0,
     mutationBarrierTail: Promise.resolve(),
     activityOpening: false,
     rescanBusy: false,
@@ -1531,6 +1538,7 @@
       folder,
       image,
       inFlight: false,
+      retries: 0,
       ownershipEpoch: state.controllerEpoch,
     };
     state.selectionPending.set(image.id, pending);
@@ -1607,6 +1615,15 @@
       if (state.selectionPending.get(image.id) !== pending) {
         return;
       }
+      if (
+        isTransientNetworkError(error)
+        && pending.ownershipEpoch === state.controllerEpoch
+        && pending.retries < SELECTION_RETRY_DELAYS_MS.length
+      ) {
+        // Keep the pending marker and try again before reporting an interruption.
+        scheduleSelectionRetry(pending);
+        return;
+      }
       if (isUncertainSaveError(error)) {
         state.connectionInterrupted = true;
         if (!(error instanceof ApiError) || error.code !== "controller_changed") {
@@ -1644,10 +1661,25 @@
       return requestJson(ROUTES.editSelection(pending.folderId), {
         method: "PATCH",
         body: { image_id: pending.image.id, selected: pending.desired },
+        timeoutMs: SAVE_TIMEOUT_MS,
       });
     });
     state.selectionRequestTail = request.catch(() => {});
     return request;
+  }
+
+  function scheduleSelectionRetry(pending) {
+    const delay = SELECTION_RETRY_DELAYS_MS[pending.retries];
+    pending.retries += 1;
+    window.setTimeout(() => {
+      if (
+        !state.connectionInterrupted
+        && state.ownsControl
+        && pending.ownershipEpoch === state.controllerEpoch
+      ) {
+        void commitSelection(pending);
+      }
+    }, delay);
   }
 
   function applySelectionConfirmation(folder, image, confirmed, selection, responseRevision) {
@@ -1758,7 +1790,30 @@
       epoch,
       ownershipEpoch: state.controllerEpoch,
     });
+    state.positionRetryAttempt = 0;
     ensurePositionFlush();
+  }
+
+  function schedulePositionRetry() {
+    window.clearTimeout(state.positionRetryTimer);
+    state.positionRetryTimer = 0;
+    if (state.positionRetryAttempt >= POSITION_RETRY_DELAYS_MS.length) {
+      // The next page turn, view change, or explicit retry tries again.
+      return;
+    }
+    const delay = POSITION_RETRY_DELAYS_MS[state.positionRetryAttempt];
+    state.positionRetryAttempt += 1;
+    state.positionRetryTimer = window.setTimeout(() => {
+      state.positionRetryTimer = 0;
+      ensurePositionFlush();
+    }, delay);
+  }
+
+  function abandonQueuedPositions() {
+    window.clearTimeout(state.positionRetryTimer);
+    state.positionRetryTimer = 0;
+    state.positionRetryAttempt = 0;
+    state.positionQueue.clear();
   }
 
   function ensurePositionFlush() {
@@ -1789,7 +1844,9 @@
           const payload = await requestJson(route, {
             method: "PATCH",
             body: { image_id: pending.imageId },
+            timeoutMs: SAVE_TIMEOUT_MS,
           });
+          state.positionRetryAttempt = 0;
           const position = payload.position || {};
           if (
             state.activity === pending.activity
@@ -1811,6 +1868,15 @@
           }
         } catch (error) {
           const ownershipIsCurrent = pending.ownershipEpoch === state.controllerEpoch;
+          if (ownershipIsCurrent && isTransientNetworkError(error)) {
+            // Positions are best-effort and latest-wins: retry quietly
+            // without interrupting reading.
+            if (!state.positionQueue.has(key)) {
+              state.positionQueue.set(key, pending);
+            }
+            schedulePositionRetry();
+            break;
+          }
           if (ownershipIsCurrent && isUncertainSaveError(error)) {
             if (!state.positionQueue.has(key)) {
               state.positionQueue.set(key, pending);
@@ -1864,6 +1930,16 @@
         await Promise.resolve();
         if (
           positionTail === state.positionFlushPromise
+          && !state.positionFlushActive
+          && state.positionQueue.size
+          && !state.connectionInterrupted
+        ) {
+          // That flush stopped on a network failure. A missed position is
+          // harmless, so leaving the view does not wait for it.
+          abandonQueuedPositions();
+        }
+        if (
+          positionTail === state.positionFlushPromise
           && selectionTail === state.selectionRequestTail
           && !state.positionFlushActive
           && state.positionQueue.size === 0
@@ -1884,9 +1960,18 @@
     state.connectionInterrupted = false;
     for (const pending of state.selectionPending.values()) {
       pending.inFlight = false;
+      pending.retries = 0;
       void commitSelection(pending);
     }
+    state.positionRetryAttempt = 0;
     ensurePositionFlush();
+  }
+
+  function isTransientNetworkError(error) {
+    if (error && error.name === "AbortError") {
+      return true;
+    }
+    return error instanceof ApiError && error.code === "network_error";
   }
 
   function isUncertainSaveError(error) {

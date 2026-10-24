@@ -858,6 +858,8 @@ class HTTPServiceTests(ServerFixture):
             self.assertEqual(response.status, 200)
             self.assertIn(b"/static/app.js?v=explicit-controller-v3", shell)
             self.assertIn(b"/static/styles.css?v=explicit-controller-v3", shell)
+            # Idle connections are never reused, so they cannot race a close.
+            self.assertEqual(response.getheader("Connection"), "close")
             self.assertIn(
                 "default-src 'self'",
                 response.getheader("Content-Security-Policy") or "",

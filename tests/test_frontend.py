@@ -22,7 +22,8 @@ class FrontendTests(unittest.TestCase):
         source = (STATIC / "app.js").read_text(encoding="utf-8")
         source = source.replace(
             "  bindEvents();\n  void bootstrap();",
-            "  globalThis.client = { state, acquireController, releaseController, loseControl, requestJson };",
+            "  globalThis.client = { state, acquireController, releaseController, loseControl,"
+            " requestJson, ensurePositionFlush, drainPendingMutations, setSelection };",
         )
         checks = "\n".join(
             (

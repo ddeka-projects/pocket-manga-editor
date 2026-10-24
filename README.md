@@ -153,11 +153,22 @@ finishes. There is no heartbeat timeout, paired-device credential, or permanent
 ownership file; the trusted private LAN is the authorization boundary.
 
 A brief Wi-Fi interruption does not close the reader or surrender control. The
-browser keeps the current screen and marks uncertain position/selection writes
-as pending. Retrying with the same token is safe because those writes set an
-explicit value and are idempotent. If control moved to another page, the old
-page must explicitly take it back; the app then refreshes authoritative state
-instead of blindly replaying uncertain writes.
+browser keeps the current screen and retries quietly. Repeating these writes is
+safe because they set an explicit value and are idempotent:
+
+- **Reading position** is best-effort. A missed save is retried in the
+  background and never shows a message; the next page turn saves the newer
+  position anyway. Leaving the entry does not wait for it, so after a real
+  outage the app may reopen a page or two earlier than where you stopped.
+- **Page selection** stays at `…` while it is retried for a few seconds. Only if
+  it still cannot be confirmed does **Connection interrupted** appear; tap
+  **Retry** once the PC is reachable. Leaving the view, rescanning, and export
+  still wait until every selection is confirmed.
+
+If control moved to another page or the library changed, that is reported
+immediately as before. The old page must explicitly take control back; the app
+then refreshes authoritative state instead of blindly replaying uncertain
+writes.
 
 See [Application design](docs/design.md) for operational and
 security details.
