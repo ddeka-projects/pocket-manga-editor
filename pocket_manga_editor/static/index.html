@@ -106,10 +106,6 @@
                 <strong>Edit</strong>
                 <span>Review and select images for export.</span>
               </button>
-              <button id="choose-export" class="activity-button export-action" type="button">
-                <strong>Export</strong>
-                <span id="export-action-detail">Replace output with the current selections.</span>
-              </button>
             </div>
           </div>
         </section>
@@ -203,36 +199,6 @@
           </div>
         </section>
       </main>
-
-      <section id="export-overlay" class="dialog-overlay" hidden>
-        <div
-          id="export-dialog"
-          class="export-dialog"
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="export-dialog-title"
-          aria-describedby="export-dialog-message"
-        >
-          <p class="eyebrow">Export manga</p>
-          <h2 id="export-dialog-title">Create output?</h2>
-          <p id="export-dialog-message" class="export-dialog-message"></p>
-
-          <div id="export-warning" class="export-warning" hidden>
-            <strong>Unrecognized files will be permanently deleted</strong>
-            <p>
-              These output items do not match the current source library. The
-              entire existing output is replaced when export succeeds.
-            </p>
-            <ul id="export-warning-samples" class="export-warning-samples"></ul>
-            <p id="export-warning-more" class="export-warning-more" hidden></p>
-          </div>
-
-          <div class="export-dialog-actions">
-            <button id="export-cancel" class="secondary-button" type="button">Cancel</button>
-            <button id="export-confirm" class="primary-button" type="button">Export</button>
-          </div>
-        </div>
-      </section>
 
       <aside id="action-error" class="action-error" role="alert" hidden>
         <div>

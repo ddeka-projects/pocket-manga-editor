@@ -10,7 +10,7 @@ This repository is part of `ddeka-projects`, a personal ecosystem of independent
 They share a development philosophy, not a required architecture or runtime. Keep each repository independently maintainable.
 
 ## This application
-The app supports reading manga, selecting pages, and exporting the chosen pages. Source images must remain untouched. Protect reading/editing positions, saved selections, and existing output; preserve transactional export and recovery guarantees.
+The app supports reading manga, selecting pages, and exporting the chosen pages. Source images must remain untouched. Protect reading/editing positions and saved selections. Export is a PC companion script (`pocket_manga_editor/companion/`), not part of the web app; its output is disposable and rebuilt from saved selections, so keep it simple rather than transactional.
 
 ## Working principles
 - Build for one user: a Windows-hosted app accessed primarily from an iPhone over a trusted home LAN, with desktop browser support. Avoid unnecessary accounts, multi-user systems, or public services.

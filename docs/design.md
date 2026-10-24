@@ -13,13 +13,14 @@ At process startup the server:
    precedence;
 2. validates the absolute existing library directory and bind host/port;
 3. acquires an operating-system lifetime guard for this app and library;
-4. completes any interrupted export recovery work;
+4. installs the export companion (`_exporter.py`, `_exporter.bat`) into the
+   metadata folder, replacing older copies; a failure is logged, not fatal;
 5. scans direct manga, entry, and image children into an immutable snapshot;
 6. starts the HTTP listener with a public `/health` readiness endpoint; and
 7. serves until Windows or the operator stops it.
 
-An invalid configuration, unsafe metadata path, unrecoverable transaction,
-failed scan, or occupied port is fatal. The process exits nonzero so Task
+An invalid configuration, unsafe metadata path, failed scan, or occupied port
+is fatal. The process exits nonzero so Task
 Scheduler can retry it, and diagnostic output is retained in `logs\server.log`
 with bounded rotation.
 The lifetime guard is outside the library and is released automatically if
@@ -52,8 +53,7 @@ or internet exposure.
 ## Exclusive controller
 
 The first page to open the application claims an unguessable, in-memory
-controller token. Every library, reader, image, selection, rescan, and export
-request must present both its page identity and token. A different tab or
+controller token. Every library, reader, image, selection, and rescan request must present both its page identity and token. A different tab or
 device receives an “open elsewhere” response and can choose **Take Control**.
 
 Ownership has no timer and the browser sends no heartbeat or shutdown-time
@@ -96,21 +96,21 @@ and tells the user when an unconfirmed save needs review.
 Choosing a manga is activity-neutral. **Read** and **Edit** bind the current page
 to that manga and metadata domain before folder/image access is allowed:
 
-- Read loads and writes only `reading.json`.
-- Edit loads and writes only `editing.json` and exposes selection fields.
+- Read loads and writes only `<manga>.read.json`.
+- Edit loads and writes only `<manga>.edit.json` and exposes selection fields.
 - Selection calls bound to Read are rejected before editing metadata is opened.
 - Opaque snapshot IDs cannot be substituted across manga or folders.
 
 Position and selection responses are returned only after the corresponding
 atomic metadata write succeeds. The browser drains confirmed queued writes
-before changing activities, rescanning, or starting export. The controller
-token is held across each durable mutation, rescan, or export, so takeover
+before changing activities or rescanning. The controller
+token is held across each durable mutation or rescan, so takeover
 cannot split one of those operations midway through its commit.
 
 ## Rescan
 
 The top-right library action is a server-side filesystem rescan, not merely an
-HTTP refresh. Rescan is serialized against state writes and export. It builds a
+HTTP refresh. Rescan is serialized against state writes. It builds a
 new immutable snapshot and review service, invalidates the old opaque IDs,
 clears the previous activity binding, and returns the controller to the library
 screen.
@@ -119,29 +119,37 @@ Files added after startup do not appear until Rescan. Files removed after a
 scan still fail live validation immediately rather than being served from a
 stale path.
 
-## Export
+## Metadata files
 
-Export is available from the manga activity menu and uses the complete saved
-Edit selection for that manga. It refuses an empty selection and leaves any
-prior output unchanged.
+All app metadata is flat in `<library>\.pocket-manga-editor`. Each manga has at
+most `<manga>.read.json` (latest Read entry/image) and `<manga>.edit.json`
+(latest Edit entry/image plus selected image names per entry). A file appears
+only after its activity first saves something. The files carry no schema
+version; unexpected keys, unsafe names, or unreadable JSON fail closed and are
+left untouched. Writes go through a same-folder temporary file and an atomic
+replace, so a reader never sees a half-written file.
 
-For a non-empty selection, the server stages a complete new output tree without
-modifying the active output. It verifies and synchronizes the staged bytes,
-durably records the transaction, moves the prior output aside, and installs the
-new tree. The prior tree is deleted only after commit. Recovery uses the journal
-and tree identities to either restore the old output or finish a committed new
-one without relying on export-history metadata.
+## Export companion
 
-Windows cannot atomically exchange two populated directories in one filesystem
-call. The durable move/install protocol therefore provides transactional
-all-or-prior-output behavior across ordinary errors and process interruption,
-with recovery before the next scan.
+Export is not part of the web app. It is a standard-library Python script with a
+double-clickable `.bat` launcher, developed in `pocket_manga_editor/companion/`
+and copied into the metadata folder at every server start. It locates the
+library as the parent of its own folder, so it needs no configuration.
 
-The old output is wholly application-managed. Before replacement, the server
-can recognize structural content that does not correspond to the current source
-and require confirmation. Once confirmed, all old output is removed, including
-unknown regular files. Links, junctions, mounted boundaries, and special files
-remain safety errors rather than content that the application follows or adopts.
+The script lists manga whose edit file has selections and exports the one you
+choose. It checks that every selected image is still a regular, non-link file
+in its entry folder; if any are missing it stops before changing anything.
+Otherwise it copies the images into `<manga>.export-tmp`, renames any existing
+`<manga>.export` to `<manga>.export-old`, renames the temporary folder into
+place, and deletes the old one. Windows cannot rename onto an existing folder,
+which is why the previous export is moved aside first.
+
+The export is disposable output rebuilt entirely from the edit file and the
+source images, so there is no journal or recovery: an interrupted run leaves at
+most a `-tmp` or `-old` folder, which the next run deletes before starting.
+Source images are opened read-only. The script reads edit files without taking
+the server's lock; atomic writes make that safe while the server runs, and
+selection saves are never blocked by an export.
 
 ## Windows Task Scheduler
 
@@ -155,7 +163,7 @@ Otherwise firewall rules are left untouched. `scripts/run-dev.ps1` uses the
 repository's `.venv` in the foreground. Scheduled startup uses a console-free
 Python launcher and records diagnostics in `logs\server.log`.
 Double-click `restart-server.cmd` after code updates to restart the exact task
-and wait for HTTP readiness. Finish active saves and exports first.
+and wait for HTTP readiness. Finish active saves first.
 `scripts/remove-startup-task.ps1` removes the task without touching application data.
 
 The server is available after that user signs in, while the PC remains awake.
@@ -188,11 +196,11 @@ follows the configured port, and update the Home Screen URL.
 Return to **Your Library** and use the top-right Rescan action. A browser reload
 alone is not a substitute for a server scan.
 
-### Export recovery blocks startup or rescan
+### Export companion is missing or outdated
 
-Do not manually move transaction payloads while recovery is possible. Stop
-duplicate processes, inspect the exact error in the server log, and preserve the
-reported manga workspace until its old/new output state can be reconciled.
+The server reinstalls `_exporter.py` and `_exporter.bat` at every start. If they
+are missing, check `logs\server.log` for an installation warning, then restart
+the server.
 
 ## Code layout
 
@@ -201,8 +209,9 @@ reported manga workspace until its old/new output state can be reconciled.
 validates routes and translates errors; `service.py` coordinates the library;
 `controller.py` holds the in-memory page owner. `static/` contains the no-build
 browser interface. `snapshot.py` and `review.py` support reader operations.
-`storage.py`, `workspace.py`, `path_safety.py`, `library_lock.py`, and
-`exporter.py` retain the separate metadata and transactional-export guarantees.
+`storage.py`, `workspace.py`, `path_safety.py`, and `library_lock.py` keep the
+metadata files safe. `companion_install.py` copies the export companion from
+`companion/` into the metadata folder.
 `process_lock.py`, `errors.py`, and `logging_setup.py` follow the same small
 conventions as the other Pocket repositories without a shared runtime package.
 

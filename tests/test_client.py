@@ -53,13 +53,6 @@ class WebAssetContractTests(unittest.TestCase):
             "back-to-library",
             "choose-read",
             "choose-edit",
-            "choose-export",
-            "export-overlay",
-            "export-dialog",
-            "export-warning",
-            "export-warning-samples",
-            "export-cancel",
-            "export-confirm",
             "reader-screen",
             "image-display",
             "selection-frame",
@@ -191,8 +184,6 @@ class WebAssetContractTests(unittest.TestCase):
             "`/api/read/folder/${encodeURIComponent(id)}/position`",
             "`/api/edit/folder/${encodeURIComponent(id)}/position`",
             "`/api/edit/folder/${encodeURIComponent(id)}/selection`",
-            "`/api/manga/${encodeURIComponent(id)}/export-preview`",
-            "`/api/manga/${encodeURIComponent(id)}/export`",
         }
         for route in required_routes:
             with self.subTest(route=route):
@@ -229,14 +220,11 @@ class WebAssetContractTests(unittest.TestCase):
         self.assertIn("Choose an activity", self.html)
         self.assertIn("Read without image-selection controls.", self.html)
         self.assertIn("Review and select images for export.", self.html)
-        self.assertIn('id="choose-export"', self.html)
-        self.assertIn("Replace output with the current selections.", self.html)
         self.assertIn('id="activity-title" tabindex="-1"', self.html)
         self.assertIn('aria-label="Back to library"', self.html)
         self.assertIn("showActivityChoice(manga", self.javascript)
         self.assertIn("chooseActivity(READ)", self.javascript)
         self.assertIn("chooseActivity(EDIT)", self.javascript)
-        self.assertIn("void prepareExport()", self.javascript)
         self.assertNotIn("selectedCount: nonNegativeInteger(manga", self.javascript)
         self.assertNotIn("selectedCount: activity === EDIT", self.javascript)
         self.assertNotIn("mangaSelectedCount: activity === EDIT", self.javascript)
@@ -359,54 +347,13 @@ class WebAssetContractTests(unittest.TestCase):
         self.assertIn("state.snapshotId = payload.snapshot_id", apply_library)
         self.assertIn('showLibrary({ historyMode: "replace" })', apply_library)
 
-    def test_export_preview_refusal_confirmation_and_long_commit_are_explicit(self) -> None:
-        prepare = self.javascript.split("async function prepareExport() {", 1)[1].split(
-            "function normalizeExportPreview", 1
-        )[0]
-        self.assertLess(
-            prepare.index("await drainPendingMutations()"),
-            prepare.index("requestJson(ROUTES.exportPreview"),
-        )
-        self.assertIn("preview.selectedImageCount === 0", prepare)
-        self.assertIn('"Nothing selected"', prepare)
-        self.assertLess(
-            prepare.index("preview.selectedImageCount === 0"),
-            prepare.index("openExportDialog(preview)"),
-        )
-
-        dialog = self.javascript.split("function openExportDialog(preview) {", 1)[1].split(
-            "function closeExportDialog", 1
-        )[0]
-        self.assertIn("Replace existing output?", dialog)
-        self.assertIn("Unrecognized output will be deleted", dialog)
-        self.assertIn("preview.unrecognizedEntries.slice(0, 6)", dialog)
-        self.assertIn("item.textContent = entry", dialog)
-        self.assertNotIn("innerHTML", dialog)
-
-        commit = self.javascript.split("async function commitExport() {", 1)[1].split(
-            "function setActivityActionsDisabled", 1
-        )[0]
-        self.assertLess(
-            commit.index("await drainPendingMutations()"),
-            commit.index("requestJson(ROUTES.exportManga"),
-        )
-        self.assertIn(
-            "confirm_unrecognized_output: preview.unrecognizedEntries.length > 0",
-            commit,
-        )
-        self.assertIn("timeoutMs: EXPORT_TIMEOUT_MS", commit)
-        self.assertIn("showWarnings(result.warnings)", commit)
-        self.assertIn('elements.exportConfirm.textContent = "Exporting…"', commit)
-        self.assertIn('error.code === "nothing_selected"', commit)
-        self.assertIn('error.code === "export_confirmation_required"', commit)
-        self.assertIn("const EXPORT_TIMEOUT_MS = 10 * 60_000", self.javascript)
-
-        self.assertIn('id="export-dialog"', self.html)
-        self.assertIn('role="dialog"', self.html)
-        self.assertIn('aria-modal="true"', self.html)
-        self.assertIn("Unrecognized files will be permanently deleted", self.html)
-        self.assertIn(".dialog-overlay", self.css)
-        self.assertIn(".export-warning", self.css)
+    def test_export_is_not_part_of_the_web_app(self) -> None:
+        # Export runs from the PC companion script in the metadata folder.
+        for source in (self.html, self.javascript, self.css):
+            self.assertNotIn("choose-export", source)
+            self.assertNotIn("export-dialog", source)
+        self.assertNotIn("/export", self.javascript)
+        self.assertNotIn("exportBusy", self.javascript)
 
     def test_manifest_and_code_native_icons_are_installable(self) -> None:
         manifest = json.loads(

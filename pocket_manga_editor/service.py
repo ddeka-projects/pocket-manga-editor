@@ -7,7 +7,6 @@ import logging
 from pathlib import Path
 import threading
 
-from . import exporter as exporter_module
 from .models import ScanResult
 from .scanner import scan_working_directory
 from .controller import ControllerOwnership
@@ -27,13 +26,6 @@ LOGGER = logging.getLogger(__name__)
 class ServiceStatus:
     active_controller: bool
     snapshot_id: str
-
-
-@dataclass(frozen=True, slots=True)
-class ExportMutation:
-    selected_folder_count: int
-    selected_image_count: int
-    warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,7 +148,6 @@ class LibraryService:
         with self._controller.authorized(page_id, token):
             root = self.working_directory
             try:
-                exporter_module.recover_interrupted_exports(root)
                 scan_result = scan_working_directory(root)
                 snapshot = LibrarySnapshot.build(root, scan_result)
                 review = ReviewService(snapshot)
@@ -171,48 +162,6 @@ class LibraryService:
                 self._review = review
                 self._activity_binding = None
                 return review.library_payload()
-
-    def export_preview(self, page_id: str, token: str, manga_id: str):
-        with self._controller.authorized(page_id, token):
-            with self._lock:
-                snapshot = self._snapshot
-                manga = snapshot.manga(manga_id).ref
-            return exporter_module.inspect_export(snapshot.working_directory, manga)
-
-    def export_manga(
-        self,
-        page_id: str,
-        token: str,
-        manga_id: str,
-        confirm_unrecognized_output: bool,
-    ) -> ExportMutation:
-        with self._controller.authorized(page_id, token):
-            with self._lock:
-                snapshot = self._snapshot
-                manga = snapshot.manga(manga_id).ref
-
-            result = exporter_module.export_manga(
-                snapshot.working_directory,
-                manga,
-                confirm_unrecognized_output=confirm_unrecognized_output,
-            )
-            for warning in result.warnings:
-                LOGGER.warning("Export cleanup warning for %s: %s", manga.name, warning)
-            public_warnings = (
-                (
-                    (
-                        "Export succeeded, but temporary cleanup is pending. "
-                        "The server will retry it automatically."
-                    ),
-                )
-                if result.warnings
-                else ()
-            )
-            return ExportMutation(
-                result.folder_count,
-                result.image_count,
-                public_warnings,
-            )
 
     def status(self) -> ServiceStatus:
         controller = self._controller.snapshot()

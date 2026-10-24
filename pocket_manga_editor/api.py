@@ -16,13 +16,6 @@ import stat
 from typing import BinaryIO, Mapping
 from urllib.parse import parse_qsl, unquote, urlsplit
 
-from .exporter import (
-    ExportBusyError,
-    ExportConfirmationRequired,
-    ExportError,
-    ExportRecoveryError,
-    NothingSelectedError,
-)
 from .service import LibraryService
 from .errors import AppError
 from .health import make_health
@@ -197,18 +190,6 @@ class API:
                 "rescan",
             ]
             is_manga = method == "GET" and len(segments) == 3 and segments[:2] == ["api", "manga"]
-            is_export_preview = (
-                method == "GET"
-                and len(segments) == 4
-                and segments[:2] == ["api", "manga"]
-                and segments[3] == "export-preview"
-            )
-            is_export = (
-                method == "POST"
-                and len(segments) == 4
-                and segments[:2] == ["api", "manga"]
-                and segments[3] == "export"
-            )
             is_folder = method == "GET" and len(segments) == 3 and segments[:2] == ["api", "folder"]
             is_image = method == "GET" and len(segments) == 3 and segments[:2] == ["api", "image"]
             is_position_write = (
@@ -230,8 +211,6 @@ class API:
                     is_library,
                     is_rescan,
                     is_manga,
-                    is_export_preview,
-                    is_export,
                     is_folder,
                     is_image,
                     is_position_write,
@@ -253,36 +232,6 @@ class API:
                 return self._json(
                     200,
                     self.service.open_manga(page_id, token, segments[2], activity),
-                )
-            if is_export_preview:
-                preview = self.service.export_preview(page_id, token, segments[2])
-                unrecognized = [str(value) for value in preview.unrecognized_entries]
-                return self._json(
-                    200,
-                    {
-                        "snapshot_id": self.service.status().snapshot_id,
-                        "export": {
-                            "selected_folder_count": preview.selected_folder_count,
-                            "selected_image_count": preview.selected_image_count,
-                            "output_exists": preview.output_exists,
-                            "unrecognized_entries": unrecognized,
-                            "requires_confirmation": bool(unrecognized),
-                        },
-                    },
-                )
-            if is_export:
-                payload = self._json_body(headers, body)
-                self._require_keys(payload, {"confirm_unrecognized_output"})
-                confirmed = payload.get("confirm_unrecognized_output")
-                if not isinstance(confirmed, bool):
-                    raise RequestError("confirm_unrecognized_output must be a boolean.")
-                mutation = self.service.export_manga(page_id, token, segments[2], confirmed)
-                return self._json(
-                    200,
-                    {
-                        "snapshot_id": self.service.status().snapshot_id,
-                        "export": asdict(mutation),
-                    },
                 )
             if is_folder:
                 activity = self._activity_query(parsed_target.query)
@@ -577,27 +526,6 @@ class API:
             return self._error(400, exc.code, str(exc))
         if isinstance(exc, RescanError):
             return self._error(503, exc.code, str(exc))
-        if isinstance(exc, ExportBusyError):
-            return self._error(409, "operation_busy", str(exc))
-        if isinstance(exc, ExportRecoveryError):
-            LOGGER.exception("Export recovery failed during an API request.")
-            return self._error(
-                503,
-                "export_recovery_failed",
-                "Export recovery could not finish safely. Check the server log.",
-            )
-        if isinstance(exc, NothingSelectedError):
-            return self._error(409, "nothing_selected", str(exc))
-        if isinstance(exc, ExportConfirmationRequired):
-            return self._error(409, "export_confirmation_required", str(exc))
-        if isinstance(exc, ExportError):
-            LOGGER.warning("Export request failed safely: %s", exc)
-            return self._error(
-                409,
-                getattr(exc, "code", "export_failed"),
-                "The manga export could not be completed safely. The previous "
-                "output was preserved; check the server log.",
-            )
         if isinstance(exc, ServiceError):
             return self._error(409, exc.code, str(exc))
         LOGGER.exception("Unhandled web API failure.")

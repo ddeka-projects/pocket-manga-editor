@@ -1,4 +1,8 @@
-"""Atomic, per-manga reading and editing state persistence."""
+"""Atomic, per-manga reading and editing state persistence.
+
+Each manga has at most two flat files in the app metadata folder:
+``<manga>.read.json`` and ``<manga>.edit.json``.
+"""
 
 from __future__ import annotations
 
@@ -13,16 +17,12 @@ from .library_lock import library_mutation_lock
 from .models import FolderRef, MangaRef
 from .scanner import natural_name_key
 from .workspace import (
-    MangaWorkspacePaths,
-    manga_workspace_paths,
-    validate_editing_workspace,
+    manga_metadata_paths,
+    validate_editing_file,
     validate_live_manga_item,
     validate_live_manga_root,
-    validate_reading_workspace,
+    validate_reading_file,
 )
-
-
-STATE_SCHEMA_VERSION = 3
 
 
 class StorageError(OSError):
@@ -58,33 +58,29 @@ class EditingSnapshot:
 
 
 class ReadingStore:
-    """Persist reading bookmarks in one manga workspace."""
+    """Persist one manga's reading bookmark."""
 
     def __init__(self, working_directory: str | Path) -> None:
         self.working_directory = Path(working_directory)
 
     def path_for(self, manga: MangaRef) -> Path:
-        paths = manga_workspace_paths(self.working_directory, manga.name)
-        return validate_reading_workspace(paths).reading
+        return validate_reading_file(manga_metadata_paths(self.working_directory, manga.name))
 
     def load(self, manga: MangaRef) -> ReadingSnapshot:
         root, _source = validate_live_manga_root(self.working_directory, manga)
-        paths = manga_workspace_paths(root, manga.name)
-        validate_reading_workspace(paths)
-        return _load_reading(paths.reading, manga)
+        return _load_reading(validate_reading_file(manga_metadata_paths(root, manga.name)), manga)
 
     def set_position(self, manga: MangaRef, folder_name: str, image_name: str) -> ReadingSnapshot:
         with library_mutation_lock(self.working_directory) as root:
             folder = _folder_for(manga, folder_name)
             image = _image_for(folder, image_name)
             validate_live_manga_item(root, manga, folder, image)
-            paths = _ensure_workspace(root, manga)
-            validate_reading_workspace(paths)
+            path = validate_reading_file(manga_metadata_paths(root, manga.name))
             # Refuse to overwrite damaged metadata, including changes made
             # outside the app after the current reader was opened.
-            _load_reading(paths.reading, manga)
+            _load_reading(path, manga)
             snapshot = ReadingSnapshot(folder_name, image_name)
-            _write_reading(paths.reading, snapshot)
+            _write_reading(path, snapshot)
             return snapshot
 
 
@@ -95,8 +91,7 @@ class EditingStore:
         self.working_directory = Path(working_directory)
 
     def path_for(self, manga: MangaRef) -> Path:
-        paths = manga_workspace_paths(self.working_directory, manga.name)
-        return validate_editing_workspace(paths).editing
+        return validate_editing_file(manga_metadata_paths(self.working_directory, manga.name))
 
     def load(self, manga: MangaRef) -> EditingSnapshot:
         root, _source = validate_live_manga_root(self.working_directory, manga)
@@ -160,12 +155,11 @@ class EditingStore:
         """Load strictly while the caller owns or does not require the mutation lock."""
 
         validate_live_manga_root(root, manga)
-        paths = manga_workspace_paths(root, manga.name)
-        validate_editing_workspace(paths)
-        if not paths.editing.exists():
+        path = validate_editing_file(manga_metadata_paths(root, manga.name))
+        if not path.exists():
             return _default_editing(manga)
         try:
-            with paths.editing.open("r", encoding="utf-8") as handle:
+            with path.open("r", encoding="utf-8") as handle:
                 payload = json.load(handle)
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise EditingStateError(
@@ -177,10 +171,8 @@ class EditingStore:
         """Write a validated snapshot while the caller holds the mutation lock."""
 
         validate_live_manga_root(root, manga)
-        paths = _ensure_workspace(root, manga)
-        validate_editing_workspace(paths)
-        payload = _editing_payload(manga, snapshot)
-        atomic_write_json(paths.editing, payload)
+        path = validate_editing_file(manga_metadata_paths(root, manga.name))
+        atomic_write_json(path, _editing_payload(manga, snapshot))
 
 
 def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -206,15 +198,6 @@ def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
         raise
 
 
-def _ensure_workspace(root: Path, manga: MangaRef) -> MangaWorkspacePaths:
-    paths = manga_workspace_paths(root, manga.name)
-    try:
-        paths.workspace.mkdir(parents=False, exist_ok=True)
-    except OSError as exc:
-        raise StorageError(f"Could not create manga workspace: {exc}") from exc
-    return manga_workspace_paths(root, manga.name)
-
-
 def _load_reading(path: Path, manga: MangaRef) -> ReadingSnapshot:
     default = _default_reading(manga)
     if not path.exists():
@@ -229,9 +212,7 @@ def _load_reading(path: Path, manga: MangaRef) -> ReadingSnapshot:
 
     if (
         not isinstance(payload, dict)
-        or set(payload) != {"schema_version", "last_folder", "last_image"}
-        or payload.get("schema_version") != STATE_SCHEMA_VERSION
-        or isinstance(payload.get("schema_version"), bool)
+        or set(payload) != {"last_folder", "last_image"}
         or not isinstance(payload.get("last_folder"), str)
         or not isinstance(payload.get("last_image"), str)
         or not _safe_component(payload.get("last_folder"))
@@ -257,7 +238,6 @@ def _write_reading(path: Path, snapshot: ReadingSnapshot) -> None:
     atomic_write_json(
         path,
         {
-            "schema_version": STATE_SCHEMA_VERSION,
             "last_folder": snapshot.last_folder,
             "last_image": snapshot.last_image,
         },
@@ -276,9 +256,7 @@ def _default_editing(manga: MangaRef) -> EditingSnapshot:
 def _parse_editing(payload: object, manga: MangaRef) -> EditingSnapshot:
     if (
         not isinstance(payload, dict)
-        or set(payload) != {"schema_version", "last_folder", "last_image", "folders"}
-        or payload.get("schema_version") != STATE_SCHEMA_VERSION
-        or isinstance(payload.get("schema_version"), bool)
+        or set(payload) != {"last_folder", "last_image", "folders"}
         or not isinstance(payload.get("last_folder"), str)
         or not isinstance(payload.get("last_image"), str)
         or not isinstance(payload.get("folders"), dict)
@@ -361,7 +339,6 @@ def _editing_payload(manga: MangaRef, snapshot: EditingSnapshot) -> dict[str, An
         }
 
     return {
-        "schema_version": STATE_SCHEMA_VERSION,
         "last_folder": snapshot.last_folder,
         "last_image": snapshot.last_image,
         "folders": folder_payload,

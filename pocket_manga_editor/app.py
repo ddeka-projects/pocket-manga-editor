@@ -1,4 +1,4 @@
-"""Load settings, recover the library, and run the local web application."""
+"""Load settings, install the export companion, and run the local web application."""
 
 from __future__ import annotations
 
@@ -8,8 +8,8 @@ import signal
 import sys
 import threading
 
+from .companion_install import install_companion
 from .config import ConfigurationError, Settings, load_settings
-from .exporter import ExportError, recover_interrupted_exports
 from .logging_setup import configure_logging
 from .process_lock import ProcessLock
 from .scanner import ScanError, scan_working_directory
@@ -41,7 +41,6 @@ def main(argv: list[str] | None = None) -> int:
             return _serve(settings)
     except (
         ConfigurationError,
-        ExportError,
         ScanError,
         OSError,
         ValueError,
@@ -55,7 +54,13 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _serve(settings: Settings) -> int:
-    recovery = recover_interrupted_exports(settings.working_directory)
+    try:
+        companion = install_companion(settings.working_directory)
+    except OSError as exc:
+        # Reading and editing do not depend on the export companion.
+        LOGGER.warning("Could not install the export companion: %s", exc)
+    else:
+        LOGGER.info("Export companion installed in %s.", companion)
     scan_result = scan_working_directory(settings.working_directory)
     service = LibraryService(settings.working_directory, scan_result)
     server = HTTPService(service, host=settings.host, port=settings.port)
@@ -70,11 +75,6 @@ def _serve(settings: Settings) -> int:
             )
             return 1
 
-        if recovery.recovered_count:
-            LOGGER.info(
-                "Recovered %d interrupted export transaction(s).",
-                recovery.recovered_count,
-            )
         for issue in scan_result.issues:
             LOGGER.warning("Ignored %s: %s", issue.path, issue.message)
         LOGGER.info(

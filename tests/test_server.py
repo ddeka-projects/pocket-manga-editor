@@ -38,7 +38,6 @@ from pocket_manga_editor.activity import (
 )
 from pocket_manga_editor.scanner import ScanError, scan_working_directory
 from pocket_manga_editor.storage import EditingStore, ReadingSnapshot, ReadingStore
-from pocket_manga_editor.workspace import manga_workspace_paths
 
 
 class ServerFixture(unittest.TestCase):
@@ -676,62 +675,6 @@ class APITests(ServerFixture):
         self.assertEqual(cross_origin.status, 403)
         self.assertEqual(wrong_type.status, 415)
 
-    def test_export_refuses_zero_then_warns_and_atomically_replaces_output(self) -> None:
-        self.assertEqual(self.claim().status, 200)
-        library = self.payload(self.get("/api/library"))
-        manga_id = library["mangas"][0]["id"]
-        preview = self.payload(self.get(f"/api/manga/{manga_id}/export-preview"))["export"]
-        self.assertEqual(preview["selected_image_count"], 0)
-        refused = self.json_request(
-            "POST",
-            f"/api/manga/{manga_id}/export",
-            {"confirm_unrecognized_output": False},
-        )
-        self.assertEqual(refused.status, 409)
-        self.assertEqual(self.payload(refused)["error"]["code"], "nothing_selected")
-
-        edit = self.payload(self.get(f"/api/manga/{manga_id}?activity=edit"))["manga"]
-        folder_id = edit["folders"][0]["id"]
-        folder = self.payload(self.get(f"/api/folder/{folder_id}?activity=edit"))["folder"]
-        image_id = folder["images"][0]["id"]
-        self.assertEqual(
-            self.json_request(
-                "PATCH",
-                f"/api/edit/folder/{folder_id}/selection",
-                {"image_id": image_id, "selected": True},
-            ).status,
-            200,
-        )
-        manga_ref = self.scan_result.mangas[0]
-        workspace = manga_workspace_paths(self.root, manga_ref.name)
-        workspace.output.mkdir(parents=True)
-        outsider = workspace.output / "test.txt"
-        outsider.write_text("outside", encoding="utf-8")
-        warning = self.payload(self.get(f"/api/manga/{manga_id}/export-preview"))["export"]
-        self.assertTrue(warning["requires_confirmation"])
-        self.assertIn("test.txt", warning["unrecognized_entries"])
-
-        unconfirmed = self.json_request(
-            "POST",
-            f"/api/manga/{manga_id}/export",
-            {"confirm_unrecognized_output": False},
-        )
-        self.assertEqual(unconfirmed.status, 409)
-        self.assertEqual(
-            self.payload(unconfirmed)["error"]["code"],
-            "export_confirmation_required",
-        )
-        self.assertTrue(outsider.exists())
-        exported = self.json_request(
-            "POST",
-            f"/api/manga/{manga_id}/export",
-            {"confirm_unrecognized_output": True},
-        )
-        self.assertEqual(exported.status, 200, exported.body)
-        result = self.payload(exported)["export"]
-        self.assertEqual(result["selected_image_count"], 1)
-        self.assertFalse(outsider.exists())
-
     def test_rescan_returns_new_library_keeps_controller_and_retains_old_on_failure(self) -> None:
         claimed = self.payload(self.claim())
         previous = claimed["snapshot_id"]
@@ -765,6 +708,8 @@ class APITests(ServerFixture):
             ("GET", "/api/volume/v_old"),
             ("GET", "/api/page/p_old/image"),
             ("POST", "/api/export"),
+            ("GET", "/api/manga/m_any/export-preview"),
+            ("POST", "/api/manga/m_any/export"),
             ("POST", "/api/complete"),
             ("POST", "/api/pair"),
         ):

@@ -2,7 +2,8 @@
 
 (() => {
   const REQUEST_TIMEOUT_MS = 15_000;
-  const EXPORT_TIMEOUT_MS = 10 * 60_000;
+  // Takeover waits for any save or rescan the previous owner is committing.
+  const TAKEOVER_TIMEOUT_MS = 10 * 60_000;
   // Position and selection saves are small, idempotent LAN writes. They retry
   // quietly before the user is asked to intervene.
   const SAVE_TIMEOUT_MS = 5_000;
@@ -27,8 +28,6 @@
     readPosition: (id) => `/api/read/folder/${encodeURIComponent(id)}/position`,
     editPosition: (id) => `/api/edit/folder/${encodeURIComponent(id)}/position`,
     editSelection: (id) => `/api/edit/folder/${encodeURIComponent(id)}/selection`,
-    exportPreview: (id) => `/api/manga/${encodeURIComponent(id)}/export-preview`,
-    exportManga: (id) => `/api/manga/${encodeURIComponent(id)}/export`,
   });
 
   const element = (id) => document.getElementById(id);
@@ -53,8 +52,6 @@
     backToLibrary: element("back-to-library"),
     chooseRead: element("choose-read"),
     chooseEdit: element("choose-edit"),
-    chooseExport: element("choose-export"),
-    exportActionDetail: element("export-action-detail"),
     readerScreen: element("reader-screen"),
     readerStage: element("reader-stage"),
     imageDisplay: element("image-display"),
@@ -77,15 +74,6 @@
     imageRetry: element("image-retry"),
     boundaryCue: element("boundary-cue"),
     readerFeedback: element("reader-feedback"),
-    exportOverlay: element("export-overlay"),
-    exportDialog: element("export-dialog"),
-    exportDialogTitle: element("export-dialog-title"),
-    exportDialogMessage: element("export-dialog-message"),
-    exportWarning: element("export-warning"),
-    exportWarningSamples: element("export-warning-samples"),
-    exportWarningMore: element("export-warning-more"),
-    exportCancel: element("export-cancel"),
-    exportConfirm: element("export-confirm"),
     actionError: element("action-error"),
     actionErrorTitle: element("action-error-title"),
     actionErrorMessage: element("action-error-message"),
@@ -143,8 +131,6 @@
     mutationBarrierTail: Promise.resolve(),
     activityOpening: false,
     rescanBusy: false,
-    exportBusy: false,
-    exportPreview: null,
     entryNavigationPending: false,
     entryNavigationToken: 0,
     historyNavigationPending: false,
@@ -172,9 +158,6 @@
     elements.backToLibrary.addEventListener("click", navigateBackAfterMutations);
     elements.chooseRead.addEventListener("click", () => void chooseActivity(READ));
     elements.chooseEdit.addEventListener("click", () => void chooseActivity(EDIT));
-    elements.chooseExport.addEventListener("click", () => void prepareExport());
-    elements.exportCancel.addEventListener("click", closeExportDialog);
-    elements.exportConfirm.addEventListener("click", () => void commitExport());
     elements.backToActivities.addEventListener("click", navigateBackAfterMutations);
     elements.folderPicker.addEventListener("change", (event) => {
       const folderId = event.currentTarget.value;
@@ -205,11 +188,6 @@
       }
     });
     elements.actionErrorDismiss.addEventListener("click", hideActionError);
-    document.addEventListener("keydown", (event) => {
-      if (event.key === "Escape" && !elements.exportOverlay.hidden && !state.exportBusy) {
-        closeExportDialog();
-      }
-    });
 
     for (const control of [elements.topChrome, elements.backToActivities]) {
       for (const eventName of ["click", "pointerup", "touchend"]) {
@@ -380,7 +358,7 @@
         method: "POST",
         body: { page_id: state.pageId },
         controller: false,
-        timeoutMs: takeover ? EXPORT_TIMEOUT_MS : REQUEST_TIMEOUT_MS,
+        timeoutMs: takeover ? TAKEOVER_TIMEOUT_MS : REQUEST_TIMEOUT_MS,
       });
       const controller = payload.controller || {};
       state.controllerToken = String(controller.token || "");
@@ -587,7 +565,7 @@
       loading: false,
       actionLabel: "Take Control",
       action: () => acquireController({ takeover: true }),
-      detail: "Taking control is immediate once any in-progress save or export finishes.",
+      detail: "Taking control is immediate once any in-progress save finishes.",
     });
   }
 
@@ -606,8 +584,6 @@
 
   function showState({ kicker, title, message, loading, actionLabel = "", action = null, detail = "" }) {
     hideActionError();
-    elements.exportOverlay.hidden = true;
-    document.body.classList.remove("dialog-open");
     clearReaderMedia();
     elements.stateScreen.hidden = false;
     elements.libraryScreen.hidden = true;
@@ -650,7 +626,7 @@
   }
 
   async function rescanLibrary() {
-    if (!state.ownsControl || state.rescanBusy || state.exportBusy) {
+    if (!state.ownsControl || state.rescanBusy) {
       return;
     }
     state.rescanBusy = true;
@@ -713,7 +689,6 @@
     state.activity = null;
     state.currentManga = null;
     state.currentFolder = null;
-    state.exportPreview = null;
     showLibrary({ historyMode: "replace" });
   }
 
@@ -783,8 +758,6 @@
 
   function showLibrary({ historyMode = "none" } = {}) {
     hideActionError();
-    elements.exportOverlay.hidden = true;
-    document.body.classList.remove("dialog-open");
     clearReaderFeedback();
     state.viewRequestToken += 1;
     state.activityEpoch += 1;
@@ -792,7 +765,6 @@
     state.activity = null;
     state.currentManga = null;
     state.currentFolder = null;
-    state.exportPreview = null;
     state.entryNavigationPending = false;
     state.entryNavigationToken += 1;
     renderLibrary();
@@ -811,8 +783,6 @@
       return;
     }
     hideActionError();
-    elements.exportOverlay.hidden = true;
-    document.body.classList.remove("dialog-open");
     clearReaderFeedback();
     clearReaderMedia();
     state.viewRequestToken += 1;
@@ -821,11 +791,9 @@
     state.activity = null;
     state.currentManga = null;
     state.currentFolder = null;
-    state.exportPreview = null;
     state.entryNavigationPending = false;
     state.entryNavigationToken += 1;
     elements.activityTitle.textContent = manga.name;
-    elements.exportActionDetail.textContent = "Replace output with the current selections.";
     elements.stateScreen.hidden = true;
     elements.libraryScreen.hidden = true;
     elements.readerScreen.hidden = true;
@@ -835,248 +803,10 @@
     window.setTimeout(() => elements.activityTitle.focus(), 20);
   }
 
-  async function prepareExport() {
-    const manga = state.activityManga;
-    if (!state.ownsControl || !manga || state.exportBusy || state.activityOpening) {
-      return;
-    }
-    setActivityActionsDisabled(true);
-    hideActionError();
-    elements.exportActionDetail.textContent = "Checking current selections…";
-    if (!(await drainPendingMutations())) {
-      setActivityActionsDisabled(false);
-      return;
-    }
-    if (state.activityManga !== manga) {
-      setActivityActionsDisabled(false);
-      return;
-    }
-    try {
-      const payload = await requestJson(ROUTES.exportPreview(manga.id));
-      if (state.activityManga !== manga) {
-        return;
-      }
-      if (payload.snapshot_id) {
-        state.snapshotId = payload.snapshot_id;
-      }
-      const preview = normalizeExportPreview(payload.export, manga);
-      if (preview.selectedImageCount === 0) {
-        state.exportPreview = null;
-        elements.exportActionDetail.textContent = "Nothing selected.";
-        showActionError(
-          "Nothing selected",
-          "Select at least one image in Edit before exporting this manga.",
-        );
-        return;
-      }
-      state.exportPreview = preview;
-      elements.exportActionDetail.textContent = `${plural(
-        preview.selectedImageCount,
-        "1 selected image",
-        `${preview.selectedImageCount} selected images`,
-      )} ready.`;
-      openExportDialog(preview);
-    } catch (error) {
-      if (state.activityManga !== manga) {
-        return;
-      }
-      if (error instanceof ApiError && error.code === "nothing_selected") {
-        elements.exportActionDetail.textContent = "Nothing selected.";
-        showActionError(
-          "Nothing selected",
-          "Select at least one image in Edit before exporting this manga.",
-        );
-      } else if (isSessionGateError(error)) {
-        handleSessionError(error, prepareExport);
-      } else {
-        elements.exportActionDetail.textContent = "Replace output with the current selections.";
-        showActionError(
-          "Couldn’t prepare export",
-          friendlyMessage(error),
-          prepareExport,
-        );
-      }
-    } finally {
-      setActivityActionsDisabled(false);
-    }
-  }
-
-  function normalizeExportPreview(rawPreview, manga) {
-    const raw = rawPreview && typeof rawPreview === "object" ? rawPreview : {};
-    return {
-      mangaId: manga.id,
-      mangaName: manga.name,
-      selectedFolderCount: nonNegativeInteger(raw.selected_folder_count),
-      selectedImageCount: nonNegativeInteger(raw.selected_image_count),
-      outputExists: Boolean(raw.output_exists),
-      unrecognizedEntries: Array.isArray(raw.unrecognized_entries)
-        ? raw.unrecognized_entries.map((entry) => String(entry))
-        : [],
-      requiresConfirmation: Boolean(raw.requires_confirmation),
-    };
-  }
-
-  function openExportDialog(preview) {
-    const suspicious = preview.unrecognizedEntries.length > 0;
-    const imageText = plural(
-      preview.selectedImageCount,
-      "1 selected image",
-      `${preview.selectedImageCount} selected images`,
-    );
-    const folderText = plural(
-      preview.selectedFolderCount,
-      "1 folder",
-      `${preview.selectedFolderCount} folders`,
-    );
-    elements.exportDialogTitle.textContent = suspicious
-      ? "Unrecognized output will be deleted"
-      : preview.outputExists
-        ? "Replace existing output?"
-        : "Export this manga?";
-    elements.exportDialogMessage.textContent = preview.outputExists
-      ? `${imageText} from ${folderText} will replace the entire existing output for ${preview.mangaName}.`
-      : `${imageText} from ${folderText} will be copied to the output for ${preview.mangaName}.`;
-    elements.exportWarning.hidden = !suspicious;
-    elements.exportWarningSamples.replaceChildren();
-    const shownEntries = preview.unrecognizedEntries.slice(0, 6);
-    for (const entry of shownEntries) {
-      const item = document.createElement("li");
-      item.textContent = entry;
-      elements.exportWarningSamples.append(item);
-    }
-    const hiddenCount = preview.unrecognizedEntries.length - shownEntries.length;
-    elements.exportWarningMore.hidden = hiddenCount <= 0;
-    elements.exportWarningMore.textContent = hiddenCount > 0
-      ? `And ${hiddenCount} more unrecognized ${hiddenCount === 1 ? "item" : "items"}.`
-      : "";
-    elements.exportConfirm.textContent = suspicious
-      ? "Delete and export"
-      : preview.outputExists
-        ? "Replace output"
-        : "Export";
-    elements.exportOverlay.hidden = false;
-    document.body.classList.add("dialog-open");
-    window.setTimeout(
-      () => (suspicious ? elements.exportCancel : elements.exportConfirm).focus(),
-      20,
-    );
-  }
-
-  function closeExportDialog() {
-    if (state.exportBusy) {
-      return;
-    }
-    hideExportDialog();
-  }
-
-  function hideExportDialog() {
-    elements.exportOverlay.hidden = true;
-    document.body.classList.remove("dialog-open");
-    elements.exportDialog.removeAttribute("aria-busy");
-    elements.exportCancel.disabled = false;
-    elements.exportConfirm.disabled = false;
-    if (state.activityManga) {
-      window.setTimeout(() => elements.chooseExport.focus(), 20);
-    }
-  }
-
-  async function commitExport() {
-    const preview = state.exportPreview;
-    const manga = state.activityManga;
-    if (
-      !preview
-      || !manga
-      || !state.ownsControl
-      || preview.mangaId !== manga.id
-      || state.exportBusy
-    ) {
-      return;
-    }
-    state.exportBusy = true;
-    setActivityActionsDisabled(true);
-    elements.backToLibrary.disabled = true;
-    elements.exportDialog.setAttribute("aria-busy", "true");
-    elements.exportCancel.disabled = true;
-    elements.exportConfirm.disabled = true;
-    elements.exportConfirm.textContent = "Exporting…";
-    if (!(await drainPendingMutations())) {
-      state.exportBusy = false;
-      elements.backToLibrary.disabled = false;
-      elements.exportCancel.disabled = false;
-      elements.exportConfirm.disabled = false;
-      elements.exportConfirm.textContent = "Export";
-      setActivityActionsDisabled(false);
-      return;
-    }
-    try {
-      const payload = await requestJson(ROUTES.exportManga(manga.id), {
-        method: "POST",
-        body: {
-          confirm_unrecognized_output: preview.unrecognizedEntries.length > 0,
-        },
-        timeoutMs: EXPORT_TIMEOUT_MS,
-      });
-      if (payload.snapshot_id) {
-        state.snapshotId = payload.snapshot_id;
-      }
-      const result = payload.export && typeof payload.export === "object"
-        ? payload.export
-        : {};
-      const imageCount = nonNegativeInteger(result.selected_image_count);
-      const folderCount = nonNegativeInteger(result.selected_folder_count);
-      state.exportPreview = null;
-      hideExportDialog();
-      elements.exportActionDetail.textContent = `${plural(
-        imageCount,
-        "1 image exported",
-        `${imageCount} images exported`,
-      )} from ${plural(folderCount, "1 folder", `${folderCount} folders`)}.`;
-      showToast(
-        plural(imageCount, "Exported 1 image.", `Exported ${imageCount} images.`),
-        3_000,
-      );
-      showWarnings(result.warnings);
-      announce("Manga export complete.");
-    } catch (error) {
-      hideExportDialog();
-      if (error instanceof ApiError && error.code === "nothing_selected") {
-        state.exportPreview = null;
-        elements.exportActionDetail.textContent = "Nothing selected.";
-        showActionError(
-          "Nothing selected",
-          "Select at least one image in Edit before exporting this manga.",
-        );
-      } else if (
-        error instanceof ApiError
-        && error.code === "export_confirmation_required"
-      ) {
-        state.exportPreview = null;
-        showActionError(
-          "Output changed",
-          "Review the current output warning before exporting.",
-          prepareExport,
-        );
-      } else if (isSessionGateError(error)) {
-        handleSessionError(error, prepareExport);
-      } else {
-        showActionError(
-          "Export failed",
-          friendlyMessage(error, "The previous output was left unchanged."),
-          prepareExport,
-        );
-      }
-    } finally {
-      state.exportBusy = false;
-      elements.backToLibrary.disabled = false;
-      setActivityActionsDisabled(false);
-    }
-  }
-
   function setActivityActionsDisabled(disabled) {
     const blocked = disabled || !state.ownsControl;
     elements.chooseRead.disabled = blocked;
     elements.chooseEdit.disabled = blocked;
-    elements.chooseExport.disabled = blocked;
   }
 
   async function chooseActivity(activity, { historyMode = "push" } = {}) {
@@ -1086,14 +816,12 @@
       || !state.ownsControl
       || (activity !== READ && activity !== EDIT)
       || state.activityOpening
-      || state.exportBusy
     ) {
       return;
     }
     state.activityOpening = true;
     elements.chooseRead.disabled = true;
     elements.chooseEdit.disabled = true;
-    elements.chooseExport.disabled = true;
     if (!(await drainPendingMutations())) {
       state.activityOpening = false;
       setActivityActionsDisabled(false);
@@ -2213,11 +1941,10 @@
   function updateControllerControls() {
     const disabled = !state.ownsControl;
     elements.libraryRefresh.disabled = disabled || state.rescanBusy;
-    elements.releaseControl.disabled = disabled || state.rescanBusy || state.exportBusy;
+    elements.releaseControl.disabled = disabled || state.rescanBusy;
     elements.emptyRetry.disabled = disabled || state.rescanBusy;
-    elements.chooseRead.disabled = disabled || state.activityOpening || state.exportBusy;
-    elements.chooseEdit.disabled = disabled || state.activityOpening || state.exportBusy;
-    elements.chooseExport.disabled = disabled || state.activityOpening || state.exportBusy;
+    elements.chooseRead.disabled = disabled || state.activityOpening;
+    elements.chooseEdit.disabled = disabled || state.activityOpening;
     elements.folderPicker.disabled = disabled;
     elements.imagePicker.disabled = disabled;
     elements.selectedPicker.disabled = disabled || state.activity !== EDIT;

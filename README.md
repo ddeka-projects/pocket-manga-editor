@@ -1,9 +1,11 @@
 # Pocket Manga Editor
 
 Pocket Manga Editor is a local web application for reading manga and selecting
-specific pages to copy into an output folder. A small Python server runs on the
-Windows PC that owns the files; the same full-screen web interface works from an
-iPhone Home Screen app or a browser on the PC.
+specific pages. A small Python server runs on the Windows PC that owns the
+files; the same full-screen web interface works from an iPhone Home Screen app
+or a browser on the PC. Selected pages are copied into an export folder by a
+double-click companion script on the PC (see
+[Exporting selected pages](#exporting-selected-pages)).
 
 There is no desktop GUI, account, cloud service, or permanent phone pairing.
 Any device on the trusted private LAN can open the app, and one browser page at
@@ -114,24 +116,24 @@ powershell -ExecutionPolicy Bypass -File .\scripts\remove-startup-task.ps1 -Remo
 
 Removal stops and unregisters the task. Firewall rules stay in place unless
 `-RemoveFirewall` is supplied. It keeps `.env`, `.venv`, logs, source manga,
-metadata, and output.
+metadata, and exports.
 
 After updating the code, rerun `bootstrap-windows.ps1` to apply any future
 requirement changes, then double-click `restart-server.cmd` in the repository
 root. It stops and waits for **Pocket Manga Editor**, starts it again, and
 checks `/health`. It asks
 for administrator access only if the task permissions require it and keeps
-the result visible. Finish active saves and exports before restarting.
+the result visible. Finish active saves before restarting. The restart also
+reinstalls the updated export companion.
 Reinstall the task after changing setup scripts or moving the repository.
 
 ## Web application
 
 The home screen lists the current library. Its top-right button performs a real
-filesystem rescan. Selecting a manga presents three actions:
+filesystem rescan. Selecting a manga presents two actions:
 
 - **Read** — selection-free reading with an independent saved position.
 - **Edit** — reading plus page selection controls and a saved editing position.
-- **Export** — replace that manga's output with all currently selected pages.
 
 Read and Edit each remember one latest entry/image pair per manga. Choosing an
 entry from the picker starts at its first image. Crossing forward into the next
@@ -150,7 +152,7 @@ away does not depend on an unreliable browser shutdown signal: ownership stays
 with that page until another page chooses **Take Control** or the server
 restarts. **Release Control** on the library screen gives up ownership
 deliberately. Other pages show a waiting screen until they take control.
-Takeover is immediate after any save or export already being committed
+Takeover is immediate after any save or rescan already being committed
 finishes. There is no heartbeat timeout, paired-device credential, or permanent
 ownership file; the trusted private LAN is the authorization boundary.
 
@@ -164,8 +166,8 @@ safe because they set an explicit value and are idempotent:
   outage the app may reopen a page or two earlier than where you stopped.
 - **Page selection** stays at `…` while it is retried for a few seconds. Only if
   it still cannot be confirmed does **Connection interrupted** appear; tap
-  **Retry** once the PC is reachable. Leaving the view, rescanning, and export
-  still wait until every selection is confirmed.
+  **Retry** once the PC is reachable. Leaving the view and rescanning still
+  wait until every selection is confirmed.
 
 If control moved to another page or the library changed, that is reported
 immediately as before. The old page must explicitly take control back; the app
@@ -175,65 +177,75 @@ writes.
 See [Application design](docs/design.md) for operational and
 security details.
 
-## App-managed workspace
+## App-managed metadata
 
-The server creates one isolated workspace per manga inside the library:
+The server keeps a flat folder inside the library. Each manga's files share its
+exact folder name, so they sort together:
 
 ```text
 C:\Manga Library\.pocket-manga-editor\
-└── Kimi wa 08\
-    ├── reading.json
-    ├── editing.json
-    ├── output\
-    │   └── V1_C01 - First Day\
-    │       └── V1_C01 - First Day__2.png
-    └── .transactions\
+├── Kimi wa 08.read.json
+├── Kimi wa 08.edit.json
+├── Kimi wa 08.export\
+│   └── V1_C01 - First Day\
+│       └── V1_C01 - First Day__2.png
+├── _exporter.bat
+└── _exporter.py
 ```
 
-`reading.json` stores only the latest Read entry/image pair. `editing.json`
-stores only the latest Edit pair and sparse exact selections. Export history and
-per-file export digests are not retained. `.transactions` contains temporary
-crash-recovery state only while an export is being committed or cleaned up.
+- `<manga>.read.json` is created the first time you open **Read** for that manga
+  and stores only the latest Read entry/image pair.
+- `<manga>.edit.json` is created the first time you open **Edit** and stores the
+  latest Edit pair and the selected images per entry.
+- `<manga>.export\` exists only after you export that manga with the companion
+  script.
+- `_exporter.bat` and `_exporter.py` are reinstalled, replacing older copies,
+  every time the server starts.
 
-Everything under `.pocket-manga-editor` is application-managed. Do not edit it
-or add files that need to be preserved. The user may move a completed `output`
-folder elsewhere and may manually delete source or workspace folders.
+Most manga have only one of the two JSON files; both may exist. Everything in
+`.pocket-manga-editor` is application-managed. Do not edit it or add files that
+need to be preserved. Move or copy a finished export elsewhere if you want to
+keep it; the next export of that manga replaces the folder.
 
-For a backup, stop the server and copy the entire `.pocket-manga-editor`
-folder to a location outside the library, together with `.env`. To restore,
-stop the server and restore that folder into the same library. Source images
-need their own backup; Git does not contain them or your workspace. Export
-transaction recovery protects interrupted replacements; it is not a backup.
-Malformed reading or editing metadata produces an error and remains untouched.
-Restore a known-good copy before continuing; stale positions referring to
-removed images instead return to the first available image with a warning.
+For a backup, stop the server and copy the `.pocket-manga-editor` folder to a
+location outside the library, together with `.env`. To restore, stop the server
+and restore that folder into the same library. Source images need their own
+backup; Git does not contain them or your metadata. Malformed reading or editing
+metadata produces an error and remains untouched. Restore a known-good copy
+before continuing; stale positions referring to removed images instead return to
+the first available image with a warning.
 
-There is intentionally no **Complete Manga** operation. Export does not delete
-source files or clear reading/selections.
+There is intentionally no **Complete Manga** operation. Exporting never deletes
+source files or clears reading positions or selections.
 
-## Whole-manga export
+## Exporting selected pages
 
-Export builds a fresh output from the complete current selection and then
-transactionally replaces the previous output:
+Export runs on the PC, not in the web app:
 
-- zero selections are refused without changing existing output;
-- every selected image is copied into a newly staged tree;
-- the previous output remains recoverable until the new output commits;
-- a failed or interrupted pre-commit operation restores the previous output;
-- a subsequent server start completes transaction recovery before scanning;
-- deselected images and entries disappear because the old output is replaced;
-  and
-- exported bytes and extensions are unchanged.
+1. Open `C:\Manga Library\.pocket-manga-editor` in File Explorer and
+   double-click `_exporter.bat`.
+2. The window lists every manga with at least one selected page and its image
+   count. Type the number of the manga to export and press Enter, or press Enter
+   alone to cancel.
+3. The script shows `Copying 37 of 120` as it copies, then prints the export
+   folder and waits for a key press before closing.
 
-If existing output contains an unknown folder, filename, nesting level, special
-file, or file type that does not correspond to the current source structure,
-the app warns before replacement. Confirmation deletes the entire old output,
-including that unrecognized content. A manually added file that exactly mimics
-a valid source-derived output path is inherently indistinguishable from an
-app-created file.
+The export folder is `<manga>.export\<entry>\<entry>__<image>`, with the exact
+entry and image names and unchanged image bytes. Each export rebuilds that
+folder from the current selections: the script copies into
+`<manga>.export-tmp`, swaps it into place, and deletes the previous export, so
+deselected pages disappear. If a run is interrupted, run it again; it removes
+any leftover `-tmp` or `-old` folder first. Source images are only ever read.
 
-Exported filenames remain `<exact entry name>__<exact image filename>` inside
-the corresponding exact entry folder.
+If a selected image no longer exists in the library, the script lists it and
+stops without changing the previous export. Restore the image, or open the manga
+in **Edit** and change any selection so stale entries are removed, then export
+again.
+
+The script needs Python 3.11 or newer from python.org; the `.bat` file uses the
+`py` launcher and falls back to `python`. It does not use the repository
+`.venv` and can run while the server is running. Its source lives in
+`pocket_manga_editor/companion/`.
 
 ## Development and tests
 
@@ -257,7 +269,7 @@ or `pwsh` when available; real Task Scheduler, UAC, and iPhone behavior still
 need verification on Windows and the phone.
 
 The suite covers scanning and ordering, reading/editing persistence, safe path
-handling, whole-output export and crash recovery, token ownership, HTTP/API
+handling, the export companion and its installation, token ownership, HTTP/API
 security, image delivery, and web-client behavior. Optional JavaScript behavior
 checks use Node.js on Windows or JavaScriptCore on macOS; the app itself requires
 neither runtime.

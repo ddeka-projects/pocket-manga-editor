@@ -175,26 +175,32 @@ class ApplicationBootstrapTests(unittest.TestCase):
         scan.assert_not_called()
         lock.assert_not_called()
 
-    def test_duplicate_server_stops_before_recovery_or_scanning(self) -> None:
+    def test_duplicate_server_stops_before_installing_or_scanning(self) -> None:
         configuration = SimpleNamespace(working_directory=Path("/absolute/library"))
         with (
             patch.object(app, "configure_logging"),
             patch.object(app, "load_settings", return_value=configuration),
             patch.object(app, "ProcessLock") as lock,
-            patch.object(app, "recover_interrupted_exports") as recover,
+            patch.object(app, "install_companion") as install,
             patch.object(app, "scan_working_directory") as scan,
         ):
             lock.return_value.__enter__.side_effect = RuntimeError(
                 "Another server already uses this data"
             )
             self.assertEqual(app.main([]), 1)
-        recover.assert_not_called()
+        install.assert_not_called()
         scan.assert_not_called()
 
-    def run_application(self, *, running=True, stop_requested=True):
+    def run_application(self, *, running=True, stop_requested=True, install_error=None):
         root = Path("/absolute/library")
         configuration = SimpleNamespace(working_directory=root, host="127.0.0.1", port=8765)
-        recovery = SimpleNamespace(recovered_count=0)
+
+        def install(_root):
+            order.append("install")
+            if install_error is not None:
+                raise install_error
+            return root / ".pocket-manga-editor"
+
         scan_result = SimpleNamespace(mangas=(), issues=())
         library_service = MagicMock()
         server = MagicMock()
@@ -212,11 +218,7 @@ class ApplicationBootstrapTests(unittest.TestCase):
             patch.object(app, "configure_logging"),
             patch.object(app, "load_settings", return_value=configuration),
             patch.object(app, "ProcessLock") as lock,
-            patch.object(
-                app,
-                "recover_interrupted_exports",
-                side_effect=lambda _root: order.append("recover") or recovery,
-            ),
+            patch.object(app, "install_companion", side_effect=install),
             patch.object(
                 app,
                 "scan_working_directory",
@@ -234,7 +236,7 @@ class ApplicationBootstrapTests(unittest.TestCase):
                 error=None
             )
             result = app.main([])
-        self.assertEqual(order, ["lock", "recover", "scan", "stop", "unlock"])
+        self.assertEqual(order, ["lock", "install", "scan", "stop", "unlock"])
         lock.assert_called_once_with(root)
         server.stop.assert_called_once_with(timeout=10.0)
         library_service.clear_controller.assert_called_once_with()
@@ -247,6 +249,11 @@ class ApplicationBootstrapTests(unittest.TestCase):
 
     def test_successful_bootstrap_shuts_down_before_releasing_the_guard(self) -> None:
         result, event = self.run_application()
+        self.assertEqual(result, 0)
+        self.assertEqual(event.wait_calls, 1)
+
+    def test_companion_install_failure_does_not_stop_the_server(self) -> None:
+        result, event = self.run_application(install_error=PermissionError("read-only"))
         self.assertEqual(result, 0)
         self.assertEqual(event.wait_calls, 1)
 
