@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 from pocket_manga_editor.companion_install import COMPANION_SOURCE, install_companion
 from pocket_manga_editor.storage import EditingStore
-from pocket_manga_editor.scanner import scan_working_directory
+from pocket_manga_editor.scanner import scan_manga
 from pocket_manga_editor.workspace import WorkspaceError
 
 _SPEC = importlib.util.spec_from_file_location("_exporter", COMPANION_SOURCE / "_exporter.py")
@@ -38,9 +38,7 @@ class CompanionFixture(unittest.TestCase):
         return path
 
     def select(self, manga_name: str, *identities: tuple[str, str]) -> None:
-        manga = next(
-            manga for manga in scan_working_directory(self.root).mangas if manga.name == manga_name
-        )
+        manga = scan_manga(self.root, manga_name).manga
         store = EditingStore(self.root)
         for folder, image in identities:
             store.set_selection(manga, folder, image, True)

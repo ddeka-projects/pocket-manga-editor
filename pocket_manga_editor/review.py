@@ -1,14 +1,13 @@
-"""Activity-isolated web review state with immediate durable persistence."""
+"""Activity-isolated Read and Edit state for the open manga."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 import threading
-from typing import Callable
 
-from .storage import EditingSnapshot, EditingStore, ReadingSnapshot, ReadingStore
-from .snapshot import FolderSnapshotEntry, LibrarySnapshot, MangaSnapshotEntry
 from .activity import Activity, WrongActivityError
+from .snapshot import FolderEntry, MangaSnapshot
+from .storage import EditingState, EditingStore, ReadingStore, SavedPosition
 
 
 class ReviewError(RuntimeError):
@@ -24,167 +23,81 @@ class ReviewLoadError(ReviewError):
 
 
 @dataclass(frozen=True, slots=True)
-class ActivityContext:
-    activity: Activity
-    manga_id: str
-    manga_name: str
-    folder_id: str
-    folder_name: str
-    image_id: str
-    image_name: str
-    selected_count: int | None
-
-
-@dataclass(frozen=True, slots=True)
 class PositionMutation:
     activity: Activity
     folder_id: str
     image_id: str
     current_image_id: str
-    revision: int
 
 
 @dataclass(frozen=True, slots=True)
 class SelectionMutation:
     folder_id: str
     image_id: str
-    current_image_id: str
     selected: bool
-    folder_selected_count: int
-    manga_selected_count: int
-    revision: int
 
 
 @dataclass(slots=True)
-class _FolderState:
-    selected_images: set[str]
-    revision: int = 0
-
-
-@dataclass(slots=True)
-class _MangaState:
-    last_folder: str
-    last_image: str
-    folders: dict[str, _FolderState]
-    warnings: tuple[str, ...]
+class _State:
+    position: SavedPosition | None
+    # Edit only: selected image names per entry, as saved. Names whose image
+    # is currently missing stay here and in the file; they are simply not shown.
+    selections: dict[str, tuple[str, ...]]
 
 
 class ReviewService:
-    """Serve Read and Edit without allowing their metadata to cross."""
+    """Serve Read and Edit for one scanned manga without letting their metadata cross."""
 
     def __init__(
         self,
-        snapshot: LibrarySnapshot,
+        manga: MangaSnapshot,
         *,
         reading_store: ReadingStore | None = None,
         editing_store: EditingStore | None = None,
-        context_callback: Callable[[ActivityContext], None] | None = None,
     ) -> None:
-        self.snapshot = snapshot
-        self._reading_store = reading_store or ReadingStore(snapshot.working_directory)
-        self._editing_store = editing_store or EditingStore(snapshot.working_directory)
-        self._context_callback = context_callback
+        self.manga = manga
+        self._reading_store = reading_store or ReadingStore(manga.working_directory)
+        self._editing_store = editing_store or EditingStore(manga.working_directory)
         self._lock = threading.RLock()
-        self._states: dict[tuple[Activity, str], _MangaState] = {}
-        self._last_context: ActivityContext | None = None
+        self._states: dict[Activity, _State] = {}
 
-    def library_payload(self) -> dict[str, object]:
-        """Return an activity-neutral library without reading either store."""
-
+    def manga_payload(self, activity: Activity) -> dict[str, object]:
         with self._lock:
+            folder, image_id = self._resume(self._state(activity))
             return {
-                "snapshot_id": self.snapshot.snapshot_id,
-                "mangas": [
-                    {
-                        "id": manga.id,
-                        "name": manga.ref.name,
-                        "folder_count": len(manga.folder_ids),
-                    }
-                    for manga in self.snapshot.mangas
-                ],
-                "issue_count": self.snapshot.issue_count,
-            }
-
-    def manga_payload(self, manga_id: str, activity: Activity) -> dict[str, object]:
-        with self._lock:
-            manga = self.snapshot.manga(manga_id)
-            state = self._state(manga, activity)
-            current_folder = self._folder_for_name(manga, state.last_folder)
-            self._publish_context(activity, manga, current_folder, state)
-            folders: list[dict[str, object]] = []
-            for folder_id in manga.folder_ids:
-                folder = self.snapshot.folder(folder_id)
-                item: dict[str, object] = {
-                    "id": folder.id,
-                    "name": folder.ref.name,
-                    "image_count": len(folder.image_ids),
-                }
-                if activity is Activity.EDIT:
-                    item["selected_count"] = len(self._folder_state(state, folder).selected_images)
-                folders.append(item)
-
-            manga_payload: dict[str, object] = {
-                "id": manga.id,
-                "name": manga.ref.name,
-                "current_folder_id": current_folder.id,
-                "current_image_id": self._image_id_for_name(current_folder, state.last_image),
-                "folders": folders,
-            }
-            if activity is Activity.EDIT:
-                manga_payload["selected_count"] = self._selected_count(state)
-            return {
-                "snapshot_id": self.snapshot.snapshot_id,
                 "activity": activity.value,
-                "manga": manga_payload,
-                "warnings": self._public_warnings(activity, state.warnings),
+                "manga": {
+                    "id": self.manga.id,
+                    "name": self.manga.ref.name,
+                    "current_folder_id": folder.id,
+                    "current_image_id": image_id,
+                    "folders": [
+                        {"id": entry.id, "name": entry.ref.name} for entry in self.manga.folders
+                    ],
+                },
             }
 
     def folder_payload(self, folder_id: str, activity: Activity) -> dict[str, object]:
         with self._lock:
-            folder = self.snapshot.folder(folder_id)
-            manga = self.snapshot.manga(folder.manga_id)
-            state = self._state(manga, activity)
-            folder_state = self._folder_state(state, folder)
-            self._publish_context(activity, manga, folder, state)
+            folder = self.manga.folder(folder_id)
+            state = self._state(activity)
+            selected = set(state.selections.get(folder.ref.name, ()))
             images: list[dict[str, object]] = []
             for image_id in folder.image_ids:
-                image = self.snapshot.image(image_id)
-                item: dict[str, object] = {
-                    "id": image.id,
-                    "name": image.ref.name,
-                    "image_url": f"/api/image/{image.id}",
-                }
+                image = self.manga.image(image_id)
+                item: dict[str, object] = {"id": image.id, "name": image.ref.name}
                 if activity is Activity.EDIT:
-                    item["selected"] = image.ref.name in folder_state.selected_images
+                    item["selected"] = image.ref.name in selected
                 images.append(item)
-
-            payload: dict[str, object] = {
-                "id": folder.id,
-                "manga_id": folder.manga_id,
-                "name": folder.ref.name,
-                "current_image_id": self._image_id_for_name(
-                    folder,
-                    (
-                        state.last_image
-                        if state.last_folder == folder.ref.name
-                        else folder.ref.images[0].name
-                    ),
-                ),
-                "revision": folder_state.revision,
-                "images": images,
-            }
-            if activity is Activity.EDIT:
-                payload.update(
-                    {
-                        "selected_count": len(folder_state.selected_images),
-                        "manga_selected_count": self._selected_count(state),
-                    }
-                )
             return {
-                "snapshot_id": self.snapshot.snapshot_id,
                 "activity": activity.value,
-                "folder": payload,
-                "warnings": self._public_warnings(activity, state.warnings),
+                "folder": {
+                    "id": folder.id,
+                    "manga_id": self.manga.id,
+                    "name": folder.ref.name,
+                    "current_image_id": self._current_image_id(folder, state),
+                    "images": images,
+                },
             }
 
     def set_position(
@@ -194,44 +107,28 @@ class ReviewService:
         image_id: str,
     ) -> PositionMutation:
         with self._lock:
-            folder = self.snapshot.folder(folder_id)
-            image = self.snapshot.image_in_folder(folder_id, image_id)
-            self.snapshot.validate_live_image(image_id)
-            manga = self.snapshot.manga(folder.manga_id)
-            state = self._state(manga, activity)
-            changed = state.last_folder != folder.ref.name or state.last_image != image.ref.name
-            if changed:
-                revision = self._folder_state(state, folder).revision
+            folder = self.manga.folder(folder_id)
+            image = self.manga.image_in_folder(folder_id, image_id)
+            self.manga.validate_live_image(image_id)
+            state = self._state(activity)
+            if state.position != SavedPosition(folder.ref.name, image.ref.name):
                 try:
                     if activity is Activity.READ:
-                        saved = self._reading_store.set_position(
-                            manga.ref, folder.ref.name, image.ref.name
+                        state.position = self._reading_store.set_position(
+                            self.manga.ref, folder.ref.name, image.ref.name
                         )
-                        self._apply_reading_snapshot(state, saved)
                     else:
-                        saved = self._editing_store.set_position(
-                            manga.ref, folder.ref.name, image.ref.name
+                        self._apply_editing(
+                            state,
+                            self._editing_store.set_position(
+                                self.manga.ref, folder.ref.name, image.ref.name
+                            ),
                         )
-                        self._apply_editing_snapshot(state, saved)
                 except OSError as exc:
                     raise ReviewSaveError(
                         f"Could not save {activity.value} position: {exc}"
                     ) from exc
-                folder_state = self._folder_state(state, folder)
-                folder_state.revision = revision + 1
-            else:
-                folder_state = self._folder_state(state, folder)
-
-            current_id = self._image_id_for_name(folder, state.last_image)
-            mutation = PositionMutation(
-                activity,
-                folder.id,
-                image.id,
-                current_id,
-                folder_state.revision,
-            )
-            self._publish_context(activity, manga, folder, state)
-            return mutation
+            return PositionMutation(activity, folder.id, image.id, image.id)
 
     def set_selection(
         self,
@@ -245,148 +142,64 @@ class ReviewService:
         if not isinstance(selected, bool):
             raise ReviewError("selected must be a boolean.")
         with self._lock:
-            folder = self.snapshot.folder(folder_id)
-            image = self.snapshot.image_in_folder(folder_id, image_id)
-            self.snapshot.validate_live_image(image_id)
-            manga = self.snapshot.manga(folder.manga_id)
-            state = self._state(manga, Activity.EDIT)
-            folder_state = self._folder_state(state, folder)
-            already_selected = image.ref.name in folder_state.selected_images
+            folder = self.manga.folder(folder_id)
+            image = self.manga.image_in_folder(folder_id, image_id)
+            self.manga.validate_live_image(image_id)
+            state = self._state(Activity.EDIT)
+            already_selected = image.ref.name in state.selections.get(folder.ref.name, ())
             if already_selected != selected:
-                revision = folder_state.revision
                 try:
-                    saved = self._editing_store.set_selection(
-                        manga.ref,
-                        folder.ref.name,
-                        image.ref.name,
-                        selected,
+                    self._apply_editing(
+                        state,
+                        self._editing_store.set_selection(
+                            self.manga.ref, folder.ref.name, image.ref.name, selected
+                        ),
                     )
-                    self._apply_editing_snapshot(state, saved)
                 except OSError as exc:
                     raise ReviewSaveError(f"Could not save image selection: {exc}") from exc
-                folder_state = self._folder_state(state, folder)
-                folder_state.revision = revision + 1
+            return SelectionMutation(folder.id, image.id, selected)
 
-            mutation = SelectionMutation(
-                folder.id,
-                image.id,
-                self._image_id_for_name(
-                    folder,
-                    (
-                        state.last_image
-                        if state.last_folder == folder.ref.name
-                        else folder.ref.images[0].name
-                    ),
-                ),
-                image.ref.name in folder_state.selected_images,
-                len(folder_state.selected_images),
-                self._selected_count(state),
-                folder_state.revision,
-            )
-            self._publish_context(Activity.EDIT, manga, folder, state)
-            return mutation
-
-    def context(self) -> ActivityContext | None:
-        with self._lock:
-            return self._last_context
-
-    def flush(self) -> None:
-        """Wait for any in-flight immediate save to finish."""
-
-        with self._lock:
-            return
-
-    def _state(self, manga: MangaSnapshotEntry, activity: Activity) -> _MangaState:
-        key = (activity, manga.id)
-        state = self._states.get(key)
+    def _state(self, activity: Activity) -> _State:
+        state = self._states.get(activity)
         if state is not None:
             return state
         try:
             if activity is Activity.READ:
-                loaded = self._reading_store.load(manga.ref)
-                state = _MangaState("", "", {}, ())
-                self._apply_reading_snapshot(state, loaded)
+                state = _State(self._reading_store.load(self.manga.ref), {})
             else:
-                loaded = self._editing_store.load(manga.ref)
-                state = _MangaState("", "", {}, ())
-                self._apply_editing_snapshot(state, loaded)
+                state = _State(None, {})
+                self._apply_editing(state, self._editing_store.load(self.manga.ref))
         except OSError as exc:
             raise ReviewLoadError(
-                f"Could not load {activity.value} metadata for '{manga.ref.name}'."
+                f"Could not load {activity.value} metadata for '{self.manga.ref.name}'."
             ) from exc
-        self._states[key] = state
+        self._states[activity] = state
         return state
 
     @staticmethod
-    def _apply_reading_snapshot(state: _MangaState, snapshot: ReadingSnapshot) -> None:
-        state.last_folder = snapshot.last_folder
-        state.last_image = snapshot.last_image
-        state.folders = {}
-        state.warnings = snapshot.warnings
+    def _apply_editing(state: _State, saved: EditingState) -> None:
+        state.position = saved.position
+        state.selections = dict(saved.folders)
 
-    @staticmethod
-    def _apply_editing_snapshot(state: _MangaState, snapshot: EditingSnapshot) -> None:
-        revisions = {name: value.revision for name, value in state.folders.items()}
-        state.last_folder = snapshot.last_folder
-        state.last_image = snapshot.last_image
-        state.folders = {
-            name: _FolderState(set(folder.selected_images), revisions.get(name, 0))
-            for name, folder in snapshot.folders.items()
-        }
-        state.warnings = snapshot.warnings
+    def _resume(self, state: _State) -> tuple[FolderEntry, str]:
+        """Saved entry and image; else that entry's first image; else the manga's first."""
 
-    def _folder_for_name(self, manga: MangaSnapshotEntry, folder_name: str) -> FolderSnapshotEntry:
-        for folder_id in manga.folder_ids:
-            folder = self.snapshot.folder(folder_id)
-            if folder.ref.name == folder_name:
-                return folder
-        return self.snapshot.folder(manga.folder_ids[0])
+        position = state.position
+        if position is not None:
+            for folder in self.manga.folders:
+                if folder.ref.name == position.last_folder:
+                    return folder, self._image_id_named(folder, position.last_image)
+        first = self.manga.folder(self.manga.folder_ids[0])
+        return first, first.image_ids[0]
 
-    def _image_id_for_name(self, folder: FolderSnapshotEntry, image_name: str) -> str:
-        for image_id in folder.image_ids:
-            if self.snapshot.image(image_id).ref.name == image_name:
-                return image_id
+    def _current_image_id(self, folder: FolderEntry, state: _State) -> str:
+        position = state.position
+        if position is not None and position.last_folder == folder.ref.name:
+            return self._image_id_named(folder, position.last_image)
         return folder.image_ids[0]
 
-    @staticmethod
-    def _selected_count(state: _MangaState) -> int:
-        return sum(len(folder.selected_images) for folder in state.folders.values())
-
-    @staticmethod
-    def _folder_state(state: _MangaState, folder: FolderSnapshotEntry) -> _FolderState:
-        return state.folders.setdefault(folder.ref.name, _FolderState(set()))
-
-    @staticmethod
-    def _public_warnings(activity: Activity, warnings: tuple[str, ...]) -> list[str]:
-        if not warnings:
-            return []
-        return [
-            f"Some saved {activity.value} metadata entries were stale or invalid "
-            "and were ignored."
-        ]
-
-    def _publish_context(
-        self,
-        activity: Activity,
-        manga: MangaSnapshotEntry,
-        folder: FolderSnapshotEntry,
-        state: _MangaState,
-    ) -> None:
-        image_name = (
-            state.last_image if state.last_folder == folder.ref.name else folder.ref.images[0].name
-        )
-        image_id = self._image_id_for_name(folder, image_name)
-        image = self.snapshot.image(image_id)
-        context = ActivityContext(
-            activity,
-            manga.id,
-            manga.ref.name,
-            folder.id,
-            folder.ref.name,
-            image.id,
-            image.ref.name,
-            self._selected_count(state) if activity is Activity.EDIT else None,
-        )
-        self._last_context = context
-        if self._context_callback is not None:
-            self._context_callback(context)
+    def _image_id_named(self, folder: FolderEntry, image_name: str) -> str:
+        for image_id in folder.image_ids:
+            if self.manga.image(image_id).ref.name == image_name:
+                return image_id
+        return folder.image_ids[0]

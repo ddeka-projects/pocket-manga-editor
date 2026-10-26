@@ -31,7 +31,7 @@ LOGGER = logging.getLogger(__name__)
 
 DEFAULT_PORT = 8765
 MAX_HTTP_WORKERS = 16
-_CLIENT_PROTOCOL_ASSET_VERSION = "explicit-controller-v3"
+_CLIENT_PROTOCOL_ASSET_VERSION = "lazy-scan-v4"
 _HOSTNAME = re.compile(
     r"^(?=.{1,253}\.?$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*"
     r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.?$"

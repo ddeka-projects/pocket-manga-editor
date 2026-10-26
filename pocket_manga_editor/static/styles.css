@@ -393,14 +393,6 @@ select:focus-visible {
   white-space: nowrap;
 }
 
-.manga-card-meta {
-  display: block;
-  margin-top: 0.33rem;
-  color: var(--muted);
-  font-size: 0.8rem;
-  line-height: 1.25;
-}
-
 .manga-card-arrow {
   color: var(--muted);
   font-size: 1.55rem;

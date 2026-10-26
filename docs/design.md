@@ -15,7 +15,8 @@ At process startup the server:
 3. acquires an operating-system lifetime guard for this app and library;
 4. installs the export companion (`_exporter.py`, `_exporter.bat`) into the
    metadata folder, replacing older copies; a failure is logged, not fatal;
-5. scans direct manga, entry, and image children into an immutable snapshot;
+5. lists the manga folder names in the library (their contents are scanned
+   only when a manga is opened);
 6. starts the HTTP listener with a public `/health` readiness endpoint; and
 7. serves until Windows or the operator stops it.
 
@@ -53,7 +54,8 @@ or internet exposure.
 ## Exclusive controller
 
 The first page to open the application claims an unguessable, in-memory
-controller token. Every library, reader, image, selection, and rescan request must present both its page identity and token. A different tab or
+controller token. Every library, manga-open, reader, image, selection, and rescan
+request must present both its page identity and token. A different tab or
 device receives an “open elsewhere” response and can choose **Take Control**.
 
 Ownership has no timer and the browser sends no heartbeat or shutdown-time
@@ -99,32 +101,56 @@ to that manga and metadata domain before folder/image access is allowed:
 - Read loads and writes only `<manga>.read.json`.
 - Edit loads and writes only `<manga>.edit.json` and exposes selection fields.
 - Selection calls bound to Read are rejected before editing metadata is opened.
-- Opaque snapshot IDs cannot be substituted across manga or folders.
+- Opaque IDs cannot be substituted across manga or folders.
 
 Position and selection responses are returned only after the corresponding
 atomic metadata write succeeds. The browser drains confirmed queued writes
-before changing activities or rescanning. The controller
-token is held across each durable mutation or rescan, so takeover
+before changing activities, opening a manga, or rescanning. The controller
+token is held across each durable mutation or scan, so takeover
 cannot split one of those operations midway through its commit.
 
-## Rescan
+## Scanning
 
-The top-right library action is a server-side filesystem rescan, not merely an
-HTTP refresh. Rescan is serialized against state writes. It builds a
-new immutable snapshot and review service, invalidates the old opaque IDs,
-clears the previous activity binding, and returns the controller to the library
-screen.
+Scanning happens in two steps so that the home screen stays fast regardless of
+library size:
 
-Files added after startup do not appear until Rescan. Files removed after a
-scan still fail live validation immediately rather than being served from a
-stale path.
+- **Library list.** At startup and on the top-right Refresh action, the server
+  lists only the folder names directly inside the library. It skips the
+  `.pocket-manga-editor` folder, Windows hidden or system folders, and links or
+  junctions (which are logged). No manga folder is opened. Each name gets an
+  opaque manga ID, and a Refresh issues new IDs.
+- **Open manga.** Tapping a manga scans that one manga: its direct entry
+  folders and their direct JPG/PNG files, in natural order. Entries, links, and
+  file types are classified from the directory listing itself, so a large
+  entry costs one listing rather than several filesystem calls per image. The
+  server keeps only this one manga's scan, with fresh opaque entry and image
+  IDs; opening any manga replaces it and retires the previous IDs. Choosing
+  Read or Edit reuses the scan from the tap. A manga with no entry folders, or
+  with entry folders but no JPG/PNG images, is reported instead of opened. The
+  server log records each scan's entry and image counts and duration.
+
+A request carrying a retired ID receives `stale_snapshot`; the browser then
+drops unconfirmed writes and returns to the library. A file removed after a
+scan still fails live validation before it is served or written about, rather
+than being served from a stale path. A file added while a manga is open appears
+the next time that manga is opened from the home screen.
 
 ## Metadata files
 
 All app metadata is flat in `<library>\.pocket-manga-editor`. Each manga has at
 most `<manga>.read.json` (latest Read entry/image) and `<manga>.edit.json`
 (latest Edit entry/image plus selected image names per entry). A file appears
-only after its activity first saves something. The files carry no schema
+only after its activity first saves something.
+
+Each write changes only what the user touched: a position save replaces
+`last_folder` and `last_image`, and a selection save adds or removes one image
+name in one entry. Everything else in the file, including selections whose
+image or entry is currently missing from disk, is written back unchanged.
+Missing selections are hidden in the reader and reported by the export
+companion; only a deselection or a manual edit removes them. When the saved
+position no longer exists, the reader starts at the first image of the saved
+entry, or at the first image of the first entry if that entry is gone; the
+file keeps the old position until the next page turn. The files carry no schema
 version; unexpected keys, unsafe names, or unreadable JSON fail closed and are
 left untouched. Writes go through a same-folder temporary file and an atomic
 replace, so a reader never sees a half-written file.
@@ -193,8 +219,10 @@ follows the configured port, and update the Home Screen URL.
 
 ### Library does not reflect filesystem changes
 
-Return to **Your Library** and use the top-right Rescan action. A browser reload
-alone is not a substitute for a server scan.
+New or removed chapters and images appear when you return to **Your Library**
+and open the manga again. New, removed, or renamed manga folders need the
+top-right Refresh action. A browser reload alone is not a substitute for either
+server scan.
 
 ### Export companion is missing or outdated
 
@@ -208,7 +236,9 @@ the server.
 `env.py` parses literal settings; `server.py` handles HTTP transport; `api.py`
 validates routes and translates errors; `service.py` coordinates the library;
 `controller.py` holds the in-memory page owner. `static/` contains the no-build
-browser interface. `snapshot.py` and `review.py` support reader operations.
+browser interface. `scanner.py` lists the library and scans one manga;
+`snapshot.py` maps them to opaque IDs; `review.py` serves Read and Edit for the
+open manga.
 `storage.py`, `workspace.py`, `path_safety.py`, and `library_lock.py` keep the
 metadata files safe. `companion_install.py` copies the export companion from
 `companion/` into the metadata folder.

@@ -17,12 +17,19 @@ from pocket_manga_editor.library_lock import (
 )
 from pocket_manga_editor.models import FolderRef, ImageRef, MangaRef
 from pocket_manga_editor.path_safety import is_link_or_reparse
-from pocket_manga_editor.scanner import ScanError, scan_working_directory
+from pocket_manga_editor import scanner
+from pocket_manga_editor.scanner import (
+    MangaMissingError,
+    ScanError,
+    scan_library,
+    scan_manga,
+)
 from pocket_manga_editor.storage import (
     EditingStateError,
     EditingStore,
     ReadingStateError,
     ReadingStore,
+    SavedPosition,
 )
 from pocket_manga_editor.workspace import WorkspaceError, manga_metadata_paths
 
@@ -49,8 +56,7 @@ class RepositoryFixture(unittest.TestCase):
         return source
 
     def manga(self, name: str = "Kimi wa 08") -> MangaRef:
-        result = scan_working_directory(self.root)
-        return next(manga for manga in result.mangas if manga.name == name)
+        return scan_manga(self.root, name).manga
 
 
 class ConfigurationTests(RepositoryFixture):
@@ -181,7 +187,20 @@ class ScannerTests(RepositoryFixture):
 
         self.assertEqual([image.name for image in images], ["004.jpg", "004.PNG"])
 
-    def test_ignores_empty_nested_direct_and_unrelated_content(self) -> None:
+    def test_library_scan_lists_folder_names_only(self) -> None:
+        self.add_image("Series 10", "Chapter", "1.jpg")
+        (self.root / "series 2").mkdir()
+        (self.root / "loose.jpg").write_bytes(b"ignored")
+        (self.root / ".pocket-manga-editor").mkdir()
+
+        with patch.object(scanner, "_scan_folder", side_effect=AssertionError("descended")):
+            result = scan_library(self.root)
+
+        self.assertEqual(result.manga_names, ("series 2", "Series 10"))
+        self.assertEqual(result.root, self.root.resolve())
+        self.assertEqual(result.issues, ())
+
+    def test_manga_scan_requires_images_inside_entry_folders(self) -> None:
         self.add_image("Series", "Valid", "cover.jpg")
         (self.root / "Series" / "Empty").mkdir()
         (self.root / "Series" / "Valid" / "notes.txt").write_text("ignored", encoding="utf-8")
@@ -189,13 +208,28 @@ class ScannerTests(RepositoryFixture):
         nested.mkdir(parents=True)
         (nested / "nested.jpg").write_bytes(b"ignored")
         (self.root / "Series" / "direct.png").write_bytes(b"ignored")
-        (self.root / "No Images").mkdir()
 
-        result = scan_working_directory(self.root)
+        result = scan_manga(self.root, "Series")
 
-        self.assertEqual([manga.name for manga in result.mangas], ["Series"])
-        self.assertEqual([folder.name for folder in result.mangas[0].folders], ["Valid"])
+        self.assertEqual([folder.name for folder in result.manga.folders], ["Valid"])
+        self.assertEqual(result.entry_folder_count, 3)
         self.assertEqual(result.issues, ())
+
+    def test_manga_scan_distinguishes_no_entries_from_no_images(self) -> None:
+        (self.root / "Loose").mkdir()
+        (self.root / "Loose" / "1.jpg").write_bytes(b"loose")
+        (self.root / "Text Only" / "Chapter 1").mkdir(parents=True)
+        (self.root / "Text Only" / "Chapter 1" / "notes.txt").write_text("x", encoding="utf-8")
+
+        loose = scan_manga(self.root, "Loose")
+        text_only = scan_manga(self.root, "Text Only")
+
+        self.assertEqual((loose.entry_folder_count, loose.manga.folders), (0, ()))
+        self.assertEqual((text_only.entry_folder_count, text_only.manga.folders), (1, ()))
+        with self.assertRaises(MangaMissingError):
+            scan_manga(self.root, "Deleted")
+        with self.assertRaises(ScanError):
+            scan_manga(self.root, "../Loose")
 
     def test_rejects_symlinked_manga_folder_and_image_candidates(self) -> None:
         outside = self.root / "outside"
@@ -209,24 +243,19 @@ class ScannerTests(RepositoryFixture):
         except OSError as exc:
             self.skipTest(f"Symbolic links are unavailable: {exc}")
 
-        result = scan_working_directory(self.root)
+        library = scan_library(self.root)
+        manga = scan_manga(self.root, "Safe")
 
-        self.assertEqual([manga.name for manga in result.mangas], ["Safe"])
+        self.assertEqual(library.manga_names, ("outside", "Safe"))
         self.assertEqual(
-            [image.name for image in result.mangas[0].folders[0].images],
+            [image.name for image in manga.manga.folders[0].images],
             ["safe.jpg"],
         )
-        self.assertEqual(len(result.issues), 3)
-        self.assertTrue(all("link" in issue.message.lower() for issue in result.issues))
-
-    def test_scanner_skips_lock_named_manga_with_an_issue(self) -> None:
-        self.add_image(".library-mutation.lock", "Folder", "1.jpg")
-
-        result = scan_working_directory(self.root)
-
-        self.assertEqual(result.mangas, ())
-        self.assertEqual(len(result.issues), 1)
-        self.assertIn("reserved", result.issues[0].message)
+        issues = library.issues + manga.issues
+        self.assertEqual(len(issues), 3)
+        self.assertTrue(all("link" in issue.message.lower() for issue in issues))
+        with self.assertRaises(MangaMissingError):
+            scan_manga(self.root, "Linked Manga")
 
     def test_rejects_a_symlink_working_directory(self) -> None:
         alias = self.root.parent / f"{self.root.name}-alias"
@@ -236,7 +265,7 @@ class ScannerTests(RepositoryFixture):
             self.skipTest(f"Directory links are unavailable: {exc}")
         try:
             with self.assertRaises(ScanError):
-                scan_working_directory(alias)
+                scan_library(alias)
             with self.assertRaises(LibraryLockError):
                 with library_mutation_lock(alias):
                     self.fail("A linked library root must never acquire a lock.")
@@ -256,6 +285,23 @@ class ScannerTests(RepositoryFixture):
         ):
             self.assertTrue(is_link_or_reparse(candidate))
 
+    def test_windows_listing_attributes_mark_links_and_hidden_folders(self) -> None:
+        def entry(attributes: int) -> SimpleNamespace:
+            return SimpleNamespace(
+                name="candidate",
+                is_symlink=lambda: False,
+                is_dir=lambda follow_symlinks: True,
+                is_file=lambda follow_symlinks: False,
+                stat=lambda follow_symlinks: SimpleNamespace(st_file_attributes=attributes),
+            )
+
+        with patch("pocket_manga_editor.scanner.os.name", "nt"):
+            self.assertEqual(scanner._entry_kind(entry(0x10)), "directory")
+            self.assertEqual(scanner._entry_kind(entry(0x10 | 0x400)), "link")
+            self.assertFalse(scanner._is_hidden(entry(0x10)))
+            self.assertTrue(scanner._is_hidden(entry(0x10 | 0x2)))
+            self.assertTrue(scanner._is_hidden(entry(0x10 | 0x4)))
+
 
 class StoreTests(RepositoryFixture):
     def setUp(self) -> None:
@@ -269,17 +315,17 @@ class StoreTests(RepositoryFixture):
         self.editing = EditingStore(self.root)
 
     def test_reading_and_editing_positions_round_trip_independently(self) -> None:
-        initial = self.reading.load(self.manga_ref)
+        self.assertIsNone(self.reading.load(self.manga_ref))
+        self.assertIsNone(self.editing.load(self.manga_ref).position)
         self.assertFalse(self.reading.path_for(self.manga_ref).exists())
-        self.assertEqual((initial.last_folder, initial.last_image), ("Folder 1", "1.jpg"))
 
         read = self.reading.set_position(self.manga_ref, "Folder 2", "10.jpg")
         self.editing.set_position(self.manga_ref, "Folder 1", "2.PNG")
         edit = self.editing.set_selection(self.manga_ref, "Folder 1", "2.PNG", True)
 
         self.assertEqual((read.last_folder, read.last_image), ("Folder 2", "10.jpg"))
-        self.assertEqual((edit.last_folder, edit.last_image), ("Folder 1", "2.PNG"))
-        self.assertEqual(edit.folders["Folder 1"].selected_images, {"2.PNG"})
+        self.assertEqual(edit.position, SavedPosition("Folder 1", "2.PNG"))
+        self.assertEqual(edit.folders["Folder 1"], ("2.PNG",))
         self.assertNotIn("selected_images", self.reading.path_for(self.manga_ref).read_text())
 
     def test_reading_remembers_only_the_latest_pair(self) -> None:
@@ -317,7 +363,7 @@ class StoreTests(RepositoryFixture):
     def test_selection_mutation_does_not_change_position_and_empty_is_sparse(self) -> None:
         self.editing.set_position(self.manga_ref, "Folder 1", "2.PNG")
         updated = self.editing.set_selection(self.manga_ref, "Folder 1", "1.jpg", True)
-        self.assertEqual((updated.last_folder, updated.last_image), ("Folder 1", "2.PNG"))
+        self.assertEqual(updated.position, SavedPosition("Folder 1", "2.PNG"))
 
         cleared = self.editing.set_selection(self.manga_ref, "Folder 1", "1.jpg", False)
         self.assertEqual(cleared.folders, {})
@@ -351,7 +397,7 @@ class StoreTests(RepositoryFixture):
         self.assertEqual(set(payload["folders"]), {"Folder 1"})
         self.assertEqual((payload["last_folder"], payload["last_image"]), ("Folder 2", "10.jpg"))
 
-    def test_stale_position_and_selections_fall_back_without_rename_inference(self) -> None:
+    def test_missing_entries_and_images_are_kept_through_every_write(self) -> None:
         path = self.editing.path_for(self.manga_ref)
         path.parent.mkdir(parents=True)
         path.write_text(
@@ -360,7 +406,7 @@ class StoreTests(RepositoryFixture):
                     "last_folder": "Renamed Folder",
                     "last_image": "missing.jpg",
                     "folders": {
-                        "Folder 1": {"selected_images": ["1.jpg", "renamed.png", "gone.png"]},
+                        "Folder 1": {"selected_images": ["1.jpg", "gone.png"]},
                         "Old Folder": {"selected_images": ["old.jpg"]},
                     },
                 }
@@ -368,41 +414,38 @@ class StoreTests(RepositoryFixture):
             encoding="utf-8",
         )
 
-        restored = self.editing.load(self.manga_ref)
+        loaded = self.editing.load(self.manga_ref)
+        self.assertEqual(loaded.position, SavedPosition("Renamed Folder", "missing.jpg"))
+        self.assertEqual(loaded.folders["Folder 1"], ("1.jpg", "gone.png"))
 
-        self.assertEqual((restored.last_folder, restored.last_image), ("Folder 1", "1.jpg"))
-        self.assertEqual(restored.folders["Folder 1"].selected_images, {"1.jpg"})
-        self.assertGreaterEqual(len(restored.warnings), 3)
+        self.editing.set_position(self.manga_ref, "Folder 2", "10.jpg")
+        self.editing.set_selection(self.manga_ref, "Folder 1", "2.PNG", True)
+        self.editing.set_selection(self.manga_ref, "Folder 1", "1.jpg", False)
 
-    def test_missing_resume_image_resets_whole_pair_to_manga_start(self) -> None:
-        reading_path = self.reading.path_for(self.manga_ref)
-        reading_path.parent.mkdir(parents=True)
-        reading_path.write_text(
-            json.dumps(
-                {
-                    "last_folder": "Folder 2",
-                    "last_image": "missing.jpg",
-                }
-            ),
-            encoding="utf-8",
-        )
-        editing_path = self.editing.path_for(self.manga_ref)
-        editing_path.write_text(
-            json.dumps(
-                {
-                    "last_folder": "Folder 2",
-                    "last_image": "missing.jpg",
-                    "folders": {},
-                }
-            ),
-            encoding="utf-8",
+        payload = json.loads(path.read_text())
+        self.assertEqual(
+            payload,
+            {
+                "last_folder": "Folder 2",
+                "last_image": "10.jpg",
+                "folders": {
+                    "Folder 1": {"selected_images": ["2.PNG", "gone.png"]},
+                    "Old Folder": {"selected_images": ["old.jpg"]},
+                },
+            },
         )
 
-        reading = self.reading.load(self.manga_ref)
-        editing = self.editing.load(self.manga_ref)
+    def test_reading_store_returns_the_saved_pair_even_if_missing(self) -> None:
+        path = self.reading.path_for(self.manga_ref)
+        path.parent.mkdir(parents=True)
+        path.write_text(
+            json.dumps({"last_folder": "Folder 2", "last_image": "missing.jpg"}),
+            encoding="utf-8",
+        )
 
-        self.assertEqual((reading.last_folder, reading.last_image), ("Folder 1", "1.jpg"))
-        self.assertEqual((editing.last_folder, editing.last_image), ("Folder 1", "1.jpg"))
+        self.assertEqual(
+            self.reading.load(self.manga_ref), SavedPosition("Folder 2", "missing.jpg")
+        )
 
     def test_unsafe_editing_identities_fail_closed_even_when_stale(self) -> None:
         path = self.editing.path_for(self.manga_ref)
@@ -560,6 +603,6 @@ class StoreTests(RepositoryFixture):
         workspace.reading.unlink()
         workspace.reading.mkdir()
         changed = self.editing.set_selection(self.manga_ref, "Folder 1", "1.jpg", True)
-        self.assertEqual(changed.folders["Folder 1"].selected_images, {"1.jpg"})
+        self.assertEqual(changed.folders["Folder 1"], ("1.jpg",))
         with self.assertRaises(WorkspaceError):
             self.reading.load(self.manga_ref)

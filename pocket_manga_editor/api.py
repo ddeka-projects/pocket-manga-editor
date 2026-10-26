@@ -190,6 +190,12 @@ class API:
                 "rescan",
             ]
             is_manga = method == "GET" and len(segments) == 3 and segments[:2] == ["api", "manga"]
+            is_manga_scan = (
+                method == "POST"
+                and len(segments) == 4
+                and segments[:2] == ["api", "manga"]
+                and segments[3] == "scan"
+            )
             is_folder = method == "GET" and len(segments) == 3 and segments[:2] == ["api", "folder"]
             is_image = method == "GET" and len(segments) == 3 and segments[:2] == ["api", "image"]
             is_position_write = (
@@ -211,6 +217,7 @@ class API:
                     is_library,
                     is_rescan,
                     is_manga,
+                    is_manga_scan,
                     is_folder,
                     is_image,
                     is_position_write,
@@ -227,6 +234,10 @@ class API:
                 self._require_keys(payload, set())
                 library = self.service.rescan(page_id, token)
                 return self._json(200, {"rescanned": True, **library})
+            if is_manga_scan:
+                payload = self._json_body(headers, body)
+                self._require_keys(payload, set())
+                return self._json(200, self.service.scan_manga(page_id, token, segments[2]))
             if is_manga:
                 activity = self._activity_query(parsed_target.query)
                 return self._json(

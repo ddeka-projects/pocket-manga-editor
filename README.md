@@ -13,9 +13,9 @@ a time owns an explicit controller token.
 
 ## Source library
 
-The configured working directory is the library. Each direct child is a manga,
-each direct child of a manga containing supported images is an entry, and each
-entry contains direct JPG or PNG files:
+The configured working directory is the library. Each direct child folder is a
+manga, each direct child folder of a manga is an entry (a chapter, volume, part,
+or anything else), and each entry contains direct JPG or PNG files:
 
 ```text
 C:\Manga Library\
@@ -38,10 +38,14 @@ C:\Manga Library\
 - Ordering is case-insensitive and natural, so `1.jpg`, `2.jpg`, and `10.jpg`
   appear in that order.
 - `.jpg` and `.png` extensions are supported case-insensitively.
-- Nested folders, images directly inside a manga, `.jpeg`, archives, PDFs,
-  symbolic links, junctions, and other file types are not included.
-- Renaming a folder or image creates a new identity; stale saved references are
-  ignored rather than inferred as renames.
+- Images must be inside an entry folder. Images directly inside a manga, nested
+  folders, `.jpeg`, archives, PDFs, symbolic links, junctions, and other file
+  types are not included. Entry folders without JPG or PNG images are left out
+  of the entry list.
+- Windows hidden or system folders in the library (such as `$RECYCLE.BIN`) and
+  the app's own `.pocket-manga-editor` folder are not listed as manga.
+- Renaming a folder or image creates a new identity; saved references to the old
+  name are kept but not inferred as renames.
 
 ## First-time Windows setup
 
@@ -129,16 +133,37 @@ Reinstall the task after changing setup scripts or moving the repository.
 
 ## Web application
 
-The home screen lists the current library. Its top-right button performs a real
-filesystem rescan. Selecting a manga presents two actions:
+The home screen lists the manga folder names and shows **N manga**. The server
+reads the library folder's names when it starts, and the top-right button
+lists them again, so adding, removing, or renaming a manga folder needs a
+Refresh. Listing names only is quick even for a large library, because no
+chapter or image is inspected at this point.
+
+Tapping a manga scans that manga's entry folders and images on the PC. This
+happens every time you open it from the home screen, so chapters added since
+your last visit appear without a Refresh. A manga that cannot be read explains
+why instead of opening:
+
+- it has no entry folders (for example, its images sit directly inside it); or
+- it has entry folders, but none of them contain JPG or PNG images.
+
+Once scanned, the manga presents two actions:
 
 - **Read** — selection-free reading with an independent saved position.
 - **Edit** — reading plus page selection controls and a saved editing position.
 
-Read and Edit each remember one latest entry/image pair per manga. Choosing an
-entry from the picker starts at its first image. Crossing forward into the next
-entry starts at its first image; crossing backward into the previous entry
-starts at its last image.
+Read and Edit each remember one latest entry/image pair per manga. Opening
+either starts there. If that image is no longer on disk, it starts at the first
+image of the saved entry; if the entry is gone too, at the first image of the
+first entry. With nothing saved yet, it starts at the first image of the first
+entry. Choosing an entry from the picker starts at its first image. Crossing
+forward into the next entry starts at its first image; crossing backward into
+the previous entry starts at its last image.
+
+In Edit, the **Selected · N** list shows the selected images in the current
+entry that exist on disk; only those can be navigated to. Files deleted on the
+PC while you are reading stay listed until you return to the home screen and
+open the manga again; opening one in the meantime fails to load the image.
 
 The web reader preserves the immediate navigation behavior: it displays the
 prefetched neighboring image without a decorative transition. In Edit, the
@@ -166,8 +191,8 @@ safe because they set an explicit value and are idempotent:
   outage the app may reopen a page or two earlier than where you stopped.
 - **Page selection** stays at `…` while it is retried for a few seconds. Only if
   it still cannot be confirmed does **Connection interrupted** appear; tap
-  **Retry** once the PC is reachable. Leaving the view and rescanning still
-  wait until every selection is confirmed.
+  **Retry** once the PC is reachable. Leaving the view, opening a manga, and
+  refreshing the library still wait until every selection is confirmed.
 
 If control moved to another page or the library changed, that is reported
 immediately as before. The old page must explicitly take control back; the app
@@ -193,18 +218,27 @@ C:\Manga Library\.pocket-manga-editor\
 └── _exporter.py
 ```
 
-- `<manga>.read.json` is created the first time you open **Read** for that manga
-  and stores only the latest Read entry/image pair.
-- `<manga>.edit.json` is created the first time you open **Edit** and stores the
-  latest Edit pair and the selected images per entry.
+- `<manga>.read.json` is created the first time you turn a page in **Read** for
+  that manga and stores only the latest Read entry/image pair.
+- `<manga>.edit.json` is created the first time you turn a page or select an
+  image in **Edit**, and stores the latest Edit pair and the selected images per
+  entry.
 - `<manga>.export\` exists only after you export that manga with the companion
   script.
 - `_exporter.bat` and `_exporter.py` are reinstalled, replacing older copies,
   every time the server starts.
 
 Most manga have only one of the two JSON files; both may exist. Everything in
-`.pocket-manga-editor` is application-managed. Do not edit it or add files that
-need to be preserved. Move or copy a finished export elsewhere if you want to
+`.pocket-manga-editor` is application-managed. Do not add files that need to be
+preserved, and edit the JSON files only to remove a selection whose image is
+gone (see [Exporting selected pages](#exporting-selected-pages)).
+
+The app writes only what you change. A page turn replaces the saved position,
+and selecting or deselecting an image adds or removes that one name. A selection
+is never removed automatically, even when its image or entry is missing from
+disk: it stays in `<manga>.edit.json`, is hidden from the **Selected** list, and
+shows again if the file returns. Only a deselection in the app or a manual edit
+removes it. Move or copy a finished export elsewhere if you want to
 keep it; the next export of that manga replaces the folder.
 
 For a backup, stop the server and copy the `.pocket-manga-editor` folder to a
@@ -212,8 +246,8 @@ location outside the library, together with `.env`. To restore, stop the server
 and restore that folder into the same library. Source images need their own
 backup; Git does not contain them or your metadata. Malformed reading or editing
 metadata produces an error and remains untouched. Restore a known-good copy
-before continuing; stale positions referring to removed images instead return to
-the first available image with a warning.
+before continuing. A saved position that refers to a removed image or entry
+falls back as described in [Web application](#web-application).
 
 There is intentionally no **Complete Manga** operation. Exporting never deletes
 source files or clears reading positions or selections.
@@ -238,9 +272,12 @@ deselected pages disappear. If a run is interrupted, run it again; it removes
 any leftover `-tmp` or `-old` folder first. Source images are only ever read.
 
 If a selected image no longer exists in the library, the script lists it and
-stops without changing the previous export. Restore the image, or open the manga
-in **Edit** and change any selection so stale entries are removed, then export
-again.
+stops without changing the previous export. Restore the image, or open
+`<manga>.edit.json` in a text editor and delete that name from its entry's
+`selected_images` list (delete the whole entry if the list becomes empty), then
+export again. The web app cannot deselect an image it cannot show. Editing the
+file is safe while the server runs; the app picks up the change the next time
+you open that manga from the home screen.
 
 The script needs Python 3.11 or newer from python.org; the `.bat` file uses the
 `py` launcher and falls back to `python`. It does not use the repository

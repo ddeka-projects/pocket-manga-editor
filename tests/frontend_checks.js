@@ -59,7 +59,31 @@ async function checks() {
   assert(staleRejected, "A late response from an older owner cannot replace current state");
   assert(intervals === 0, "Ownership never creates background polling");
 
+  await openMangaChecks();
   await transientSaveChecks();
+}
+
+async function openMangaChecks() {
+  const { state, openManga } = client;
+  const manga = { id: "m_one", name: "Series One" };
+  state.library = [manga];
+  const scans = [];
+  transport = async (path, options) => {
+    scans.push([path, options.method, options.body]);
+    return reply({ ok: true, manga: { id: "m_one", name: "Series One" } });
+  };
+  await openManga(manga);
+  assert(scans.length === 1, "Tapping a manga sends exactly one request");
+  assert(scans[0].join(" ") === "/api/manga/m_one/scan POST {}", "Tapping a manga scans it on the PC");
+  assert(!element("activity-screen").hidden && element("library-screen").hidden, "A scanned manga opens its Read/Edit choice");
+  assert(element("activity-title").textContent === "Series One", "The choice is titled with the manga name");
+
+  transport = async () => reply({ ok: false, error: { code: "no_images", message: "None of the folders in 'Series One' contain JPG or PNG images." } }, 409);
+  await openManga(manga);
+  assert(element("action-error-title").textContent === "Can’t open Series One", "An unreadable manga names itself");
+  assert(element("action-error-message").textContent.includes("JPG or PNG"), "The server explains why it cannot be opened");
+  assert(!state.mangaOpening, "A failed open can be retried");
+  element("action-error-title").textContent = "";
 }
 
 async function transientSaveChecks() {

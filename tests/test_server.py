@@ -27,17 +27,20 @@ from pocket_manga_editor.controller import (
 from pocket_manga_editor.review import ReviewSaveError, ReviewService
 from pocket_manga_editor.server import HTTPService
 from pocket_manga_editor.snapshot import (
-    LibrarySnapshot,
+    LibraryIndex,
+    MangaSnapshot,
+    MissingImageError,
     SnapshotError,
     SnapshotLookupError,
 )
 from pocket_manga_editor.activity import (
     Activity,
+    MangaUnavailableError,
     RescanError,
     WrongActivityError,
 )
-from pocket_manga_editor.scanner import ScanError, scan_working_directory
-from pocket_manga_editor.storage import EditingStore, ReadingSnapshot, ReadingStore
+from pocket_manga_editor.scanner import ScanError, scan_library, scan_manga
+from pocket_manga_editor.storage import EditingStore, ReadingStore
 
 
 class ServerFixture(unittest.TestCase):
@@ -51,7 +54,7 @@ class ServerFixture(unittest.TestCase):
             "Series One", "Volume Two - Ch 12", "cover.JPG", b"cover"
         )
         self.other_manga_image = self.add_image("Series Two", "Bonus scans", "scan-a.png", b"scan")
-        self.scan_result = scan_working_directory(self.root)
+        self.scan_result = scan_library(self.root)
 
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
@@ -62,13 +65,8 @@ class ServerFixture(unittest.TestCase):
         image.write_bytes(content)
         return image
 
-    def build_snapshot(self, *, token_prefix: str = "opaque") -> LibrarySnapshot:
-        counter = iter(range(100))
-        return LibrarySnapshot.build(
-            self.root,
-            self.scan_result,
-            id_factory=lambda: f"{token_prefix}{next(counter)}",
-        )
+    def build_manga(self, name: str = "Series One") -> MangaSnapshot:
+        return MangaSnapshot.build(self.root.resolve(), "m_test", scan_manga(self.root, name).manga)
 
 
 class ControllerOwnershipTests(unittest.TestCase):
@@ -107,43 +105,39 @@ class ControllerOwnershipTests(unittest.TestCase):
             ownership.claim("")
 
 
-class LibrarySnapshotTests(ServerFixture):
-    def test_ids_are_opaque_scoped_and_follow_manga_folder_image(self) -> None:
-        first = self.build_snapshot(token_prefix="alpha")
-        second = self.build_snapshot(token_prefix="beta")
-        manga = first.mangas[0]
-        folder_id = manga.folder_ids[0]
+class SnapshotTests(ServerFixture):
+    def test_ids_are_opaque_and_replaced_by_each_scan(self) -> None:
+        library = LibraryIndex.build(self.scan_result)
+        first = self.build_manga()
+        second = self.build_manga()
         public_ids = {
-            first.snapshot_id,
-            *(entry.id for entry in first.mangas),
-            *(folder for entry in first.mangas for folder in entry.folder_ids),
-            *(
-                image
-                for entry in first.mangas
-                for folder in entry.folder_ids
-                for image in first.folder(folder).image_ids
-            ),
+            library.snapshot_id,
+            *(entry.id for entry in library.mangas),
+            *first.folder_ids,
+            *(image for folder in first.folders for image in folder.image_ids),
         }
         for value in public_ids:
             self.assertNotIn("Series", value)
             self.assertNotIn("Part", value)
             self.assertNotIn("/", value)
             self.assertNotIn(str(self.root), value)
+        self.assertEqual([entry.name for entry in library.mangas], ["Series One", "Series Two"])
         with self.assertRaises(SnapshotLookupError):
-            second.manga(manga.id)
+            LibraryIndex.build(self.scan_result).manga(library.mangas[0].id)
         with self.assertRaises(SnapshotLookupError):
-            second.folder(folder_id)
+            second.folder(first.folder_ids[0])
 
     def test_image_ids_cannot_cross_folder_boundaries(self) -> None:
-        snapshot = self.build_snapshot()
-        manga = snapshot.mangas[0]
+        manga = self.build_manga()
         first_folder, second_folder = manga.folder_ids
-        image = snapshot.folder(first_folder).image_ids[0]
-        self.assertEqual(snapshot.image_in_folder(first_folder, image).id, image)
+        image = manga.folder(first_folder).image_ids[0]
+        self.assertEqual(manga.image_in_folder(first_folder, image).id, image)
         with self.assertRaises(SnapshotLookupError):
-            snapshot.image_in_folder(second_folder, image)
+            manga.image_in_folder(second_folder, image)
 
-    def test_snapshot_rejects_symlinked_folder_after_scan(self) -> None:
+    def test_live_validation_rejects_a_folder_swapped_for_a_link(self) -> None:
+        manga = self.build_manga()
+        image_id = manga.folder(manga.folder_ids[0]).image_ids[0]
         source = self.first_image.parent
         relocated = self.root / "relocated"
         source.rename(relocated)
@@ -151,93 +145,132 @@ class LibrarySnapshotTests(ServerFixture):
             source.symlink_to(relocated, target_is_directory=True)
         except OSError as exc:
             self.skipTest(f"Directory symlinks are unavailable: {exc}")
-        with self.assertRaises(SnapshotError):
-            LibrarySnapshot.build(self.root, self.scan_result)
+        with self.assertRaises(MissingImageError):
+            manga.validate_live_image(image_id)
 
 
 class ReviewPersistenceTests(ServerFixture):
-    def test_library_is_neutral_and_default_reads_create_no_metadata(self) -> None:
-        snapshot = self.build_snapshot()
-        review = ReviewService(snapshot)
-        manga = snapshot.mangas[0]
-        with (
-            patch.object(ReadingStore, "load") as read_load,
-            patch.object(EditingStore, "load") as edit_load,
-        ):
-            library = review.library_payload()
-        read_load.assert_not_called()
-        edit_load.assert_not_called()
-        read_payload = review.manga_payload(manga.id, Activity.READ)
-        edit_payload = review.manga_payload(manga.id, Activity.EDIT)
-        self.assertNotIn("selected_count", library["mangas"][0])
-        self.assertNotIn("selected_count", read_payload["manga"])
-        self.assertIn("selected_count", edit_payload["manga"])
+    def test_default_payloads_create_no_metadata_and_carry_no_counts(self) -> None:
+        manga = self.build_manga()
+        review = ReviewService(manga)
+        read_payload = review.manga_payload(Activity.READ)
+        edit_payload = review.manga_payload(Activity.EDIT)
+        edit_folder = review.folder_payload(manga.folder_ids[0], Activity.EDIT)
+        self.assertNotIn("count", json.dumps([read_payload, edit_payload, edit_folder]))
+        self.assertEqual(edit_payload["manga"]["current_folder_id"], manga.folder_ids[0])
         self.assertFalse(ReadingStore(self.root).path_for(manga.ref).exists())
         self.assertFalse(EditingStore(self.root).path_for(manga.ref).exists())
 
     def test_read_and_edit_positions_and_selections_are_independent(self) -> None:
-        snapshot = self.build_snapshot()
-        manga = snapshot.mangas[0]
+        manga = self.build_manga()
         folder_id = manga.folder_ids[0]
-        folder = snapshot.folder(folder_id)
+        folder = manga.folder(folder_id)
         first_id, second_id, tenth_id = folder.image_ids
-        review = ReviewService(snapshot)
+        review = ReviewService(manga)
         review.set_position(Activity.READ, folder_id, second_id)
         review.set_position(Activity.EDIT, folder_id, tenth_id)
         selection = review.set_selection(Activity.EDIT, folder_id, first_id, True)
         reading = ReadingStore(self.root).load(manga.ref)
         editing = EditingStore(self.root).load(manga.ref)
         self.assertEqual((reading.last_folder, reading.last_image), (folder.ref.name, "2.PNG"))
-        self.assertEqual((editing.last_folder, editing.last_image), (folder.ref.name, "10.jpg"))
         self.assertEqual(
-            editing.folders[folder.ref.name].selected_images,
-            frozenset({"1.jpg"}),
+            (editing.position.last_folder, editing.position.last_image),
+            (folder.ref.name, "10.jpg"),
         )
-        self.assertEqual(selection.manga_selected_count, 1)
+        self.assertEqual(editing.folders[folder.ref.name], ("1.jpg",))
+        self.assertTrue(selection.selected)
 
     def test_only_latest_manga_position_resumes(self) -> None:
-        snapshot = self.build_snapshot()
-        manga = snapshot.mangas[0]
-        first_folder = snapshot.folder(manga.folder_ids[0])
-        second_folder = snapshot.folder(manga.folder_ids[1])
-        review = ReviewService(snapshot)
+        manga = self.build_manga()
+        first_folder = manga.folder(manga.folder_ids[0])
+        second_folder = manga.folder(manga.folder_ids[1])
+        review = ReviewService(manga)
         review.set_position(Activity.EDIT, first_folder.id, first_folder.image_ids[-1])
         review.set_position(Activity.EDIT, second_folder.id, second_folder.image_ids[0])
-        manga_payload = review.manga_payload(manga.id, Activity.EDIT)["manga"]
+        manga_payload = review.manga_payload(Activity.EDIT)["manga"]
         first_payload = review.folder_payload(first_folder.id, Activity.EDIT)["folder"]
         self.assertEqual(manga_payload["current_folder_id"], second_folder.id)
         self.assertEqual(manga_payload["current_image_id"], second_folder.image_ids[0])
         self.assertTrue(all("current_image_id" not in item for item in manga_payload["folders"]))
         self.assertEqual(first_payload["current_image_id"], first_folder.image_ids[0])
 
+    def test_resume_falls_back_to_the_entry_start_then_the_manga_start(self) -> None:
+        reading = ReadingStore(self.root).path_for(scan_manga(self.root, "Series One").manga)
+        reading.parent.mkdir(parents=True)
+        cases = (
+            ("Volume Two - Ch 12", "cover.JPG", "Volume Two - Ch 12", "cover.JPG"),
+            ("Part III - Ch 21", "missing.jpg", "Part III - Ch 21", "1.jpg"),
+            ("Missing Entry", "1.jpg", "Part III - Ch 21", "1.jpg"),
+        )
+        for saved_folder, saved_image, folder_name, image_name in cases:
+            with self.subTest(saved=(saved_folder, saved_image)):
+                reading.write_text(
+                    json.dumps({"last_folder": saved_folder, "last_image": saved_image}),
+                    encoding="utf-8",
+                )
+                manga = self.build_manga()
+                payload = ReviewService(manga).manga_payload(Activity.READ)["manga"]
+                folder = manga.folder(payload["current_folder_id"])
+                image = manga.image(payload["current_image_id"])
+                self.assertEqual((folder.ref.name, image.ref.name), (folder_name, image_name))
+        self.assertIn("Missing Entry", reading.read_text())
+
+    def test_missing_selections_are_hidden_but_never_pruned(self) -> None:
+        # Day 1: 1.jpg, 2.PNG and 10.jpg were selected. Day 2: 2.PNG is gone.
+        editing = EditingStore(self.root).path_for(scan_manga(self.root, "Series One").manga)
+        editing.parent.mkdir(parents=True)
+        editing.write_text(
+            json.dumps(
+                {
+                    "last_folder": "Part III - Ch 21",
+                    "last_image": "1.jpg",
+                    "folders": {
+                        "Old Entry": {"selected_images": ["old.jpg"]},
+                        "Part III - Ch 21": {"selected_images": ["1.jpg", "2.PNG", "10.jpg"]},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.second_image.unlink()
+        manga = self.build_manga()
+        review = ReviewService(manga)
+        folder_id = manga.folder_ids[0]
+        folder = review.folder_payload(folder_id, Activity.EDIT)["folder"]
+        self.assertEqual(
+            [(image["name"], image["selected"]) for image in folder["images"]],
+            [("1.jpg", True), ("10.jpg", True)],
+        )
+
+        first_id, tenth_id = (image["id"] for image in folder["images"])
+        review.set_position(Activity.EDIT, folder_id, tenth_id)
+        review.set_selection(Activity.EDIT, folder_id, tenth_id, False)
+
+        self.assertEqual(
+            json.loads(editing.read_text()),
+            {
+                "last_folder": "Part III - Ch 21",
+                "last_image": "10.jpg",
+                "folders": {
+                    "Old Entry": {"selected_images": ["old.jpg"]},
+                    "Part III - Ch 21": {"selected_images": ["1.jpg", "2.PNG"]},
+                },
+            },
+        )
+
     def test_read_payload_has_no_paths_or_selection_semantics(self) -> None:
-        snapshot = self.build_snapshot()
-        manga = snapshot.mangas[0]
-        payload = ReviewService(snapshot).folder_payload(manga.folder_ids[0], Activity.READ)
+        manga = self.build_manga()
+        payload = ReviewService(manga).folder_payload(manga.folder_ids[0], Activity.READ)
         serialized = json.dumps(payload)
         self.assertNotIn(str(self.root), serialized)
         self.assertNotIn("selected", serialized)
         self.assertNotIn("exports", serialized)
 
-    def test_storage_warnings_do_not_expose_paths(self) -> None:
-        snapshot = self.build_snapshot()
-        manga = snapshot.mangas[0]
-        loaded = ReadingSnapshot(
-            manga.ref.folders[0].name,
-            manga.ref.folders[0].images[0].name,
-            (f"Could not read {self.root}/private/reading.json",),
-        )
-        with patch.object(ReadingStore, "load", return_value=loaded):
-            payload = ReviewService(snapshot).manga_payload(manga.id, Activity.READ)
-        self.assertNotIn(str(self.root), json.dumps(payload))
-        self.assertEqual(len(payload["warnings"]), 1)
-
     def test_read_selection_is_never_persisted(self) -> None:
-        snapshot = self.build_snapshot()
-        manga = snapshot.mangas[0]
+        manga = self.build_manga()
         folder_id = manga.folder_ids[0]
-        image_id = snapshot.folder(folder_id).image_ids[0]
-        review = ReviewService(snapshot)
+        image_id = manga.folder(folder_id).image_ids[0]
+        review = ReviewService(manga)
         with patch.object(EditingStore, "set_selection") as save:
             with self.assertRaises(WrongActivityError):
                 review.set_selection(Activity.READ, folder_id, image_id, True)
@@ -249,20 +282,83 @@ class ServiceTests(ServerFixture):
 
     def setUp(self) -> None:
         super().setUp()
-        self.service = LibraryService(self.root, self.scan_result)
+        self.service = LibraryService(self.scan_result)
         self.grant = self.service.claim_controller(self.PAGE)
         self.token = self.grant["token"]
 
-    def test_always_active_service_persists_review_and_keeps_controller_on_error(self) -> None:
-        snapshot_id = self.service.status().snapshot_id
-        library = self.service.library(self.PAGE, self.token)
-        self.assertEqual(library["snapshot_id"], snapshot_id)
-        manga_id = library["mangas"][0]["id"]
+    def manga_id(self, name: str = "Series One", page: str = PAGE, token: str = "") -> str:
+        library = self.service.library(page, token or self.token)
+        return next(manga["id"] for manga in library["mangas"] if manga["name"] == name)
+
+    def open_edit(self) -> tuple[str, str]:
+        manga_id = self.manga_id()
+        self.service.scan_manga(self.PAGE, self.token, manga_id)
         manga = self.service.open_manga(self.PAGE, self.token, manga_id, Activity.EDIT)["manga"]
         folder_id = manga["folders"][0]["id"]
-        image_id = self.service.folder(self.PAGE, self.token, folder_id, Activity.EDIT)["folder"][
-            "images"
-        ][0]["id"]
+        folder = self.service.folder(self.PAGE, self.token, folder_id, Activity.EDIT)["folder"]
+        return folder_id, folder["images"][0]["id"]
+
+    def test_library_lists_names_without_scanning_manga_contents(self) -> None:
+        (self.root / "Empty Manga").mkdir()
+        with patch(
+            "pocket_manga_editor.service.scan_manga",
+            side_effect=AssertionError("library scan must not open manga"),
+        ):
+            library = self.service.rescan(self.PAGE, self.token)
+        self.assertEqual(
+            library["mangas"],
+            [{"id": manga["id"], "name": manga["name"]} for manga in library["mangas"]],
+        )
+        self.assertEqual(
+            [manga["name"] for manga in library["mangas"]],
+            ["Empty Manga", "Series One", "Series Two"],
+        )
+
+    def test_opening_a_manga_reports_why_it_cannot_be_read(self) -> None:
+        (self.root / "No Entries").mkdir()
+        (self.root / "No Entries" / "loose.jpg").write_bytes(b"loose")
+        (self.root / "No Images" / "Chapter 1").mkdir(parents=True)
+        self.service.rescan(self.PAGE, self.token)
+        cases = {
+            "No Entries": "no_entry_folders",
+            "No Images": "no_images",
+            "Series Two": "manga_missing",
+        }
+        (self.root / "Series Two" / "Bonus scans" / "scan-a.png").unlink()
+        (self.root / "Series Two" / "Bonus scans").rmdir()
+        (self.root / "Series Two").rmdir()
+        for name, code in cases.items():
+            with self.subTest(name=name):
+                with self.assertRaises(MangaUnavailableError) as raised:
+                    self.service.scan_manga(self.PAGE, self.token, self.manga_id(name))
+                self.assertEqual(raised.exception.code, code)
+
+    def test_reopening_a_manga_rescans_it_and_retires_old_ids(self) -> None:
+        old_folder_id, _image_id = self.open_edit()
+        self.add_image("Series One", "Volume Three - Ch 30", "1.jpg", b"new")
+        manga_id = self.manga_id()
+
+        self.service.scan_manga(self.PAGE, self.token, manga_id)
+        manga = self.service.open_manga(self.PAGE, self.token, manga_id, Activity.EDIT)["manga"]
+
+        self.assertIn("Volume Three - Ch 30", [folder["name"] for folder in manga["folders"]])
+        with self.assertRaises(SnapshotLookupError):
+            self.service.folder(self.PAGE, self.token, old_folder_id, Activity.EDIT)
+
+    def test_choosing_an_activity_reuses_the_scan_from_the_tile_tap(self) -> None:
+        manga_id = self.manga_id()
+        self.service.scan_manga(self.PAGE, self.token, manga_id)
+        with patch(
+            "pocket_manga_editor.service.scan_manga",
+            side_effect=AssertionError("Read/Edit must reuse the tile scan"),
+        ):
+            self.service.open_manga(self.PAGE, self.token, manga_id, Activity.READ)
+            self.service.open_manga(self.PAGE, self.token, manga_id, Activity.EDIT)
+
+    def test_always_active_service_persists_review_and_keeps_controller_on_error(self) -> None:
+        snapshot_id = self.service.status().snapshot_id
+        self.assertEqual(self.service.library(self.PAGE, self.token)["snapshot_id"], snapshot_id)
+        folder_id, image_id = self.open_edit()
         with patch.object(EditingStore, "set_selection", side_effect=OSError("disk")):
             with self.assertRaises(ReviewSaveError):
                 self.service.set_selection(
@@ -276,12 +372,12 @@ class ServiceTests(ServerFixture):
         self.assertTrue(self.service.status().active_controller)
         self.assertEqual(self.service.status().snapshot_id, snapshot_id)
 
-    def test_rescan_swaps_only_a_complete_snapshot_and_retains_controller(self) -> None:
+    def test_rescan_swaps_only_a_complete_library_and_retains_controller(self) -> None:
         original = self.service.status().snapshot_id
         self.add_image("Series Three", "Chapter 1", "new.jpg", b"new")
         with (
             patch(
-                "pocket_manga_editor.service.LibrarySnapshot.build",
+                "pocket_manga_editor.service.LibraryIndex.build",
                 side_effect=SnapshotError("bad snapshot"),
             ),
             patch("pocket_manga_editor.service.LOGGER.exception"),
@@ -297,12 +393,7 @@ class ServiceTests(ServerFixture):
         self.assertTrue(self.service.status().active_controller)
 
     def test_takeover_waits_for_an_authorized_durable_operation(self) -> None:
-        library = self.service.library(self.PAGE, self.token)
-        manga_id = library["mangas"][0]["id"]
-        manga = self.service.open_manga(self.PAGE, self.token, manga_id, Activity.EDIT)["manga"]
-        folder_id = manga["folders"][0]["id"]
-        folder = self.service.folder(self.PAGE, self.token, folder_id, Activity.EDIT)["folder"]
-        image_id = folder["images"][0]["id"]
+        folder_id, image_id = self.open_edit()
         started = threading.Event()
         finish = threading.Event()
         takeover_done = threading.Event()
@@ -365,11 +456,8 @@ class ServiceTests(ServerFixture):
             len(self.service.library("other-page", replacement[0])["mangas"]),
             2,
         )
-        selected = EditingStore(self.root).load(self.scan_result.mangas[0])
-        self.assertEqual(
-            selected.folders[self.scan_result.mangas[0].folders[0].name].selected_images,
-            frozenset({"1.jpg"}),
-        )
+        selected = EditingStore(self.root).load(scan_manga(self.root, "Series One").manga)
+        self.assertEqual(selected.folders["Part III - Ch 21"], ("1.jpg",))
 
 
 class APITests(ServerFixture):
@@ -379,7 +467,7 @@ class APITests(ServerFixture):
 
     def setUp(self) -> None:
         super().setUp()
-        self.service = LibraryService(self.root, self.scan_result)
+        self.service = LibraryService(self.scan_result)
         self.api = API(self.service, allowed_hosts={"desktop.local"})
         self.controller_page = self.PAGE
         self.controller_token = "x" * 43
@@ -450,6 +538,7 @@ class APITests(ServerFixture):
 
     def open_activity(self, activity: str = "read") -> dict[str, object]:
         manga_id = self.payload(self.get("/api/library"))["mangas"][0]["id"]
+        self.assertEqual(self.json_request("POST", f"/api/manga/{manga_id}/scan", {}).status, 200)
         response = self.get(f"/api/manga/{manga_id}?activity={activity}")
         self.assertEqual(response.status, 200)
         return self.payload(response)
@@ -532,7 +621,7 @@ class APITests(ServerFixture):
     def test_activity_queries_and_patch_writes_are_strict_and_independent(self) -> None:
         self.assertEqual(self.claim().status, 200)
         library = self.payload(self.get("/api/library"))
-        self.assertNotIn("selected_count", library["mangas"][0])
+        self.assertEqual(set(library["mangas"][0]), {"id", "name"})
         manga_id = library["mangas"][0]["id"]
         for query in ("", "?activity=", "?activity=read&activity=edit", "?mode=read"):
             with self.subTest(query=query):
@@ -576,12 +665,15 @@ class APITests(ServerFixture):
             {"image_id": first_id, "selected": True},
         )
         self.assertEqual(selected.status, 200)
-        manga_ref = self.scan_result.mangas[0]
-        folder_name = manga_ref.folders[0].name
+        manga_ref = scan_manga(self.root, "Series One").manga
         self.assertEqual(ReadingStore(self.root).load(manga_ref).last_image, "2.PNG")
         editing = EditingStore(self.root).load(manga_ref)
-        self.assertEqual(editing.last_image, "10.jpg")
-        self.assertEqual(editing.folders[folder_name].selected_images, frozenset({"1.jpg"}))
+        self.assertEqual(editing.position.last_image, "10.jpg")
+        self.assertEqual(editing.folders["Part III - Ch 21"], ("1.jpg",))
+        self.assertEqual(
+            self.payload(selected)["selection"],
+            {"folder_id": folder_id, "image_id": first_id, "selected": True},
+        )
 
     def test_activity_rebind_rejects_stale_writes(self) -> None:
         self.assertEqual(self.claim().status, 200)
@@ -689,7 +781,7 @@ class APITests(ServerFixture):
 
         with (
             patch(
-                "pocket_manga_editor.service.scan_working_directory",
+                "pocket_manga_editor.service.scan_library",
                 side_effect=ScanError("broken source"),
             ),
             patch("pocket_manga_editor.service.LOGGER.exception"),
@@ -701,6 +793,32 @@ class APITests(ServerFixture):
         self.assertEqual(current["snapshot_id"], stable)
         extra = self.json_request("POST", "/api/library/rescan", {"unexpected": True})
         self.assertEqual(extra.status, 400)
+
+    def test_manga_scan_route_is_exact_and_reports_unreadable_manga(self) -> None:
+        (self.root / "Loose Pages").mkdir()
+        (self.root / "Loose Pages" / "1.jpg").write_bytes(b"loose")
+        self.assertEqual(self.claim().status, 200)
+        self.assertEqual(self.json_request("POST", "/api/library/rescan", {}).status, 200)
+        mangas = {
+            manga["name"]: manga["id"] for manga in self.payload(self.get("/api/library"))["mangas"]
+        }
+
+        scanned = self.json_request("POST", f"/api/manga/{mangas['Series One']}/scan", {})
+        self.assertEqual(scanned.status, 200)
+        self.assertEqual(
+            self.payload(scanned)["manga"], {"id": mangas["Series One"], "name": "Series One"}
+        )
+        loose = self.json_request("POST", f"/api/manga/{mangas['Loose Pages']}/scan", {})
+        self.assertEqual(loose.status, 409)
+        self.assertEqual(self.payload(loose)["error"]["code"], "no_entry_folders")
+        stale = self.json_request("POST", "/api/manga/m_unknown/scan", {})
+        self.assertEqual(stale.status, 404)
+        self.assertEqual(self.payload(stale)["error"]["code"], "stale_snapshot")
+        extra = self.json_request(
+            "POST", f"/api/manga/{mangas['Series One']}/scan", {"unexpected": True}
+        )
+        self.assertEqual(extra.status, 400)
+        self.assertEqual(self.get(f"/api/manga/{mangas['Series One']}/scan").status, 404)
 
     def test_old_destructive_and_pairing_routes_are_absent(self) -> None:
         self.assertEqual(self.claim().status, 200)
@@ -732,7 +850,7 @@ class HTTPServiceTests(ServerFixture):
 
     def service(self, port: int) -> HTTPService:
         service = HTTPService(
-            LibraryService(self.root, self.scan_result),
+            LibraryService(self.scan_result),
             host="127.0.0.1",
             port=port,
             public_host="127.0.0.1",
@@ -801,8 +919,8 @@ class HTTPServiceTests(ServerFixture):
             response = connection.getresponse()
             shell = response.read()
             self.assertEqual(response.status, 200)
-            self.assertIn(b"/static/app.js?v=explicit-controller-v3", shell)
-            self.assertIn(b"/static/styles.css?v=explicit-controller-v3", shell)
+            self.assertIn(b"/static/app.js?v=lazy-scan-v4", shell)
+            self.assertIn(b"/static/styles.css?v=lazy-scan-v4", shell)
             # Idle connections are never reused, so they cannot race a close.
             self.assertEqual(response.getheader("Connection"), "close")
             self.assertIn(

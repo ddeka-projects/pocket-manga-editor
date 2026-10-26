@@ -12,7 +12,7 @@ from .companion_install import install_companion
 from .config import ConfigurationError, Settings, load_settings
 from .logging_setup import configure_logging
 from .process_lock import ProcessLock
-from .scanner import ScanError, scan_working_directory
+from .scanner import ScanError, scan_library
 from .server import HTTPService
 from .service import LibraryService
 
@@ -61,8 +61,8 @@ def _serve(settings: Settings) -> int:
         LOGGER.warning("Could not install the export companion: %s", exc)
     else:
         LOGGER.info("Export companion installed in %s.", companion)
-    scan_result = scan_working_directory(settings.working_directory)
-    service = LibraryService(settings.working_directory, scan_result)
+    scan_result = scan_library(settings.working_directory)
+    service = LibraryService(scan_result)
     server = HTTPService(service, host=settings.host, port=settings.port)
     previous_handlers: dict[int, object] = {}
     exit_code = 0
@@ -80,7 +80,7 @@ def _serve(settings: Settings) -> int:
         LOGGER.info(
             "Pocket Manga Editor is serving %s (%d manga).",
             status.url,
-            len(scan_result.mangas),
+            len(scan_result.manga_names),
         )
 
         stop_requested = threading.Event()

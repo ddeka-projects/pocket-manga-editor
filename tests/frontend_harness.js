@@ -19,6 +19,8 @@ class Element {
   replaceChildren(...children) { this.children = children; }
   removeAttribute() {}
   setAttribute() {}
+  addEventListener() {}
+  focus() {}
 }
 function element(id) {
   if (!nodes.has(id)) nodes.set(id, new Element());
@@ -29,7 +31,7 @@ let intervals = 0;
 globalThis.window = {
   setTimeout() { return 1; }, clearTimeout() {},
   setInterval() { intervals += 1; },
-  history: { replaceState() {} }, location: { pathname: "/" },
+  history: { pushState() {}, replaceState() {} }, location: { pathname: "/" },
 };
 globalThis.crypto = { randomUUID: () => "test-page-id" };
 globalThis.AbortController = class { signal = {}; abort() {} };

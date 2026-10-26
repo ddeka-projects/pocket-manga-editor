@@ -24,3 +24,11 @@ class RescanError(ServiceError):
 
 class WrongActivityError(ServiceError):
     code = "wrong_activity"
+
+
+class MangaUnavailableError(ServiceError):
+    """A manga folder that cannot be opened, with a code saying why."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code

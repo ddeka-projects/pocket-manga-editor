@@ -18,6 +18,7 @@
     release: "/api/controller/release",
     library: "/api/library",
     rescan: "/api/library/rescan",
+    mangaScan: (id) => `/api/manga/${encodeURIComponent(id)}/scan`,
     manga: (id, activity) => (
       `/api/manga/${encodeURIComponent(id)}?activity=${encodeURIComponent(activity)}`
     ),
@@ -130,6 +131,7 @@
     positionRetryAttempt: 0,
     mutationBarrierTail: Promise.resolve(),
     activityOpening: false,
+    mangaOpening: false,
     rescanBusy: false,
     entryNavigationPending: false,
     entryNavigationToken: 0,
@@ -696,32 +698,22 @@
     return {
       id: String(manga && manga.id || ""),
       name: String(manga && manga.name || "Untitled manga"),
-      folderCount: nonNegativeInteger(manga && manga.folder_count),
     };
   }
 
   function renderLibrary() {
     elements.libraryList.replaceChildren();
-    let folderCount = 0;
     for (const manga of state.library) {
-      folderCount += manga.folderCount;
       const button = document.createElement("button");
       button.type = "button";
       button.className = "manga-card";
-      button.disabled = manga.folderCount === 0;
-      button.setAttribute("aria-label", mangaCardLabel(manga));
-      button.addEventListener("click", () => {
-        showActivityChoice(manga, { historyMode: "push" });
-      });
+      button.addEventListener("click", () => void openManga(manga));
 
       const text = document.createElement("span");
       const title = document.createElement("span");
       title.className = "manga-card-title";
       title.textContent = manga.name;
-      const meta = document.createElement("span");
-      meta.className = "manga-card-meta";
-      meta.textContent = mangaCardMeta(manga);
-      text.append(title, meta);
+      text.append(title);
 
       const arrow = document.createElement("span");
       arrow.className = "manga-card-arrow";
@@ -734,9 +726,7 @@
       elements.libraryList.append(item);
     }
 
-    const mangaText = `${state.library.length} manga`;
-    const folderText = `${folderCount} ${folderCount === 1 ? "folder" : "folders"}`;
-    elements.librarySummary.textContent = `${mangaText} · ${folderText}`;
+    elements.librarySummary.textContent = `${state.library.length} manga`;
     elements.libraryEmpty.hidden = state.library.length > 0;
     elements.libraryList.hidden = state.library.length === 0;
     elements.libraryNotice.hidden = state.libraryIssueCount === 0;
@@ -745,15 +735,38 @@
     }
   }
 
-  function mangaCardMeta(manga) {
-    if (!manga.folderCount) {
-      return "No readable image folders";
+  // The library lists names only. Tapping a manga scans its entries and
+  // images on the PC, so chapters added since the last visit appear here.
+  async function openManga(manga) {
+    if (!state.ownsControl || state.mangaOpening || state.rescanBusy) {
+      return;
     }
-    return plural(manga.folderCount, "1 image folder", `${manga.folderCount} image folders`);
-  }
-
-  function mangaCardLabel(manga) {
-    return `${manga.name}, ${mangaCardMeta(manga)}`;
+    state.mangaOpening = true;
+    try {
+      if (!(await drainPendingMutations())) {
+        return;
+      }
+      const requestToken = ++state.viewRequestToken;
+      const epoch = ++state.activityEpoch;
+      showToast("Opening manga…", 1_200);
+      try {
+        await requestJson(ROUTES.mangaScan(manga.id), { method: "POST", body: {} });
+        if (requestToken === state.viewRequestToken && epoch === state.activityEpoch) {
+          showActivityChoice(manga, { historyMode: "push" });
+        }
+      } catch (error) {
+        if (requestToken !== state.viewRequestToken || epoch !== state.activityEpoch) {
+          return;
+        }
+        if (isSessionGateError(error)) {
+          handleSessionError(error, () => openManga(manga));
+        } else {
+          showActionError(`Can’t open ${manga.name}`, friendlyMessage(error), () => openManga(manga));
+        }
+      }
+    } finally {
+      state.mangaOpening = false;
+    }
   }
 
   function showLibrary({ historyMode = "none" } = {}) {
@@ -843,34 +856,22 @@
       if (payload.activity !== activity) {
         throw new ApiError("wrong_activity", "The PC opened a different activity.");
       }
-      if (payload.snapshot_id) {
-        state.snapshotId = payload.snapshot_id;
-      }
       const raw = payload.manga || {};
       const folders = Array.isArray(raw.folders)
-        ? raw.folders.map((folder) => normalizeFolderSummary(folder, activity)).filter((folder) => folder.id)
+        ? raw.folders.map(normalizeFolderSummary).filter((folder) => folder.id)
         : [];
+      if (!folders.length) {
+        throw new ApiError("no_images", "This manga has no images to open.");
+      }
       state.activity = activity;
       state.chromeVisible = true;
-      const currentManga = {
+      state.currentManga = {
         id: String(raw.id || manga.id),
         name: String(raw.name || manga.name),
         currentFolderId: String(raw.current_folder_id || ""),
         currentImageId: String(raw.current_image_id || ""),
         folders,
       };
-      if (activity === EDIT) {
-        currentManga.selectedCount = nonNegativeInteger(raw.selected_count);
-      }
-      state.currentManga = currentManga;
-      if (!folders.length) {
-        showActionError(
-          "No readable image folder",
-          "This manga no longer has a readable image folder in the active snapshot.",
-          () => chooseActivity(activity, { historyMode: "none" }),
-        );
-        return;
-      }
       populateFolderPicker(folders);
       const preferred = folders.find((folder) => folder.id === state.currentManga.currentFolderId)
         || folders[0];
@@ -879,7 +880,6 @@
         historyMode,
         requestEpoch: epoch,
       });
-      showWarnings(payload.warnings);
     } catch (error) {
       if (requestToken === state.viewRequestToken && epoch === state.activityEpoch) {
         if (isSessionGateError(error)) {
@@ -898,16 +898,11 @@
     }
   }
 
-  function normalizeFolderSummary(folder, activity) {
-    const normalized = {
+  function normalizeFolderSummary(folder) {
+    return {
       id: String(folder && folder.id || ""),
       name: String(folder && folder.name || "Untitled folder"),
-      imageCount: nonNegativeInteger(folder && folder.image_count),
     };
-    if (activity === EDIT) {
-      normalized.selectedCount = nonNegativeInteger(folder && folder.selected_count);
-    }
-    return normalized;
   }
 
   async function openFolder(
@@ -941,20 +936,13 @@
       const images = Array.isArray(raw.images)
         ? raw.images.map((image) => normalizeImage(image, activity)).filter((image) => image.id)
         : [];
-      const currentFolder = {
+      state.currentFolder = {
         id: String(raw.id || folderId),
         mangaId: String(raw.manga_id || (state.currentManga && state.currentManga.id) || ""),
         name: String(raw.name || "Untitled folder"),
         currentImageId: String(raw.current_image_id || ""),
-        revision: nonNegativeInteger(raw.revision),
         images,
       };
-      if (activity === EDIT) {
-        currentFolder.selectedCount = nonNegativeInteger(raw.selected_count);
-        currentFolder.mangaSelectedCount = nonNegativeInteger(raw.manga_selected_count);
-      }
-      state.currentFolder = currentFolder;
-      updateFolderSummary(state.currentFolder);
       elements.folderPicker.value = state.currentFolder.id;
       populateImagePickers();
       showReader();
@@ -989,7 +977,6 @@
       if (persist) {
         queuePosition(activity, state.currentFolder.id, images[index].id, requestEpoch);
       }
-      showWarnings(payload.warnings);
     } catch (error) {
       if (requestToken === state.viewRequestToken && requestEpoch === state.activityEpoch) {
         if (state.currentFolder) {
@@ -1286,24 +1273,13 @@
       const payload = await queueSelectionRequest(pending);
       const selection = payload.selection || {};
       const confirmed = typeof selection.selected === "boolean" ? selection.selected : desired;
-      const responseRevision = nonNegativeInteger(selection.revision ?? folder.revision);
-      const capturedAggregateAccepted = applySelectionConfirmation(
-        folder,
-        image,
-        confirmed,
-        selection,
-        responseRevision,
-      );
+      image.selected = confirmed;
       if (state.selectionPending.get(image.id) === pending) {
         state.selectionPending.delete(image.id);
       }
 
-      const editingSameManga = (
-        state.activity === EDIT
-        && state.currentManga
-        && state.currentManga.id === folder.mangaId
-      );
-      const liveFolder = editingSameManga
+      // The folder may have been reloaded while the save was in flight.
+      const liveFolder = state.activity === EDIT
         && state.currentFolder
         && state.currentFolder.id === folder.id
         ? state.currentFolder
@@ -1311,26 +1287,10 @@
       const liveImage = liveFolder
         ? liveFolder.images.find((candidate) => candidate.id === image.id) || null
         : null;
-      let currentAggregateAccepted = capturedAggregateAccepted;
-      if (liveFolder && liveImage && (liveFolder !== folder || liveImage !== image)) {
-        currentAggregateAccepted = applySelectionConfirmation(
-          liveFolder,
-          liveImage,
-          confirmed,
-          selection,
-          responseRevision,
-        );
+      if (liveImage) {
+        liveImage.selected = confirmed;
       }
-      if (editingSameManga) {
-        updateFolderSummary(liveFolder || folder);
-        if (
-          currentAggregateAccepted
-          && Number.isInteger(selection.manga_selected_count)
-        ) {
-          state.currentManga.selectedCount = Math.max(0, selection.manga_selected_count);
-        }
-      }
-      if (liveFolder && epoch === state.activityEpoch && state.activity === EDIT) {
+      if (liveFolder && epoch === state.activityEpoch) {
         populateImagePickers();
         elements.imagePicker.value = currentImage() ? currentImage().id : "";
         if (currentImage() && currentImage().id === image.id) {
@@ -1410,21 +1370,6 @@
     }, delay);
   }
 
-  function applySelectionConfirmation(folder, image, confirmed, selection, responseRevision) {
-    const aggregateAccepted = responseRevision >= folder.revision;
-    image.selected = confirmed;
-    if (aggregateAccepted && Number.isInteger(selection.folder_selected_count)) {
-      folder.selectedCount = Math.max(0, selection.folder_selected_count);
-    } else {
-      folder.selectedCount = folder.images.filter((candidate) => candidate.selected).length;
-    }
-    if (aggregateAccepted && Number.isInteger(selection.manga_selected_count)) {
-      folder.mangaSelectedCount = Math.max(0, selection.manga_selected_count);
-    }
-    folder.revision = Math.max(folder.revision, responseRevision);
-    return aggregateAccepted;
-  }
-
   function renderSelectionState(image) {
     if (state.activity !== EDIT) {
       clearSelectionPresentation();
@@ -1491,21 +1436,6 @@
       "is-neutral",
       "is-error",
     );
-  }
-
-  function updateFolderSummary(folder) {
-    if (!state.currentManga || !folder) {
-      return;
-    }
-    const summary = state.currentManga.folders.find((candidate) => candidate.id === folder.id);
-    if (summary) {
-      if (state.activity === EDIT) {
-        summary.selectedCount = folder.selectedCount;
-      }
-    }
-    if (state.activity === EDIT && Number.isInteger(folder.mangaSelectedCount)) {
-      state.currentManga.selectedCount = folder.mangaSelectedCount;
-    }
   }
 
   function queuePosition(activity, folderId, imageId, epoch) {
@@ -1589,10 +1519,6 @@
               state.currentManga.currentFolderId = pending.folderId;
               state.currentManga.currentImageId = state.currentFolder.currentImageId;
             }
-            state.currentFolder.revision = nonNegativeInteger(
-              position.revision ?? state.currentFolder.revision,
-            );
-            updateFolderSummary(state.currentFolder);
           }
         } catch (error) {
           const ownershipIsCurrent = pending.ownershipEpoch === state.controllerEpoch;
@@ -1907,12 +1833,6 @@
       window.history.pushState(historyState, "", window.location.pathname);
     } else if (mode === "replace") {
       window.history.replaceState(historyState, "", window.location.pathname);
-    }
-  }
-
-  function showWarnings(warnings) {
-    if (Array.isArray(warnings) && warnings.length) {
-      showToast(String(warnings[0]), 3_000);
     }
   }
 

@@ -168,7 +168,7 @@ class ApplicationBootstrapTests(unittest.TestCase):
             patch.object(
                 app, "load_settings", side_effect=ConfigurationError("invalid configuration")
             ),
-            patch.object(app, "scan_working_directory") as scan,
+            patch.object(app, "scan_library") as scan,
             patch.object(app, "ProcessLock") as lock,
         ):
             self.assertEqual(app.main([]), 1)
@@ -182,7 +182,7 @@ class ApplicationBootstrapTests(unittest.TestCase):
             patch.object(app, "load_settings", return_value=configuration),
             patch.object(app, "ProcessLock") as lock,
             patch.object(app, "install_companion") as install,
-            patch.object(app, "scan_working_directory") as scan,
+            patch.object(app, "scan_library") as scan,
         ):
             lock.return_value.__enter__.side_effect = RuntimeError(
                 "Another server already uses this data"
@@ -201,7 +201,7 @@ class ApplicationBootstrapTests(unittest.TestCase):
                 raise install_error
             return root / ".pocket-manga-editor"
 
-        scan_result = SimpleNamespace(mangas=(), issues=())
+        scan_result = SimpleNamespace(manga_names=(), issues=())
         library_service = MagicMock()
         server = MagicMock()
         server.start.return_value = SimpleNamespace(
@@ -221,7 +221,7 @@ class ApplicationBootstrapTests(unittest.TestCase):
             patch.object(app, "install_companion", side_effect=install),
             patch.object(
                 app,
-                "scan_working_directory",
+                "scan_library",
                 side_effect=lambda _root: order.append("scan") or scan_result,
             ),
             patch.object(app, "LibraryService", return_value=library_service),

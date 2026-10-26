@@ -102,22 +102,20 @@ class WebAssetContractTests(unittest.TestCase):
         self.assertIn("prefetchAdjacentImages", self.javascript)
         self.assertIn("selection-pending-add", self.javascript)
         self.assertIn("selection-failed", self.javascript)
-        self.assertIn("responseRevision >= folder.revision", self.javascript)
         self.assertIn("selectionRequestTail: Promise.resolve()", self.javascript)
         self.assertIn(
             "state.selectionRequestTail = request.catch(() => {})",
             self.javascript,
         )
-        self.assertIn(
-            "aggregateAccepted && Number.isInteger(selection.manga_selected_count)",
-            self.javascript,
-        )
+        # Only the Selected dropdown shows a count, derived from the list it shows.
+        self.assertIn("`Selected · ${selectedImages.length}`", self.javascript)
+        for removed in ("selected_count", "selectedCount", "revision", "folder_count"):
+            self.assertNotIn(removed, self.javascript)
         self.assertIn(
             "Position not saved",
             self.javascript,
         )
         self.assertIn("Selection not saved", self.javascript)
-        self.assertIn("applySelectionConfirmation", self.javascript)
         self.assertIn(
             'id="chrome-toggle" class="tap-zone chrome-toggle-zone"',
             self.html,
@@ -178,6 +176,7 @@ class WebAssetContractTests(unittest.TestCase):
             'release: "/api/controller/release"',
             'library: "/api/library"',
             'rescan: "/api/library/rescan"',
+            "mangaScan: (id) => `/api/manga/${encodeURIComponent(id)}/scan`",
             "`/api/manga/${encodeURIComponent(id)}?activity=${encodeURIComponent(activity)}`",
             "`/api/folder/${encodeURIComponent(id)}?activity=${encodeURIComponent(activity)}`",
             "`/api/image/${encodeURIComponent(id)}`",
@@ -346,6 +345,31 @@ class WebAssetContractTests(unittest.TestCase):
         ].split("function normalizeMangaSummary", 1)[0]
         self.assertIn("state.snapshotId = payload.snapshot_id", apply_library)
         self.assertIn('showLibrary({ historyMode: "replace" })', apply_library)
+
+    def test_library_shows_names_and_scans_a_manga_when_it_is_tapped(self) -> None:
+        render = self.javascript.split("function renderLibrary() {", 1)[1].split(
+            "async function openManga", 1
+        )[0]
+        self.assertIn(
+            "elements.librarySummary.textContent = `${state.library.length} manga`", render
+        )
+        self.assertIn("openManga(manga)", render)
+        self.assertNotIn("disabled", render)
+        self.assertNotIn("manga-card-meta", self.javascript + self.css)
+
+        open_manga = self.javascript.split("async function openManga(manga) {", 1)[1].split(
+            "function showLibrary", 1
+        )[0]
+        self.assertLess(
+            open_manga.index("await drainPendingMutations()"),
+            open_manga.index("requestJson(ROUTES.mangaScan(manga.id)"),
+        )
+        self.assertLess(
+            open_manga.index("requestJson(ROUTES.mangaScan(manga.id)"),
+            open_manga.index('showActivityChoice(manga, { historyMode: "push" })'),
+        )
+        self.assertIn("body: {}", open_manga)
+        self.assertIn("showActionError(`Can’t open ${manga.name}`", open_manga)
 
     def test_export_is_not_part_of_the_web_app(self) -> None:
         # Export runs from the PC companion script in the metadata folder.

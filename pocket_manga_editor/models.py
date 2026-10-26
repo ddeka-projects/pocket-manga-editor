@@ -41,6 +41,18 @@ class ScanIssue:
 
 
 @dataclass(frozen=True, slots=True)
-class ScanResult:
-    mangas: tuple[MangaRef, ...]
+class LibraryScan:
+    """The manga folder names directly inside the library; nothing deeper."""
+
+    root: Path
+    manga_names: tuple[str, ...]
+    issues: tuple[ScanIssue, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class MangaScan:
+    """One manga's entry folders and images, scanned when it is opened."""
+
+    manga: MangaRef
+    entry_folder_count: int
     issues: tuple[ScanIssue, ...]
