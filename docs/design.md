@@ -59,7 +59,8 @@ request must present both its page identity and token. A different tab or
 device receives an “open elsewhere” response and can choose **Take Control**.
 
 Ownership has no timer and the browser sends no heartbeat or shutdown-time
-release. The library screen offers **Release Control** for an explicit release.
+release, and the interface has no manual release button. The server keeps its
+release route for API completeness.
 Ownership remains valid through phone suspension and temporary Wi-Fi loss.
 An explicit takeover rotates the token immediately after any already-authorized
 durable operation finishes; requests carrying the old token are then rejected.

@@ -1,5 +1,5 @@
 async function checks() {
-  const { state, acquireController, releaseController, loseControl, requestJson } = client;
+  const { state, acquireController, loseControl, requestJson } = client;
   const sent = [];
   transport = async (path) => {
     sent.push(path);
@@ -11,28 +11,15 @@ async function checks() {
   assert(element("state-screen").hidden && !element("library-screen").hidden, "Claim opens the library");
   assert(sent.join(",") === "/api/controller/claim,/api/library", "No polling or extra requests on entry");
 
-  state.positionQueue.set("read:manga", { activity: "read", folderId: "folder", imageId: "image", epoch: state.activityEpoch, ownershipEpoch: state.controllerEpoch });
   sent.length = 0;
   transport = async (path, options) => {
     sent.push(path);
     assert(options.headers.get("X-Page-Id") === state.pageId, "Protected requests use the common page header");
-    assert(options.headers.get("X-Controller-Token") === "first-token", "Existing token protects both requests");
-    return reply({ ok: true, released: true });
+    assert(options.headers.get("X-Controller-Token") === "first-token", "Existing token protects requests");
+    return reply({ ok: true, mangas: [], snapshot_id: "first-snapshot" });
   };
-  await releaseController();
-  assert(sent.join(",") === "/api/read/folder/folder/position,/api/controller/release", "Release waits for the pending position to be saved");
-  assert(!state.ownsControl && state.controllerToken === null, "Confirmed release clears local authority");
-  assert(!element("state-screen").hidden && element("library-screen").hidden, "Release hides the entire workspace");
-  assert(element("state-action").textContent === "Take Control", "Explicit reentry remains available");
-
-  state.ownsControl = true;
-  state.controllerToken = "live-token";
-  element("state-screen").hidden = true;
-  element("library-screen").hidden = false;
-  transport = async () => { throw new Error("offline"); };
-  await releaseController();
-  assert(state.ownsControl && state.controllerToken === "live-token", "An unconfirmed release retains its identity for recovery");
-  assert(element("action-error-title").textContent === "Connection interrupted", "Network failure states that confirmation is missing");
+  await requestJson("/api/library");
+  assert(sent.join(",") === "/api/library", "Protected request carries ownership headers");
 
   state.positionQueue.set("unsure", { imageId: "unsure-image" });
   loseControl();

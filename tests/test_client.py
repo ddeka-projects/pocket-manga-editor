@@ -46,7 +46,6 @@ class WebAssetContractTests(unittest.TestCase):
             "state-screen",
             "library-screen",
             "library-refresh",
-            "release-control",
             "library-list",
             "activity-screen",
             "activity-title",
@@ -173,7 +172,6 @@ class WebAssetContractTests(unittest.TestCase):
         required_routes = {
             'claim: "/api/controller/claim"',
             'takeover: "/api/controller/takeover"',
-            'release: "/api/controller/release"',
             'library: "/api/library"',
             'rescan: "/api/library/rescan"',
             "mangaScan: (id) => `/api/manga/${encodeURIComponent(id)}/scan`",

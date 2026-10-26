@@ -12,7 +12,7 @@ STATIC = ROOT / "pocket_manga_editor" / "static"
 
 
 class FrontendTests(unittest.TestCase):
-    def test_ownership_release_takeover_and_uncertain_saves(self):
+    def test_ownership_takeover_and_uncertain_saves(self):
         runtime = shutil.which("node")
         jsc = Path("/System/Library/Frameworks/JavaScriptCore.framework/Versions/A/Helpers/jsc")
         if runtime is None and jsc.is_file():
@@ -22,7 +22,7 @@ class FrontendTests(unittest.TestCase):
         source = (STATIC / "app.js").read_text(encoding="utf-8")
         source = source.replace(
             "  bindEvents();\n  void bootstrap();",
-            "  globalThis.client = { state, acquireController, releaseController, loseControl,"
+            "  globalThis.client = { state, acquireController, loseControl,"
             " requestJson, ensurePositionFlush, drainPendingMutations, setSelection, openManga };",
         )
         checks = "\n".join(

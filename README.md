@@ -175,8 +175,8 @@ shows or hides the controls. Read has no selection strip.
 Only one browser page can control the library at a time. Closing or navigating
 away does not depend on an unreliable browser shutdown signal: ownership stays
 with that page until another page chooses **Take Control** or the server
-restarts. **Release Control** on the library screen gives up ownership
-deliberately. Other pages show a waiting screen until they take control.
+restarts. There is no manual release button; closing the Home Screen app keeps
+ownership. Other pages show a waiting screen until they take control.
 Takeover is immediate after any save or rescan already being committed
 finishes. There is no heartbeat timeout, paired-device credential, or permanent
 ownership file; the trusted private LAN is the authorization boundary.

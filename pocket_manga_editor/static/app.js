@@ -15,7 +15,6 @@
   const ROUTES = Object.freeze({
     claim: "/api/controller/claim",
     takeover: "/api/controller/takeover",
-    release: "/api/controller/release",
     library: "/api/library",
     rescan: "/api/library/rescan",
     mangaScan: (id) => `/api/manga/${encodeURIComponent(id)}/scan`,
@@ -42,7 +41,6 @@
     stateDetail: element("state-detail"),
     libraryScreen: element("library-screen"),
     libraryRefresh: element("library-refresh"),
-    releaseControl: element("release-control"),
     librarySummary: element("library-summary"),
     libraryNotice: element("library-notice"),
     libraryList: element("library-list"),
@@ -155,7 +153,6 @@
       }
     });
     elements.libraryRefresh.addEventListener("click", () => void rescanLibrary());
-    elements.releaseControl.addEventListener("click", () => void releaseController());
     elements.emptyRetry.addEventListener("click", () => void rescanLibrary());
     elements.backToLibrary.addEventListener("click", navigateBackAfterMutations);
     elements.chooseRead.addEventListener("click", () => void chooseActivity(READ));
@@ -473,32 +470,6 @@
     state.connectionInterrupted = false;
     if (state.activity === EDIT) {
       renderSelectionState(currentImage());
-    }
-  }
-
-  async function releaseController() {
-    if (!state.ownsControl || !(await drainPendingMutations())) {
-      return;
-    }
-    try {
-      await requestJson(ROUTES.release, {
-        method: "POST",
-        body: { page_id: state.pageId, token: state.controllerToken },
-      });
-      state.ownsControl = false;
-      state.controllerToken = null;
-      state.controllerEpoch += 1;
-      updateControllerControls();
-      showState({
-        kicker: "Control released",
-        title: "Ready when you are",
-        message: "Take control here or open the app on another device.",
-        loading: false,
-        actionLabel: "Take Control",
-        action: () => acquireController(),
-      });
-    } catch (error) {
-      await handleSessionError(error, releaseController);
     }
   }
 
@@ -1861,7 +1832,6 @@
   function updateControllerControls() {
     const disabled = !state.ownsControl;
     elements.libraryRefresh.disabled = disabled || state.rescanBusy;
-    elements.releaseControl.disabled = disabled || state.rescanBusy;
     elements.emptyRetry.disabled = disabled || state.rescanBusy;
     elements.chooseRead.disabled = disabled || state.activityOpening;
     elements.chooseEdit.disabled = disabled || state.activityOpening;
