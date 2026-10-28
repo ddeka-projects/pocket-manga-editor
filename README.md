@@ -133,7 +133,8 @@ Reinstall the task after changing setup scripts or moving the repository.
 
 ## Web application
 
-The home screen lists the manga folder names and shows **N manga**. The server
+The home screen lists the manga folder names, one per row with long names
+wrapped onto extra lines, and shows **N manga**. The server
 reads the library folder's names when it starts, and the top-right button
 lists them again, so adding, removing, or renaming a manga folder needs a
 Refresh. Listing names only is quick even for a large library, because no

@@ -385,12 +385,11 @@ select:focus-visible {
 
 .manga-card-title {
   display: block;
-  overflow: hidden;
   font-size: 1.03rem;
   font-weight: 720;
   line-height: 1.25;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  /* Long names wrap onto more lines instead of being cut off. */
+  overflow-wrap: anywhere;
 }
 
 .manga-card-arrow {
@@ -989,12 +988,6 @@ select:focus-visible {
 @keyframes failed-pulse {
   0%, 100% { border-color: var(--green); box-shadow: none; }
   45% { border-color: var(--red); box-shadow: 0 0 34px rgb(255 107 115 / 72%); }
-}
-
-@media (min-width: 650px) {
-  .manga-list {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
 }
 
 @media (max-width: 365px) {

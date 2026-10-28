@@ -919,8 +919,8 @@ class HTTPServiceTests(ServerFixture):
             response = connection.getresponse()
             shell = response.read()
             self.assertEqual(response.status, 200)
-            self.assertIn(b"/static/app.js?v=lazy-scan-v4", shell)
-            self.assertIn(b"/static/styles.css?v=lazy-scan-v4", shell)
+            self.assertIn(b"/static/app.js?v=lazy-scan-v5", shell)
+            self.assertIn(b"/static/styles.css?v=lazy-scan-v5", shell)
             # Idle connections are never reused, so they cannot race a close.
             self.assertEqual(response.getheader("Connection"), "close")
             self.assertIn(
