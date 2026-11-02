@@ -3,6 +3,7 @@ from __future__ import annotations
 import http.client
 import io
 import json
+import os
 from pathlib import Path
 import socket
 import tempfile
@@ -307,11 +308,69 @@ class ServiceTests(ServerFixture):
             library = self.service.rescan(self.PAGE, self.token)
         self.assertEqual(
             library["mangas"],
-            [{"id": manga["id"], "name": manga["name"]} for manga in library["mangas"]],
+            [
+                {"id": manga["id"], "name": manga["name"], "saved_activity": None}
+                for manga in library["mangas"]
+            ],
         )
         self.assertEqual(
             [manga["name"] for manga in library["mangas"]],
             ["Empty Manga", "Series One", "Series Two"],
+        )
+
+    def test_activity_labels_use_one_metadata_listing_without_parsing_json(self) -> None:
+        metadata = self.root / ".pocket-manga-editor"
+        metadata.mkdir()
+        (metadata / "Series One.read.json").write_text("not parsed", encoding="utf-8")
+        (metadata / "Series One.edit.json").write_text("not parsed", encoding="utf-8")
+        (metadata / "Series Two.read.json").write_text("not parsed", encoding="utf-8")
+        (metadata / "Orphan.edit.json").write_text("not parsed", encoding="utf-8")
+        with (
+            patch("pocket_manga_editor.workspace.os.scandir", wraps=os.scandir) as listing,
+            patch(
+                "pocket_manga_editor.service.scan_manga",
+                side_effect=AssertionError("No source scan"),
+            ),
+            patch.object(ReadingStore, "load", side_effect=AssertionError("No reading JSON load")),
+            patch.object(EditingStore, "load", side_effect=AssertionError("No editing JSON load")),
+        ):
+            library = self.service.library(self.PAGE, self.token)
+        self.assertEqual(listing.call_count, 1)
+        self.assertEqual(
+            {manga["name"]: manga["saved_activity"] for manga in library["mangas"]},
+            {"Series One": "edit", "Series Two": "read"},
+        )
+
+    def test_activity_labels_refresh_after_saves_and_ignore_non_files(self) -> None:
+        metadata = self.root / ".pocket-manga-editor"
+        metadata.mkdir()
+        (metadata / "Series Two.edit.json").mkdir()
+        (metadata / "Series One.read.json.tmp").write_text("temporary", encoding="utf-8")
+        self.assertTrue(
+            all(
+                m["saved_activity"] is None
+                for m in self.service.library(self.PAGE, self.token)["mangas"]
+            )
+        )
+        folder_id, image_id = self.open_edit()
+        self.service.set_selection(self.PAGE, self.token, Activity.EDIT, folder_id, image_id, True)
+        library = self.service.library(self.PAGE, self.token)
+        self.assertEqual([m["saved_activity"] for m in library["mangas"]], ["edit", None])
+
+    def test_linked_metadata_file_does_not_mark_a_title_as_started(self) -> None:
+        metadata = self.root / ".pocket-manga-editor"
+        metadata.mkdir()
+        outside = self.root / "outside.json"
+        outside.write_text("{}", encoding="utf-8")
+        try:
+            (metadata / "Series One.edit.json").symlink_to(outside)
+        except (OSError, NotImplementedError):
+            self.skipTest("Creating symlinks is unavailable on this system.")
+        self.assertTrue(
+            all(
+                m["saved_activity"] is None
+                for m in self.service.library(self.PAGE, self.token)["mangas"]
+            )
         )
 
     def test_opening_a_manga_reports_why_it_cannot_be_read(self) -> None:
@@ -621,7 +680,7 @@ class APITests(ServerFixture):
     def test_activity_queries_and_patch_writes_are_strict_and_independent(self) -> None:
         self.assertEqual(self.claim().status, 200)
         library = self.payload(self.get("/api/library"))
-        self.assertEqual(set(library["mangas"][0]), {"id", "name"})
+        self.assertEqual(set(library["mangas"][0]), {"id", "name", "saved_activity"})
         manga_id = library["mangas"][0]["id"]
         for query in ("", "?activity=", "?activity=read&activity=edit", "?mode=read"):
             with self.subTest(query=query):

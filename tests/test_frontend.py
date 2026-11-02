@@ -26,7 +26,8 @@ class FrontendTests(unittest.TestCase):
             " requestJson, ensurePositionFlush, drainPendingMutations, setSelection, openManga,"
             " recommendationAction, showHome, showLibrary, showRecommendation, historyChanged,"
             " applyLibraryPayload, readRecommendationFilter, selectRecommendationFilter,"
-            " requestRecommendation, readRecommendation, navigateBackAfterMutations };",
+            " requestRecommendation, readRecommendation, navigateBackAfterMutations,"
+            " visibleMangas, renderLibrary, selectExplorePool, readExplorePool };",
         )
         checks = "\n".join(
             (

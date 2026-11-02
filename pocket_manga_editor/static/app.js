@@ -57,6 +57,10 @@
     librarySummary: element("library-summary"),
     libraryNotice: element("library-notice"),
     libraryList: element("library-list"),
+    librarySearch: element("library-search"),
+    libraryNoResults: element("library-no-results"),
+    exploreAll: element("explore-all"),
+    exploreNormal: element("explore-normal"),
     libraryEmpty: element("library-empty"),
     emptyRetry: element("empty-retry"),
     activityScreen: element("activity-screen"),
@@ -115,6 +119,8 @@
     stateAction: null,
     library: [],
     libraryIssueCount: 0,
+    librarySearch: "",
+    explorePool: readExplorePool(),
     recommendations: { pending: null, preferences: {} },
     recommendationFilter: readRecommendationFilter(),
     recommendationBusy: false,
@@ -165,6 +171,17 @@
   }
 
   function bindEvents() {
+    elements.librarySearch.addEventListener("input", () => {
+      state.librarySearch = elements.librarySearch.value;
+      renderLibrary();
+    });
+    elements.exploreAll.checked = state.explorePool === "all";
+    elements.exploreNormal.checked = state.explorePool === "normal";
+    for (const input of [elements.exploreAll, elements.exploreNormal]) {
+      input.addEventListener("change", () => {
+        if (input.checked) selectExplorePool(input.value);
+      });
+    }
     selectRecommendationFilter(state.recommendationFilter, { persist: false });
     for (const value of ["all", "normal", "adult"]) {
       element(`filter-${value}`).addEventListener("click", () => selectRecommendationFilter(value));
@@ -277,6 +294,28 @@
       // Use the default when storage is unavailable.
     }
     return "all";
+  }
+
+  function readExplorePool() {
+    try {
+      if (window.localStorage.getItem("pocket-manga-explore-pool") === "normal") return "normal";
+    } catch (_error) {
+      // Default to showing every title when browser storage is unavailable.
+    }
+    return "all";
+  }
+
+  function selectExplorePool(value) {
+    if (!["all", "normal"].includes(value)) return;
+    state.explorePool = value;
+    elements.exploreAll.checked = value === "all";
+    elements.exploreNormal.checked = value === "normal";
+    try {
+      window.localStorage.setItem("pocket-manga-explore-pool", value);
+    } catch (_error) {
+      // Keep the choice for this page even when browser storage is unavailable.
+    }
+    renderLibrary();
   }
 
   function selectRecommendationFilter(value, { persist = true } = {}) {
@@ -1000,12 +1039,41 @@
     return {
       id: String(manga && manga.id || ""),
       name: String(manga && manga.name || "Untitled manga"),
+      savedActivity: manga && [EDIT, READ].includes(manga.saved_activity) ? manga.saved_activity : null,
     };
   }
 
+  function recordSavedActivity(mangaId, activity) {
+    const manga = state.library.find((candidate) => candidate.id === mangaId);
+    if (manga && manga.savedActivity !== EDIT) manga.savedActivity = activity;
+  }
+
+  function visibleMangas() {
+    const query = state.librarySearch.trim().toLocaleLowerCase();
+    const rank = (manga) => manga.savedActivity === EDIT ? 0 : manga.savedActivity === READ ? 1 : 2;
+    // Stable sorting preserves the server's natural name order within each group.
+    return state.library.filter((manga) => (
+      (state.explorePool === "all" || !/^\[[^\[\]]+\]/.test(manga.name))
+      && manga.name.toLocaleLowerCase().includes(query)
+    )).sort((left, right) => rank(left) - rank(right));
+  }
+
+  function cardIndicator(container, text, className, description = text) {
+    const indicator = document.createElement("span");
+    indicator.className = className;
+    indicator.textContent = text;
+    indicator.title = description;
+    if (description !== text) {
+      indicator.setAttribute("role", "img");
+      indicator.setAttribute("aria-label", description);
+    }
+    container.append(indicator);
+  }
+
   function renderLibrary() {
+    const visible = visibleMangas();
     elements.libraryList.replaceChildren();
-    for (const manga of state.library) {
+    for (const manga of visible) {
       const button = document.createElement("button");
       button.type = "button";
       button.className = "manga-card";
@@ -1016,30 +1084,39 @@
       title.className = "manga-card-title";
       title.textContent = manga.name;
       text.append(title);
-      const badges = document.createElement("span");
-      badges.className = "title-badges";
-      titleBadges(badges, manga.name);
-      text.append(badges);
+      const details = document.createElement("span");
+      details.className = "manga-card-details";
+      const labels = document.createElement("span");
+      labels.className = "manga-card-labels";
+      if (manga.savedActivity) {
+        cardIndicator(labels, manga.savedActivity === EDIT ? "Editing" : "Reading", `activity-label activity-${manga.savedActivity}`);
+      }
+      const adult = /^\[[^\[\]]+\]/.test(manga.name);
+      if (adult) cardIndicator(labels, "18+", "adult-label");
+      const symbols = document.createElement("span");
+      symbols.className = "manga-card-symbols";
       const preferences = preferencesFor(manga.name);
-      button.classList.toggle("preference-favorite", Boolean(preferences.favorite));
-      button.classList.toggle("preference-less", Boolean(preferences.less_often));
-      button.classList.toggle("preference-excluded", Boolean(preferences.not_for_me));
-      button.classList.toggle("adult-title", /^\[[^\[\]]+\]/.test(manga.name));
-
-      const arrow = document.createElement("span");
-      arrow.className = "manga-card-arrow";
-      arrow.setAttribute("aria-hidden", "true");
-      arrow.textContent = "›";
-      button.append(text, arrow);
+      if (preferences.favorite) cardIndicator(symbols, "★", "favorite-symbol", "Favorite");
+      if (preferences.less_often) cardIndicator(symbols, "↓", "less-often-symbol", "Less often");
+      if (labels.children.length) details.append(labels);
+      if (symbols.children.length) details.append(symbols);
+      if (details.children.length) text.append(details);
+      if (preferences.not_for_me) cardIndicator(text, "Not for me", "sr-only");
+      button.classList.toggle("is-excluded", Boolean(preferences.not_for_me));
+      button.classList.toggle("adult-title", adult);
+      button.append(text);
       const item = document.createElement("div");
       item.setAttribute("role", "listitem");
       item.append(button);
       elements.libraryList.append(item);
     }
 
-    elements.librarySummary.textContent = `${state.library.length} manga`;
+    elements.librarySummary.textContent = state.librarySearch.trim() || state.explorePool !== "all"
+      ? `${visible.length} of ${state.library.length} manga`
+      : `${state.library.length} manga`;
     elements.libraryEmpty.hidden = state.library.length > 0;
-    elements.libraryList.hidden = state.library.length === 0;
+    elements.libraryList.hidden = visible.length === 0;
+    elements.libraryNoResults.hidden = state.library.length === 0 || visible.length > 0;
     elements.libraryNotice.hidden = state.libraryIssueCount === 0;
     if (state.libraryIssueCount) {
       elements.libraryNotice.textContent = `${state.libraryIssueCount} source ${state.libraryIssueCount === 1 ? "item was" : "items were"} skipped by the PC scan.`;
@@ -1623,6 +1700,7 @@
       const payload = await queueSelectionRequest(pending);
       const selection = payload.selection || {};
       const confirmed = typeof selection.selected === "boolean" ? selection.selected : desired;
+      recordSavedActivity(folder.mangaId, EDIT);
       image.selected = confirmed;
       if (state.selectionPending.get(image.id) === pending) {
         state.selectionPending.delete(image.id);
@@ -1793,6 +1871,7 @@
     const key = `${activity}:${mangaId}`;
     state.positionQueue.set(key, {
       activity,
+      mangaId,
       folderId,
       imageId,
       epoch,
@@ -1855,6 +1934,7 @@
             timeoutMs: SAVE_TIMEOUT_MS,
           });
           state.positionRetryAttempt = 0;
+          recordSavedActivity(pending.mangaId, pending.activity);
           const position = payload.position || {};
           if (
             state.activity === pending.activity

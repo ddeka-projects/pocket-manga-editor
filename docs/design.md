@@ -113,7 +113,11 @@ cannot split one of those operations midway through its commit.
 ## Recommendations
 
 The home screen offers Recommend, Explore, Reset Preferences, and Clean Up.
-Explore keeps the existing scan-on-open Read/Edit flow. Recommend opens the
+Explore keeps the existing scan-on-open Read/Edit flow. Its cards size to their
+contents, stay left-aligned one per row, and wrap long titles at the available
+width. Favorite and Less often use compact, accessible symbols; Not for me uses
+a dashed outline and muted title. The recommendation and activity screens retain
+their full preference labels. Recommend opens the
 chosen manga's reader immediately in Read mode; leaving its reader returns to
 feedback, where Read can reopen it. Reload and takeover continue to restore
 pending feedback without automatically entering the reader. If the initial
@@ -147,8 +151,9 @@ chapter catalog and no scan of every readable candidate up front.
 The pool filter is `all`, `normal`, or `adult`, with `all` as the default. Three
 segmented buttons select it directly, with the active choice exposed through
 `aria-pressed`. The client stores it in localStorage and submits it with each
-offer request. The server derives 18+ from an initial nonempty `[author]` prefix; it stores no
-classification flag. Explore ignores the filter. The pending offer retains the
+offer request. The server derives 18+ from an initial nonempty `[author]` prefix;
+it stores no classification flag. Explore uses its own independent All / Normal only radio
+choice, remembered in browser storage. The pending offer retains the
 filter used to produce it.
 
 `<library>/.pocket-manga-editor/_recommendations.json` contains:
@@ -208,6 +213,28 @@ drops unconfirmed writes and returns to the library. A file removed after a
 scan still fails live validation before it is served or written about, rather
 than being served from a stale path. A file added while a manga is open appears
 the next time that manga is opened from Explore or recommended afresh.
+
+## Explore activity and filtering
+
+Library responses also include `saved_activity` (`edit`, `read`, or null) for
+each manga. The server derives it from one listing of the flat metadata folder,
+without opening JSON files, inspecting export contents, or scanning source
+chapters. Only regular non-link files count. An edit file takes precedence over
+a read file; orphaned metadata does not introduce extra library titles.
+
+The browser stably groups the naturally ordered library into Editing, Reading,
+and the rest. A confirmed selection or position response updates the local
+activity marker immediately; a Reading save never demotes Editing. Unconfirmed
+writes do not change the marker. Returning to Explore therefore shows the
+updated activity without an extra library request. Initial load, Refresh, and
+controller recovery derive the markers from the metadata listing again.
+
+Search matches the whole folder name, including the author prefix,
+case-insensitively after trimming the query. It combines with Explore's
+All / Normal only filter and updates the visible count and no-results state
+locally, without server requests. Search remains while navigating within the
+page and clears on reload; the Explore filter persists separately in
+`pocket-manga-explore-pool` localStorage and defaults to `all`.
 
 ## Metadata files
 

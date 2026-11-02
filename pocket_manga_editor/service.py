@@ -15,6 +15,7 @@ from .models import LibraryScan, ScanIssue
 from .review import PositionMutation, ReviewService, SelectionMutation
 from .scanner import MangaMissingError, ScanError, scan_library, scan_manga
 from .snapshot import ImageEntry, LibraryIndex, MangaSnapshot
+from .workspace import saved_manga_activities
 from .recommendations import (
     RecommendationError,
     RecommendationStore,
@@ -200,9 +201,13 @@ class LibraryService:
 
     def _library_payload(self) -> dict[str, object]:
         library = self._library
+        activities = saved_manga_activities(library.working_directory)
         return {
             "snapshot_id": library.snapshot_id,
-            "mangas": [{"id": manga.id, "name": manga.name} for manga in library.mangas],
+            "mangas": [
+                {"id": manga.id, "name": manga.name, "saved_activity": activities.get(manga.name)}
+                for manga in library.mangas
+            ],
             "issue_count": library.issue_count,
             "recommendations": self._recommendation_payload(),
         }

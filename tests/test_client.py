@@ -348,9 +348,7 @@ class WebAssetContractTests(unittest.TestCase):
         render = self.javascript.split("function renderLibrary() {", 1)[1].split(
             "async function openManga", 1
         )[0]
-        self.assertIn(
-            "elements.librarySummary.textContent = `${state.library.length} manga`", render
-        )
+        self.assertIn("`${visible.length} of ${state.library.length} manga`", render)
         self.assertIn("openManga(manga)", render)
         self.assertNotIn("disabled", render)
         self.assertNotIn("manga-card-meta", self.javascript + self.css)

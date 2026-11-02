@@ -68,6 +68,44 @@ def recommendations_metadata_path(working_directory: str | Path) -> Path:
     return path
 
 
+def saved_manga_activities(working_directory: str | Path) -> dict[str, str]:
+    """Identify saved activity from one metadata listing, without opening JSON files."""
+
+    activities: dict[str, str] = {}
+    directory = metadata_directory(working_directory)
+    try:
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                suffix = next(
+                    (
+                        suffix
+                        for suffix in (EDITING_SUFFIX, READING_SUFFIX)
+                        if entry.name.endswith(suffix)
+                    ),
+                    None,
+                )
+                if suffix is None:
+                    continue
+                try:
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                    if os.name == "nt" and getattr(
+                        entry.stat(follow_symlinks=False), "st_file_attributes", 0
+                    ) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400):
+                        continue
+                except FileNotFoundError:
+                    continue  # A file may disappear during the listing.
+                name = entry.name[: -len(suffix)]
+                if name:
+                    if suffix == EDITING_SUFFIX:
+                        activities[name] = "edit"
+                    else:
+                        activities.setdefault(name, "read")
+    except FileNotFoundError:
+        pass  # No activity has been saved yet.
+    return activities
+
+
 def validate_live_manga_root(working_directory: str | Path, manga: MangaRef) -> tuple[Path, Path]:
     """Validate only the library and manga roots for an ordinary state load."""
 

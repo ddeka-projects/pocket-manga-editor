@@ -12,6 +12,7 @@ class Element {
     this.classList = {
       add(...names) { names.forEach((name) => classes.add(name)); },
       remove(...names) { names.forEach((name) => classes.delete(name)); },
+      contains(name) { return classes.has(name); },
       toggle(name, force = !classes.has(name)) {
         if (force) classes.add(name); else classes.delete(name);
       },

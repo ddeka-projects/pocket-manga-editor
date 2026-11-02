@@ -128,9 +128,30 @@
             </button>
           </header>
 
-          <div id="library-summary" class="library-summary" aria-live="polite"></div>
+          <div class="library-controls">
+            <label class="library-search" for="library-search">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5" /><path d="m16 16 4.5 4.5" /></svg>
+              <span class="sr-only">Search manga titles and authors</span>
+              <input id="library-search" type="search" placeholder="Search titles or [author]" autocomplete="off" autocapitalize="none" spellcheck="false">
+            </label>
+            <div class="library-results">
+              <div id="library-summary" class="library-summary" aria-live="polite"></div>
+              <fieldset class="explore-pool">
+                <legend class="sr-only">Explore 18+ visibility</legend>
+                <label>
+                  <input id="explore-all" class="sr-only" name="explore-pool" type="radio" value="all" checked>
+                  <span>All</span>
+                </label>
+                <label>
+                  <input id="explore-normal" class="sr-only" name="explore-pool" type="radio" value="normal">
+                  <span>Normal only</span>
+                </label>
+              </fieldset>
+            </div>
+          </div>
           <div id="library-notice" class="notice" role="status" hidden></div>
           <div id="library-list" class="manga-list" role="list"></div>
+          <p id="library-no-results" class="library-no-results" hidden>No manga match your search and filter.</p>
 
           <div id="library-empty" class="empty-state" hidden>
             <span class="empty-glyph" aria-hidden="true">&#9638;</span>

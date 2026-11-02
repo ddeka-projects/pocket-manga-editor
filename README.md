@@ -134,12 +134,29 @@ Reinstall the task after changing setup scripts or moving the repository.
 ## Web application
 
 The home screen offers **Recommend**, **Explore**, **Reset Preferences**, and
-**Clean Up**. Explore lists the manga folder names, one per row with long names
-wrapped onto extra lines, and shows **N manga**. The server
+**Clean Up**. Explore shows compact, left-aligned title cards, one per row.
+Cards grow to fit their title and indicators up to the available width, with
+long names wrapping onto extra lines. The server
 reads the library folder's names when it starts, and the top-right button
 lists them again, so adding, removing, or renaming a manga folder needs a
 Refresh. Listing names only is quick even for a large library, because no
 chapter or image is inspected at this point.
+
+Explore puts manga with saved **Editing** activity first, then **Reading**,
+then the remaining titles. Each group keeps the case-insensitive natural name
+order. A title with both `<manga>.edit.json` and `<manga>.read.json` appears once,
+with Editing taking precedence. These labels mean saved activity, not a live
+session: they appear after the first confirmed position or selection save and
+remain while that metadata file exists. Returning from the reader updates
+the label and ordering without another source scan.
+
+Search filters the entire folder name, including `[author]`, as you type,
+ignoring case and surrounding spaces. The compact **All / Normal only** radio
+control includes or hides 18+ titles; **All** is the default and the choice is
+remembered per browser. This is independent of the recommendation pool. The
+count shows **N manga**, or **N of M manga** when a search or filter is active.
+Search and ordering run locally and keep their state while you visit a manga
+and return; search clears on a page reload.
 
 Tapping a manga scans that manga's entry folders and images on the PC. This
 happens every time you open it from Explore, so chapters added since
@@ -183,11 +200,14 @@ The recommendation pool uses three directly tappable options: **All**
 (the default), **Normal only**, and **18+ only**. A manga is 18+ when its exact
 folder name starts with a nonempty `[author]` prefix, such as
 `[Kino Hitoshi] Sample name`.
-Explore always shows all titles. Each browser or Home Screen installation
-remembers its own filter; Reset Preferences leaves it unchanged.
+Each browser or Home Screen installation remembers its own recommendation
+filter; Reset Preferences leaves it unchanged. Explore has its own independent
+All / Normal only control.
 
-Explore shows Favorite in green, Less often in amber, and Not for me in red.
-An independent violet **18+** badge can appear alongside these states. Open a
+Explore shows Favorite as a green **★**, Less often as a muted coral **↓**, and
+Not for me with a red dashed outline and a muted, readable title. The symbols
+have accessible descriptions. Compact **Editing** / **Reading** and violet
+**18+** labels can appear alongside them. Open a
 title's Read/Edit menu to change or remove its recommendation preferences,
 including restoring a Not for me title.
 
@@ -369,7 +389,7 @@ need verification on Windows and the phone.
 
 The suite covers scanning and ordering, reading/editing persistence, safe path
 handling, the export companion and its installation, token ownership, HTTP/API
-security, image delivery, recommendation weighting and recovery, cleanup, and
-web-client behavior. Optional JavaScript behavior
-checks use Node.js on Windows or JavaScriptCore on macOS; the app itself requires
-neither runtime.
+security, image delivery, recommendation weighting and recovery, cleanup,
+Explore search/filtering and saved-activity ordering, and web-client behavior.
+Optional JavaScript behavior checks use Node.js on Windows or JavaScriptCore on
+macOS; the app itself requires neither runtime.

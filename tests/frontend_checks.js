@@ -47,9 +47,60 @@ async function checks() {
   assert(intervals === 0, "Ownership never creates background polling");
 
   await openMangaChecks();
+  exploreChecks();
   await recommendationChecks();
   await recommendedReaderChecks();
   await transientSaveChecks();
+}
+
+function exploreChecks() {
+  const { state, applyLibraryPayload, visibleMangas, renderLibrary, selectExplorePool, readExplorePool, showLibrary } = client;
+  const mangas = [
+    { id: "adult", name: "[Kino] Night", saved_activity: "read" },
+    { id: "short", name: "A Short", saved_activity: null },
+    { id: "edit2", name: "Edit 2", saved_activity: "edit" },
+    { id: "edit10", name: "Edit 10", saved_activity: "edit" },
+    { id: "reading", name: "Reading 1", saved_activity: "read" },
+    { id: "plain", name: "Z Plain", saved_activity: null },
+  ];
+  applyLibraryPayload({ mangas, recommendations: { pending: null, preferences: {
+    "Edit 2": { favorite: true }, "Edit 10": { not_for_me: true }, "[Kino] Night": { less_often: true },
+  } } });
+  transport = async () => { throw new Error("Explore filters must not request the server"); };
+  const titles = () => visibleMangas().map((manga) => manga.name).join(",");
+  const renderedCard = (index) => element("library-list").children[index].children[0];
+  const renderedContents = (index) => renderedCard(index).children[0];
+  assert(titles() === "Edit 2,Edit 10,[Kino] Night,Reading 1,A Short,Z Plain", "Editing, Reading, Rest groups preserve natural name order");
+  showLibrary();
+  assert(element("library-summary").textContent === "6 manga", "Unfiltered Explore shows the full count");
+  const editingDetails = renderedContents(0).children[1];
+  assert(editingDetails.children[0].children[0].textContent === "Editing", "Saved Edit activity has one compact label");
+  assert(editingDetails.children[1].children[0].textContent === "★" && editingDetails.children[1].children[0].getAttribute("aria-label") === "Favorite", "Favorite is a star with an accessible description");
+  assert(renderedCard(1).classList.contains("is-excluded"), "Not for me uses its own card style");
+  const adultDetails = renderedContents(2).children[1];
+  assert(adultDetails.children[0].children.map((label) => label.textContent).join(",") === "Reading,18+", "Activity and adult labels coexist");
+  assert(adultDetails.children[1].children[0].getAttribute("aria-label") === "Less often", "The Less often symbol is named for accessibility");
+  assert(renderedContents(4).children.length === 1, "A plain title has no empty indicator row");
+
+  state.librarySearch = "  [KINO]  ";
+  renderLibrary();
+  assert(titles() === "[Kino] Night" && element("library-summary").textContent === "1 of 6 manga", "Search includes the author prefix and ignores case and outer spaces");
+  let remembered;
+  window.localStorage.setItem = (key, value) => { remembered = [key, value]; };
+  selectExplorePool("normal");
+  assert(visibleMangas().length === 0 && !element("library-no-results").hidden && element("library-empty").hidden, "Hiding 18+ also hides adult search matches without claiming the library is empty");
+  assert(remembered[0] === "pocket-manga-explore-pool" && remembered[1] === "normal", "Explore remembers its own filter");
+  assert(state.recommendationFilter === "all", "Explore filtering does not change the recommendation pool");
+  state.librarySearch = "";
+  renderLibrary();
+  assert(visibleMangas().length === 5 && element("explore-normal").checked, "Normal only excludes adult titles");
+  window.localStorage.getItem = () => "normal";
+  assert(readExplorePool() === "normal", "Explore restores its remembered radio choice");
+  window.localStorage.getItem = () => { throw new Error("Storage unavailable"); };
+  assert(readExplorePool() === "all", "Explore defaults to All if storage is unavailable");
+  selectExplorePool("all");
+  window.localStorage.getItem = () => null;
+  applyLibraryPayload({ mangas: [], recommendations: { pending: null, preferences: {} } });
 }
 
 async function recommendedReaderChecks() {
@@ -196,7 +247,8 @@ async function transientSaveChecks() {
     await settle();
   };
   const banner = () => element("action-error-title").textContent;
-  const position = () => ({ activity: "read", folderId: "folder", imageId: "page-19", epoch: state.activityEpoch, ownershipEpoch: state.controllerEpoch });
+  const position = () => ({ activity: "read", mangaId: "saved", folderId: "folder", imageId: "page-19", epoch: state.activityEpoch, ownershipEpoch: state.controllerEpoch });
+  state.library = [{ id: "saved", name: "Saved Manga", savedActivity: null }];
   state.ownsControl = true;
   state.controllerToken = "replacement-token";
   element("action-error-title").textContent = "";
@@ -212,9 +264,11 @@ async function transientSaveChecks() {
   await ensurePositionFlush();
   assert(!state.connectionInterrupted && banner() === "", "A missed position save does not interrupt reading");
   assert(state.positionQueue.size === 1, "The latest position is kept for a quiet retry");
+  assert(state.library[0].savedActivity === null, "A failed position save does not claim Reading has been saved");
   online = true;
   await runRetryTimers();
   assert(sent === 2 && state.positionQueue.size === 0, "The position is saved by the quiet retry");
+  assert(state.library[0].savedActivity === "read", "A confirmed position updates the Explore activity without another request");
 
   online = false;
   state.positionQueue.set("read:manga", position());
@@ -223,7 +277,7 @@ async function transientSaveChecks() {
   timers.length = 0;
 
   state.activity = "edit";
-  const folder = { id: "folder", revision: 0, images: [], selectedCount: 0 };
+  const folder = { id: "folder", mangaId: "saved", revision: 0, images: [], selectedCount: 0 };
   const blip = { id: "blip-page", selected: false };
   let failures = 1;
   transport = async () => {
@@ -236,8 +290,14 @@ async function transientSaveChecks() {
   await setSelection(folder, blip, true, state.activityEpoch);
   assert(state.selectionPending.has("blip-page"), "A selection stays pending during its quiet retry");
   assert(!state.connectionInterrupted && banner() === "", "One failed selection attempt shows no banner");
+  assert(state.library[0].savedActivity === "read", "An unconfirmed selection does not change the activity label");
   await runRetryTimers();
   assert(!state.selectionPending.has("blip-page") && blip.selected, "The quiet retry confirms the selection");
+  assert(state.library[0].savedActivity === "edit", "A confirmed selection promotes the title to Editing");
+  transport = async () => reply({ ok: true, position: {} });
+  state.positionQueue.set("read:saved", position());
+  await ensurePositionFlush();
+  assert(state.library[0].savedActivity === "edit", "Saving Reading later never demotes a title that also has Editing data");
   assert(banner() === "", "A recovered selection never showed a banner");
 
   const down = { id: "down-page", selected: false };
