@@ -156,8 +156,10 @@ Once scanned, the manga presents two actions:
 
 ### Recommendations and preferences
 
-**Recommend** chooses a readable title using your preferences, then presents
-**Read**, an independent **Favorite** toggle, and these feedback options:
+**Recommend** chooses a readable title using your preferences and immediately
+opens its reader. Tap the reader's back arrow to reach its feedback screen,
+which offers **Read** to continue reading, an independent **Favorite** toggle,
+and these feedback options:
 
 | Choice | Effect |
 | --- | --- |
@@ -177,9 +179,10 @@ screen. Reloading, restarting the server, or taking control from another page
 also restores any pending feedback. A renamed or removed title can still
 receive feedback even though it can no longer be opened.
 
-The recommendation pool selector offers **All titles** (the default),
-**Normal only**, and **18+ only**. A manga is 18+ when its exact folder name
-starts with a nonempty `[author]` prefix, such as `[Kino Hitoshi] Sample name`.
+The recommendation pool uses three directly tappable options: **All**
+(the default), **Normal only**, and **18+ only**. A manga is 18+ when its exact
+folder name starts with a nonempty `[author]` prefix, such as
+`[Kino Hitoshi] Sample name`.
 Explore always shows all titles. Each browser or Home Screen installation
 remembers its own filter; Reset Preferences leaves it unchanged.
 

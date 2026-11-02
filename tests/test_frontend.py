@@ -25,7 +25,8 @@ class FrontendTests(unittest.TestCase):
             "  globalThis.client = { state, acquireController, loseControl,"
             " requestJson, ensurePositionFlush, drainPendingMutations, setSelection, openManga,"
             " recommendationAction, showHome, showLibrary, showRecommendation, historyChanged,"
-            " applyLibraryPayload, readRecommendationFilter };",
+            " applyLibraryPayload, readRecommendationFilter, selectRecommendationFilter,"
+            " requestRecommendation, readRecommendation, navigateBackAfterMutations };",
         )
         checks = "\n".join(
             (

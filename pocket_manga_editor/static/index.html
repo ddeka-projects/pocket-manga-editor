@@ -51,12 +51,12 @@
           <div class="menu-card">
             <p class="eyebrow">Pocket Manga</p>
             <h1 id="home-title">What would you like to read?</h1>
-            <label class="filter-label" for="recommendation-filter">Recommendation pool</label>
-            <select id="recommendation-filter" class="filter-select">
-              <option value="all">All titles</option>
-              <option value="normal">Normal only</option>
-              <option value="adult">18+ only</option>
-            </select>
+            <p id="recommendation-pool-label" class="filter-label">Recommendation pool</p>
+            <div id="recommendation-filter" class="segmented-control" role="group" aria-labelledby="recommendation-pool-label">
+              <button id="filter-all" type="button" aria-pressed="true">All</button>
+              <button id="filter-normal" type="button" aria-pressed="false">Normal only</button>
+              <button id="filter-adult" type="button" aria-pressed="false">18+ only</button>
+            </div>
             <div class="menu-actions">
               <button id="recommend" class="primary-button" type="button">Recommend</button>
               <button id="explore" class="secondary-button" type="button">Explore</button>
@@ -71,7 +71,7 @@
             <p class="eyebrow">Your recommendation</p>
             <h1 id="recommendation-title" tabindex="-1"></h1>
             <div id="recommendation-badges" class="title-badges"></div>
-            <p class="menu-description">Read now or choose an outcome. Resolve this recommendation to continue.</p>
+            <p class="menu-description">Continue reading or choose an outcome. Resolve this recommendation to continue.</p>
             <div class="menu-actions">
               <button id="recommendation-read" class="primary-button" type="button">Read</button>
               <button id="recommendation-favorite" class="secondary-button" type="button" aria-pressed="false">Favorite</button>
@@ -90,7 +90,10 @@
 
         <section id="cleanup-screen" class="screen menu-screen" hidden aria-labelledby="cleanup-title">
           <div class="menu-card">
-            <button id="cleanup-back" class="secondary-button" type="button">← Home</button>
+            <button id="cleanup-back" class="secondary-button navigation-back" type="button">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 18-6-6 6-6" /></svg>
+              Home
+            </button>
             <p class="eyebrow">Recommendation preferences</p>
             <h1 id="cleanup-title">Clean Up</h1>
             <p class="menu-description">These titles no longer have a folder in your library. Choose the recommendation records to remove. Reading and editing files are kept. No backup is created.</p>
@@ -101,6 +104,12 @@
         </section>
 
         <section id="library-screen" class="screen library-screen" hidden aria-labelledby="library-title">
+          <div class="library-navigation">
+            <button id="explore-back" class="secondary-button navigation-back" type="button">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 18-6-6 6-6" /></svg>
+              Home
+            </button>
+          </div>
           <header class="library-header">
             <div>
               <p class="eyebrow">Pocket Manga</p>
@@ -119,7 +128,6 @@
             </button>
           </header>
 
-          <button id="explore-back" class="quiet-button" type="button">← Home</button>
           <div id="library-summary" class="library-summary" aria-live="polite"></div>
           <div id="library-notice" class="notice" role="status" hidden></div>
           <div id="library-list" class="manga-list" role="list"></div>
@@ -141,12 +149,12 @@
           <div class="activity-card">
             <button
               id="back-to-library"
-              class="activity-back secondary-button"
+              class="secondary-button navigation-back"
               type="button"
-              aria-label="Back to library"
+              aria-label="Back to Explore"
             >
-              <span aria-hidden="true">&larr;</span>
-              Library
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 18-6-6 6-6" /></svg>
+              Explore
             </button>
             <p class="eyebrow">Choose an activity</p>
             <h1 id="activity-title" tabindex="-1">Manga</h1>

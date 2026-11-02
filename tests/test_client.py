@@ -218,7 +218,7 @@ class WebAssetContractTests(unittest.TestCase):
         self.assertIn("Read without image-selection controls.", self.html)
         self.assertIn("Review and select images for export.", self.html)
         self.assertIn('id="activity-title" tabindex="-1"', self.html)
-        self.assertIn('aria-label="Back to library"', self.html)
+        self.assertIn('aria-label="Back to Explore"', self.html)
         self.assertIn("showActivityChoice(manga", self.javascript)
         self.assertIn("chooseActivity(READ)", self.javascript)
         self.assertIn("chooseActivity(EDIT)", self.javascript)
@@ -338,9 +338,9 @@ class WebAssetContractTests(unittest.TestCase):
             self.javascript,
         )
 
-        apply_library = self.javascript.split("function applyLibraryPayload(payload) {", 1)[
-            1
-        ].split("function normalizeMangaSummary", 1)[0]
+        apply_library = self.javascript.split("function applyLibraryPayload(payload,", 1)[1].split(
+            "function normalizeMangaSummary", 1
+        )[0]
         self.assertIn("state.snapshotId = payload.snapshot_id", apply_library)
         self.assertIn('showHome({ historyMode: "replace" })', apply_library)
 

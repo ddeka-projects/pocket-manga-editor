@@ -48,7 +48,70 @@ async function checks() {
 
   await openMangaChecks();
   await recommendationChecks();
+  await recommendedReaderChecks();
   await transientSaveChecks();
+}
+
+async function recommendedReaderChecks() {
+  const { state, selectRecommendationFilter, requestRecommendation, readRecommendation, navigateBackAfterMutations } = client;
+  let remembered;
+  window.localStorage.setItem = (key, value) => { remembered = [key, value]; };
+  selectRecommendationFilter("adult");
+  assert(state.recommendationFilter === "adult" && remembered[1] === "adult", "One tap chooses and remembers the pool");
+  assert(element("filter-adult").getAttribute("aria-pressed") === "true" && element("filter-all").getAttribute("aria-pressed") === "false", "The pool exposes exactly one active option");
+
+  const pending = { id: "direct-offer", manga: "[Author] Direct", manga_id: "m_direct", filter: "adult" };
+  const requests = [];
+  transport = async (path, options) => {
+    requests.push(path);
+    if (path === "/api/recommendations/offer") {
+      assert(JSON.parse(options.body).filter === "adult", "Recommend submits the selected pool");
+      return reply({ ok: true, snapshot_id: "direct-snapshot", mangas: [{ id: "m_direct", name: pending.manga }], recommendations: { pending, preferences: {} } });
+    }
+    if (path === "/api/manga/m_direct?activity=read") {
+      return reply({ ok: true, activity: "read", manga: { id: "m_direct", name: pending.manga, current_folder_id: "f_direct", current_image_id: "i_saved", folders: [{ id: "f_direct", name: "Chapter 3" }] } });
+    }
+    if (path === "/api/folder/f_direct?activity=read") {
+      return reply({ ok: true, activity: "read", folder: { id: "f_direct", current_image_id: "i_saved", name: "Chapter 3", images: [{ id: "i_first", name: "1.jpg" }, { id: "i_saved", name: "2.jpg" }] } });
+    }
+    if (path === "/api/image/i_saved") {
+      return { ok: true, headers: { get: () => "image/jpeg" }, blob: async () => ({}) };
+    }
+    throw new Error(`Unexpected request: ${path}`);
+  };
+  const serveReader = transport;
+  await requestRecommendation();
+  assert(!element("reader-screen").hidden && element("recommendation-screen").hidden, "Recommend goes straight into the reader");
+  assert(state.activity === "read" && state.currentImageIndex === 1, "Recommended reading resumes its saved Read position");
+  assert(requests.slice(0, 3).join(",") === "/api/recommendations/offer,/api/manga/m_direct?activity=read,/api/folder/f_direct?activity=read", "Recommend opens Read without a separate click or redundant scan");
+  assert(state.recommendations.pending && element("back-to-activities").getAttribute("aria-label") === "Back to recommendation feedback", "Opening the reader keeps feedback pending");
+
+  await navigateBackAfterMutations();
+  assert(element("reader-screen").hidden && !element("recommendation-screen").hidden, "The reader back arrow opens feedback");
+  await readRecommendation();
+  assert(!element("reader-screen").hidden, "Read on feedback can reopen the reader");
+  await navigateBackAfterMutations();
+
+  // A failed initial reader request must still leave a usable feedback screen.
+  transport = async (path) => {
+    if (path === "/api/recommendations/offer") return reply({ ok: true, mangas: [{ id: "m_direct", name: pending.manga }], recommendations: { pending, preferences: {} } });
+    throw new Error("Wi-Fi interrupted while opening Read");
+  };
+  await requestRecommendation();
+  assert(!element("recommendation-screen").hidden && !element("action-error").hidden, "A failed reader launch preserves feedback and offers retry");
+  assert(!state.recommendationBusy && state.recommendations.pending.id === pending.id, "A failed reader launch does not resolve feedback");
+
+  transport = async (path, options) => {
+    if (path === "/api/folder/f_direct?activity=read") throw new Error("Folder request interrupted");
+    return serveReader(path, options);
+  };
+  await requestRecommendation();
+  assert(!element("recommendation-screen").hidden && typeof state.actionRetry === "function", "A failed initial folder request also leaves a usable retry");
+  transport = serveReader;
+  await state.actionRetry();
+  assert(!element("reader-screen").hidden, "Retry after a folder failure reopens Read successfully");
+  await navigateBackAfterMutations();
+  client.applyLibraryPayload({ mangas: [], recommendations: { pending: null, preferences: {} } });
 }
 
 async function recommendationChecks() {
@@ -87,7 +150,7 @@ async function recommendationChecks() {
 
   applyLibraryPayload({ mangas: [], recommendations: { pending: { ...pending, manga_id: null }, preferences } });
   assert(!element("recommendation-screen").hidden && element("recommendation-read").hidden, "Removed pending title still offers feedback without Read");
-  assert(client.readRecommendationFilter() === "all", "The filter defaults to All titles");
+  assert(client.readRecommendationFilter() === "all", "The filter defaults to All");
   window.localStorage.getItem = () => "adult";
   assert(client.readRecommendationFilter() === "adult", "The filter is browser-local");
   window.localStorage.getItem = () => { throw new Error("Storage disabled"); };

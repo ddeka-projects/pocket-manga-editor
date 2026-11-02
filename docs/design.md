@@ -113,9 +113,12 @@ cannot split one of those operations midway through its commit.
 ## Recommendations
 
 The home screen offers Recommend, Explore, Reset Preferences, and Clean Up.
-Explore keeps the existing scan-on-open Read/Edit flow. Recommend opens a
-read-only recommendation; leaving its reader returns to feedback. The server
-allows only that manga's Read activity while feedback is pending, rejects
+Explore keeps the existing scan-on-open Read/Edit flow. Recommend opens the
+chosen manga's reader immediately in Read mode; leaving its reader returns to
+feedback, where Read can reopen it. Reload and takeover continue to restore
+pending feedback without automatically entering the reader. If the initial
+reader load fails, feedback remains accessible and Read can be retried. The
+server allows only that manga's Read activity while feedback is pending, rejects
 rescans and preference maintenance, and allows its independent Favorite toggle.
 The library endpoint remains available so reload and controller takeover can
 recover authoritative pending state. Feedback never requires a source folder,
@@ -141,9 +144,10 @@ publishes the new library IDs and persists pending feedback. This keeps failed
 recommendation attempts from invalidating Explore's IDs. There is no persistent
 chapter catalog and no scan of every readable candidate up front.
 
-The pool filter is `all`, `normal`, or `adult`, with `all` as the default. The
-client stores it in localStorage and submits it with each offer request. The
-server derives 18+ from an initial nonempty `[author]` prefix; it stores no
+The pool filter is `all`, `normal`, or `adult`, with `all` as the default. Three
+segmented buttons select it directly, with the active choice exposed through
+`aria-pressed`. The client stores it in localStorage and submits it with each
+offer request. The server derives 18+ from an initial nonempty `[author]` prefix; it stores no
 classification flag. Explore ignores the filter. The pending offer retains the
 filter used to produce it.
 

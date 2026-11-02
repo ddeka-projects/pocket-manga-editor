@@ -78,7 +78,7 @@ def compute_weight(preferences: dict, now: datetime) -> float:
 
 def pick_title(names: list[str], state: dict, filter_value: str, now: datetime) -> str | None:
     if filter_value not in FILTERS:
-        raise RecommendationError("Choose All titles, Normal only, or 18+ only.", status=400)
+        raise RecommendationError("Choose All, Normal only, or 18+ only.", status=400)
     candidates = []
     weights = []
     for name in names:

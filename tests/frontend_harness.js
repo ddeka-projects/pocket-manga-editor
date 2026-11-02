@@ -6,6 +6,8 @@ class Element {
     this.disabled = false;
     this.textContent = "";
     this.children = [];
+    this.dataset = {};
+    this.attributes = new Map();
     const classes = new Set();
     this.classList = {
       add(...names) { names.forEach((name) => classes.add(name)); },
@@ -18,7 +20,8 @@ class Element {
   append(...children) { this.children.push(...children); }
   replaceChildren(...children) { this.children = children; }
   removeAttribute() {}
-  setAttribute() {}
+  setAttribute(name, value) { this.attributes.set(name, value); }
+  getAttribute(name) { return this.attributes.get(name); }
   addEventListener() {}
   focus() {}
 }
@@ -51,6 +54,7 @@ globalThis.Headers = class {
 };
 let transport;
 globalThis.fetch = (...args) => transport(...args);
+globalThis.URL = { createObjectURL: () => "blob:test-image", revokeObjectURL() {} };
 function reply(body, status = 200) {
   return { status, ok: status < 400, headers: { get: () => "application/json" }, json: async () => body };
 }
