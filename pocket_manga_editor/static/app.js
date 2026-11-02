@@ -1086,7 +1086,7 @@
       if (authorPrefix) {
         const author = document.createElement("span");
         author.className = "author-tag";
-        author.textContent = authorPrefix[0];
+        author.textContent = authorPrefix[0].slice(1, -1);
         const name = document.createElement("span");
         name.textContent = manga.name.slice(authorPrefix[0].length);
         title.append(author, name);
