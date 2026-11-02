@@ -1082,7 +1082,17 @@
       const text = document.createElement("span");
       const title = document.createElement("span");
       title.className = "manga-card-title";
-      title.textContent = manga.name;
+      const authorPrefix = manga.name.match(/^\[[^\[\]]+\]/);
+      if (authorPrefix) {
+        const author = document.createElement("span");
+        author.className = "author-tag";
+        author.textContent = authorPrefix[0];
+        const name = document.createElement("span");
+        name.textContent = manga.name.slice(authorPrefix[0].length);
+        title.append(author, name);
+      } else {
+        title.textContent = manga.name;
+      }
       text.append(title);
       const details = document.createElement("span");
       details.className = "manga-card-details";
@@ -1091,7 +1101,7 @@
       if (manga.savedActivity) {
         cardIndicator(labels, manga.savedActivity === EDIT ? "Editing" : "Reading", `activity-label activity-${manga.savedActivity}`);
       }
-      const adult = /^\[[^\[\]]+\]/.test(manga.name);
+      const adult = Boolean(authorPrefix);
       if (adult) cardIndicator(labels, "18+", "adult-label");
       const symbols = document.createElement("span");
       symbols.className = "manga-card-symbols";

@@ -506,7 +506,6 @@ select:focus-visible {
 .manga-list {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
-  justify-items: start;
   max-width: 720px;
   margin: 0 auto;
   gap: 0.45rem;
@@ -517,7 +516,7 @@ select:focus-visible {
 .manga-card {
   position: relative;
   display: block;
-  width: fit-content;
+  width: 100%;
   max-width: 100%;
   min-height: 44px;
   padding: 0.55rem 0.75rem 0.55rem 0.85rem;
@@ -555,6 +554,20 @@ select:focus-visible {
   line-height: 1.25;
   /* Long names wrap onto more lines instead of being cut off. */
   overflow-wrap: anywhere;
+}
+
+.author-tag {
+  display: inline-block;
+  max-width: 100%;
+  padding: 0.08rem 0.4rem;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: rgb(255 255 255 / 5%);
+  color: var(--muted-strong);
+  font-size: 0.75rem;
+  font-weight: 550;
+  line-height: 1.4;
+  vertical-align: 0.05em;
 }
 
 .manga-card-details {

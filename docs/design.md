@@ -113,9 +113,9 @@ cannot split one of those operations midway through its commit.
 ## Recommendations
 
 The home screen offers Recommend, Explore, Reset Preferences, and Clean Up.
-Explore keeps the existing scan-on-open Read/Edit flow. Its cards size to their
-contents, stay left-aligned one per row, and wrap long titles at the available
-width. Favorite and Less often use compact, accessible symbols; Not for me uses
+Explore keeps the existing scan-on-open Read/Edit flow. Its cards fill the list
+width, stay compact in height, and grow taller as long titles wrap or indicators
+require more space. Favorite and Less often use compact, accessible symbols; Not for me uses
 a dashed outline and muted title. The recommendation and activity screens retain
 their full preference labels. Recommend opens the
 chosen manga's reader immediately in Read mode; leaving its reader returns to

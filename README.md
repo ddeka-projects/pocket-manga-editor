@@ -134,9 +134,10 @@ Reinstall the task after changing setup scripts or moving the repository.
 ## Web application
 
 The home screen offers **Recommend**, **Explore**, **Reset Preferences**, and
-**Clean Up**. Explore shows compact, left-aligned title cards, one per row.
-Cards grow to fit their title and indicators up to the available width, with
-long names wrapping onto extra lines. The server
+**Clean Up**. Explore shows full-width title cards, one per row, with compact
+padding and heights that grow only as needed for their contents. Long names
+wrap onto extra lines. An initial `[author]` prefix appears as a
+smaller rounded tag before the title. The server
 reads the library folder's names when it starts, and the top-right button
 lists them again, so adding, removing, or renaming a manga folder needs a
 Refresh. Listing names only is quick even for a large library, because no
