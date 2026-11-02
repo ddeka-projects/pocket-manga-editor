@@ -204,6 +204,7 @@ class LibraryService:
         activities = saved_manga_activities(library.working_directory)
         return {
             "snapshot_id": library.snapshot_id,
+            "library_path": str(library.working_directory),
             "mangas": [
                 {"id": manga.id, "name": manga.name, "saved_activity": activities.get(manga.name)}
                 for manga in library.mangas

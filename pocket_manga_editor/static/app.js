@@ -35,6 +35,7 @@
   const elements = Object.freeze({
     stateScreen: element("state-screen"),
     homeScreen: element("home-screen"),
+    libraryPath: element("library-path"),
     recommendationScreen: element("recommendation-screen"),
     cleanupScreen: element("cleanup-screen"),
     recommendationTitle: element("recommendation-title"),
@@ -354,7 +355,7 @@
     elements.activityScreen.hidden = true;
     elements.readerScreen.hidden = true;
     screen.hidden = false;
-    document.title = "Pocket Manga";
+    document.title = "Pocket Manga Editor";
     setHistory({ view: historyView }, historyMode);
     updateControllerControls();
   }
@@ -682,7 +683,7 @@
 
   async function bootstrap() {
     showState({
-      kicker: "Pocket Manga",
+      kicker: "Pocket Manga Editor",
       title: "Connecting to your PC",
       message: "Opening your library…",
       loading: true,
@@ -693,7 +694,7 @@
   async function acquireController({ takeover = false, quiet = false } = {}) {
     if (!quiet) {
       showState({
-        kicker: "Pocket Manga",
+        kicker: "Pocket Manga Editor",
         title: takeover ? "Taking control" : "Opening your library",
         message: takeover
           ? "Waiting for any active save to finish…"
@@ -738,7 +739,7 @@
         showOccupied();
       } else {
         showUnavailable(
-          friendlyMessage(error, "The Pocket Manga server could not be reached."),
+          friendlyMessage(error, "The Pocket Manga Editor server could not be reached."),
           () => acquireController({ takeover }),
         );
       }
@@ -880,7 +881,7 @@
       announce("Connection interrupted. Current screen retained.");
       return;
     }
-    showUnavailable(friendlyMessage(error, "The Pocket Manga server could not be reached."), retry);
+    showUnavailable(friendlyMessage(error, "The Pocket Manga Editor server could not be reached."), retry);
   }
 
   function hasVisibleAppView() {
@@ -900,7 +901,7 @@
     state.controllerToken = null;
     showState({
       kicker: "Controller in use",
-      title: "Pocket Manga is open elsewhere",
+      title: "Pocket Manga Editor is open elsewhere",
       message: "Another tab or device currently controls this library.",
       loading: false,
       actionLabel: "Take Control",
@@ -919,7 +920,7 @@
       action: retry,
       detail: "Confirm the PC is awake, the server is running, and both devices use the same local network.",
     });
-    announce("Pocket Manga is unavailable.");
+    announce("Pocket Manga Editor is unavailable.");
   }
 
   function showState({ kicker, title, message, loading, actionLabel = "", action = null, detail = "" }) {
@@ -1020,6 +1021,7 @@
   }
 
   function applyLibraryPayload(payload, { show = true } = {}) {
+    elements.libraryPath.textContent = String(payload.library_path || "");
     if (payload.snapshot_id) {
       state.snapshotId = payload.snapshot_id;
     }
@@ -1193,7 +1195,7 @@
     elements.activityScreen.hidden = true;
     elements.readerScreen.hidden = true;
     elements.libraryScreen.hidden = false;
-    document.title = "Library · Pocket Manga";
+    document.title = "Library · Pocket Manga Editor";
     clearReaderMedia();
     setHistory({ view: "library" }, historyMode);
   }
@@ -1230,7 +1232,7 @@
     elements.libraryScreen.hidden = true;
     elements.readerScreen.hidden = true;
     elements.activityScreen.hidden = false;
-    document.title = `${manga.name} · Pocket Manga`;
+    document.title = `${manga.name} · Pocket Manga Editor`;
     setHistory({ view: "activity", manga_id: manga.id }, historyMode);
     window.setTimeout(() => elements.activityTitle.focus(), 20);
   }
@@ -1520,7 +1522,7 @@
       clearSelectionPresentation();
     }
     const mangaName = state.currentManga ? state.currentManga.name : "Reader";
-    document.title = `${mangaName} · ${editing ? "Edit" : "Read"} · Pocket Manga`;
+    document.title = `${mangaName} · ${editing ? "Edit" : "Read"} · Pocket Manga Editor`;
   }
 
   function showImage(index, { persist = true } = {}) {

@@ -292,14 +292,47 @@ select:focus-visible {
   margin: clamp(1rem, 8vh, 5rem) auto;
 }
 
-.menu-card h1 {
+.menu-card h1,
+.recommendation-heading {
   margin: 0 0 1.3rem;
   font-size: clamp(1.7rem, 7vw, 2.5rem);
   line-height: 1.15;
   overflow-wrap: anywhere;
 }
 
+.menu-card .app-title {
+  margin-bottom: 1rem;
+  font-size: 1.45rem;
+  font-weight: 750;
+  line-height: 1.25;
+}
+
 .menu-actions { display: grid; gap: 0.8rem; margin: 1.2rem 0; }
+.home-maintenance { margin-top: 1.8rem; }
+.home-maintenance h2 {
+  margin: 0 0 0.65rem;
+  color: var(--muted);
+  font-size: 0.8rem;
+  font-weight: 650;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.maintenance-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.5rem; }
+.maintenance-actions button { padding: 0.65rem 0.75rem; font-size: 0.9rem; font-weight: 500; }
+.home-footer { margin-top: 1.5rem; }
+.library-location {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 0.3rem 0.9rem;
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.8rem;
+  line-height: 1.5;
+}
+
+.library-location dt { font-weight: 600; }
+.library-location dd { margin: 0; overflow-wrap: anywhere; }
 .menu-description { color: var(--muted-strong); line-height: 1.5; }
 .filter-label { display: block; margin: 1.5rem 0 0.6rem; color: var(--muted-strong); }
 .segmented-control {

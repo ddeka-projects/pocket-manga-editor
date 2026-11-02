@@ -112,7 +112,9 @@ cannot split one of those operations midway through its commit.
 
 ## Recommendations
 
-The home screen offers Recommend, Explore, Reset Preferences, and Clean Up.
+The home screen offers Recommend and Explore, followed by Maintenance with
+Reset Preferences and Clean Up side by side. The footer displays the absolute
+library path from the controller-protected library response (`library_path`).
 Explore keeps the existing scan-on-open Read/Edit flow. Its cards fill the list
 width, stay compact in height, and grow taller as long titles wrap or indicators
 require more space. Favorite and Less often use compact, accessible symbols; Not for me uses

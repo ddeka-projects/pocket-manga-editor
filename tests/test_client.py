@@ -382,7 +382,7 @@ class WebAssetContractTests(unittest.TestCase):
         self.assertEqual(manifest["id"], "/")
         self.assertEqual(manifest["start_url"], "/")
         self.assertEqual(manifest["display"], "standalone")
-        self.assertEqual(manifest["name"], "Pocket Manga")
+        self.assertEqual(manifest["name"], "Pocket Manga Editor")
         self.assertEqual(manifest["background_color"], "#050706")
         self.assertEqual(manifest["theme_color"], "#050706")
 

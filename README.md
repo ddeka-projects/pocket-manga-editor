@@ -133,8 +133,10 @@ Reinstall the task after changing setup scripts or moving the repository.
 
 ## Web application
 
-The home screen offers **Recommend**, **Explore**, **Reset Preferences**, and
-**Clean Up**. Explore shows full-width title cards, one per row, with compact
+The home and feedback screens share the **Pocket Manga Editor** heading. The
+home screen offers **Recommend** and **Explore**, with **Reset Preferences**
+and **Clean Up** grouped under **Maintenance**. Its footer shows the configured
+manga library's absolute path on the PC. Explore shows full-width title cards, one per row, with compact
 padding and heights that grow only as needed for their contents. Long names
 wrap onto extra lines. An initial `[author]` prefix appears as a
 smaller rounded tag before the title, displaying just the author name without

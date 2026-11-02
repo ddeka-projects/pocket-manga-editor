@@ -12,7 +12,7 @@
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="apple-mobile-web-app-title" content="Pocket Manga">
     <meta name="format-detection" content="telephone=no">
-    <title>Pocket Manga</title>
+    <title>Pocket Manga Editor</title>
     <link rel="manifest" href="/manifest.webmanifest">
     <link rel="icon" href="/static/icon.svg" type="image/svg+xml">
     <link rel="apple-touch-icon" href="/static/icon-180.png">
@@ -24,17 +24,17 @@
       <main id="main-content">
         <section id="state-screen" class="screen state-screen" aria-labelledby="state-title">
           <div class="state-card">
-            <div class="brand-lockup" aria-label="Pocket Manga">
+            <div class="brand-lockup" aria-label="Pocket Manga Editor">
               <span class="brand-mark" aria-hidden="true">
                 <span class="brand-page brand-page-back"></span>
                 <span class="brand-page brand-page-front"></span>
                 <span class="brand-check">&#10003;</span>
               </span>
-              <span class="brand-name">Pocket Manga</span>
+              <span class="brand-name">Pocket Manga Editor</span>
             </div>
 
             <div id="state-spinner" class="state-spinner" aria-hidden="true"></div>
-            <p id="state-kicker" class="eyebrow">Pocket Manga</p>
+            <p id="state-kicker" class="eyebrow">Pocket Manga Editor</p>
             <h1 id="state-title">Connecting to your PC</h1>
             <p id="state-message" class="state-message">
               Opening your library&hellip;
@@ -49,10 +49,8 @@
 
         <section id="home-screen" class="screen menu-screen" hidden aria-labelledby="home-title">
           <div class="menu-card">
-            <p class="eyebrow">Pocket Manga</p>
-            <h1 id="home-title">What would you like to read?</h1>
-            <p id="recommendation-pool-label" class="filter-label">Recommendation pool</p>
-            <div id="recommendation-filter" class="segmented-control" role="group" aria-labelledby="recommendation-pool-label">
+            <h1 id="home-title" class="app-title">Pocket Manga Editor</h1>
+            <div id="recommendation-filter" class="segmented-control" role="group" aria-label="Recommendation pool">
               <button id="filter-all" type="button" aria-pressed="true">All</button>
               <button id="filter-normal" type="button" aria-pressed="false">Normal only</button>
               <button id="filter-adult" type="button" aria-pressed="false">18+ only</button>
@@ -60,16 +58,28 @@
             <div class="menu-actions">
               <button id="recommend" class="primary-button" type="button">Recommend</button>
               <button id="explore" class="secondary-button" type="button">Explore</button>
-              <button id="reset-preferences" class="quiet-button" type="button">Reset Preferences</button>
-              <button id="cleanup" class="quiet-button" type="button">Clean Up</button>
             </div>
+            <section class="home-maintenance" aria-labelledby="maintenance-title">
+              <h2 id="maintenance-title">Maintenance</h2>
+              <div class="maintenance-actions">
+                <button id="reset-preferences" class="secondary-button" type="button">Reset Preferences</button>
+                <button id="cleanup" class="secondary-button" type="button">Clean Up</button>
+              </div>
+            </section>
+            <footer class="home-footer">
+              <dl class="library-location">
+                <dt>Library</dt>
+                <dd id="library-path"></dd>
+              </dl>
+            </footer>
           </div>
         </section>
 
         <section id="recommendation-screen" class="screen menu-screen" hidden aria-labelledby="recommendation-title">
           <div class="menu-card">
+            <h1 class="app-title">Pocket Manga Editor</h1>
             <p class="eyebrow">Your recommendation</p>
-            <h1 id="recommendation-title" tabindex="-1"></h1>
+            <h2 id="recommendation-title" class="recommendation-heading" tabindex="-1"></h2>
             <div id="recommendation-badges" class="title-badges"></div>
             <p class="menu-description">Continue reading or choose an outcome. Resolve this recommendation to continue.</p>
             <div class="menu-actions">
@@ -112,7 +122,7 @@
           </div>
           <header class="library-header">
             <div>
-              <p class="eyebrow">Pocket Manga</p>
+              <p class="eyebrow">Pocket Manga Editor</p>
               <h1 id="library-title">Explore</h1>
             </div>
             <button
