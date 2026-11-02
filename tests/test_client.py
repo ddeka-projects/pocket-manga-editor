@@ -215,8 +215,8 @@ class WebAssetContractTests(unittest.TestCase):
 
     def test_activity_choice_is_explicit_neutral_and_accessible(self) -> None:
         self.assertIn("Choose an activity", self.html)
-        self.assertIn("Read without image-selection controls.", self.html)
-        self.assertIn("Review and select images for export.", self.html)
+        self.assertIn("<strong>Read</strong>", self.html)
+        self.assertIn("<strong>Edit</strong>", self.html)
         self.assertIn('id="activity-title" tabindex="-1"', self.html)
         self.assertIn('aria-label="Back to Explore"', self.html)
         self.assertIn("showActivityChoice(manga", self.javascript)

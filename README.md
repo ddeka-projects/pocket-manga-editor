@@ -170,7 +170,8 @@ why instead of opening:
 - it has no entry folders (for example, its images sit directly inside it); or
 - it has entry folders, but none of them contain JPG or PNG images.
 
-Once scanned, the manga presents two actions:
+Once scanned, the manga presents two equally prominent buttons side by side,
+below its title and badges:
 
 - **Read** — selection-free reading with an independent saved position.
 - **Edit** — reading plus page selection controls and a saved editing position.
