@@ -8,7 +8,7 @@ async function checks() {
   };
   await acquireController();
   assert(state.ownsControl, "First page claims control automatically");
-  assert(element("state-screen").hidden && !element("library-screen").hidden, "Claim opens the library");
+  assert(element("state-screen").hidden && !element("home-screen").hidden, "Claim opens home");
   assert(sent.join(",") === "/api/controller/claim,/api/library", "No polling or extra requests on entry");
 
   sent.length = 0;
@@ -47,7 +47,52 @@ async function checks() {
   assert(intervals === 0, "Ownership never creates background polling");
 
   await openMangaChecks();
+  await recommendationChecks();
   await transientSaveChecks();
+}
+
+async function recommendationChecks() {
+  const { state, recommendationAction, applyLibraryPayload, showLibrary, showHome, historyChanged } = client;
+  const pending = { id: "offer", manga: "[Author] Recommended", manga_id: "m_rec", filter: "all" };
+  const preferences = { "[Author] Recommended": { favorite: false } };
+  applyLibraryPayload({ snapshot_id: "recommendation-snapshot", mangas: [{ id: "m_rec", name: pending.manga }], recommendations: { pending, preferences } });
+  assert(!element("recommendation-screen").hidden && element("home-screen").hidden, "Pending feedback is restored instead of home");
+  assert(element("recommendation-title").textContent === pending.manga, "Pending feedback uses the stored title");
+  showLibrary();
+  assert(element("library-screen").hidden, "Pending feedback blocks Explore");
+  await historyChanged({ state: { view: "library" } });
+  assert(!element("recommendation-screen").hidden, "Browser Back cannot bypass feedback");
+
+  transport = async () => reply({ ok: true, recommendations: { pending, preferences: { [pending.manga]: { favorite: true } } } });
+  await recommendationAction("preference", { manga: pending.manga, flag: "favorite", value: true }, client.showRecommendation);
+  assert(state.recommendations.pending && state.recommendations.preferences[pending.manga].favorite, "Favorite does not resolve the offer");
+
+  const attempts = [];
+  let online = false;
+  transport = async (path, options) => {
+    attempts.push([path, options.body]);
+    if (!online) throw new Error("Lost response");
+    return reply({ ok: true, recommendations: { pending: null, preferences } });
+  };
+  await recommendationAction("feedback", { id: "offer", feedback: "no_feedback" }, () => showHome());
+  assert(state.recommendationUnconfirmed && !element("recommendation-screen").hidden, "Unconfirmed feedback keeps its screen and retry");
+  showHome();
+  assert(element("home-screen").hidden, "Unconfirmed feedback cannot be bypassed");
+  assert(!element("action-error").hidden && element("action-error-retry").textContent === "Retry", "Blocked navigation keeps the retry available");
+  const retry = state.recommendationUnconfirmed;
+  online = true;
+  await retry();
+  assert(attempts.length === 2 && attempts[0][1] === attempts[1][1], "Retry resends the same offer ID and outcome");
+  assert(!state.recommendations.pending && !state.recommendationUnconfirmed && !element("home-screen").hidden, "Confirmed No feedback returns home");
+
+  applyLibraryPayload({ mangas: [], recommendations: { pending: { ...pending, manga_id: null }, preferences } });
+  assert(!element("recommendation-screen").hidden && element("recommendation-read").hidden, "Removed pending title still offers feedback without Read");
+  assert(client.readRecommendationFilter() === "all", "The filter defaults to All titles");
+  window.localStorage.getItem = () => "adult";
+  assert(client.readRecommendationFilter() === "adult", "The filter is browser-local");
+  window.localStorage.getItem = () => { throw new Error("Storage disabled"); };
+  assert(client.readRecommendationFilter() === "all", "Unavailable browser storage does not block startup");
+  applyLibraryPayload({ mangas: [], recommendations: { pending: null, preferences: {} } });
 }
 
 async function openMangaChecks() {

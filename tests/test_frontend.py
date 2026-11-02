@@ -23,7 +23,9 @@ class FrontendTests(unittest.TestCase):
         source = source.replace(
             "  bindEvents();\n  void bootstrap();",
             "  globalThis.client = { state, acquireController, loseControl,"
-            " requestJson, ensurePositionFlush, drainPendingMutations, setSelection, openManga };",
+            " requestJson, ensurePositionFlush, drainPendingMutations, setSelection, openManga,"
+            " recommendationAction, showHome, showLibrary, showRecommendation, historyChanged,"
+            " applyLibraryPayload, readRecommendationFilter };",
         )
         checks = "\n".join(
             (

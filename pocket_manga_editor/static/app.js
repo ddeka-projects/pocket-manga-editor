@@ -17,6 +17,7 @@
     takeover: "/api/controller/takeover",
     library: "/api/library",
     rescan: "/api/library/rescan",
+    recommendations: (action) => `/api/recommendations/${action}`,
     mangaScan: (id) => `/api/manga/${encodeURIComponent(id)}/scan`,
     manga: (id, activity) => (
       `/api/manga/${encodeURIComponent(id)}?activity=${encodeURIComponent(activity)}`
@@ -33,6 +34,19 @@
   const element = (id) => document.getElementById(id);
   const elements = Object.freeze({
     stateScreen: element("state-screen"),
+    homeScreen: element("home-screen"),
+    recommendationScreen: element("recommendation-screen"),
+    cleanupScreen: element("cleanup-screen"),
+    recommendationFilter: element("recommendation-filter"),
+    recommendationTitle: element("recommendation-title"),
+    recommendationBadges: element("recommendation-badges"),
+    recommendationRead: element("recommendation-read"),
+    recommendationFavorite: element("recommendation-favorite"),
+    cleanupList: element("cleanup-list"),
+    cleanupEmpty: element("cleanup-empty"),
+    cleanupRemove: element("cleanup-remove"),
+    activityBadges: element("activity-badges"),
+    activityPreferences: element("activity-preferences"),
     stateSpinner: element("state-spinner"),
     stateKicker: element("state-kicker"),
     stateTitle: element("state-title"),
@@ -102,6 +116,10 @@
     stateAction: null,
     library: [],
     libraryIssueCount: 0,
+    recommendations: { pending: null, preferences: {} },
+    recommendationBusy: false,
+    recommendationUnconfirmed: null,
+    cleanupSelected: new Set(),
     activityManga: null,
     activity: null,
     currentManga: null,
@@ -147,6 +165,56 @@
   }
 
   function bindEvents() {
+    elements.recommendationFilter.value = readRecommendationFilter();
+    elements.recommendationFilter.addEventListener("change", () => {
+      try {
+        window.localStorage.setItem(
+          "pocket-manga-recommendation-filter", elements.recommendationFilter.value,
+        );
+      } catch (_error) {
+        // Private storage may be unavailable.
+      }
+    });
+    element("recommend").addEventListener("click", () => void requestRecommendation());
+    element("explore").addEventListener("click", () => showLibrary({ historyMode: "push" }));
+    element("explore-back").addEventListener("click", () => showHome({ historyMode: "replace" }));
+    element("reset-preferences").addEventListener("click", () => {
+      if (window.confirm("Reset all recommendation preferences and timing information? Reading positions and selections are kept.")) {
+        void recommendationAction("reset", {}, () => {
+          showHome();
+          showToast("Preferences reset.");
+        });
+      }
+    });
+    element("cleanup").addEventListener("click", () => void openCleanup());
+    element("cleanup-back").addEventListener("click", () => showHome({ historyMode: "replace" }));
+    elements.cleanupRemove.addEventListener("click", () => {
+      const names = [...state.cleanupSelected];
+      if (names.length && window.confirm(`Remove ${names.length} orphaned recommendation records? No backup will be created.`)) {
+        void recommendationAction("cleanup", { names }, (payload) => {
+          renderCleanup(payload.orphans || []);
+        });
+      }
+    });
+    elements.recommendationRead.addEventListener("click", () => void readRecommendation());
+    elements.recommendationFavorite.addEventListener("click", () => {
+      const pending = state.recommendations.pending;
+      if (pending) {
+        void savePreference(pending.manga, "favorite", !preferencesFor(pending.manga).favorite);
+      }
+    });
+    for (const button of document.querySelectorAll("[data-feedback]")) {
+      button.addEventListener("click", () => {
+        const pending = state.recommendations.pending;
+        if (pending) {
+          void recommendationAction(
+            "feedback",
+            { id: pending.id, feedback: button.dataset.feedback },
+            () => showHome({ historyMode: "replace" }),
+          );
+        }
+      });
+    }
     elements.stateAction.addEventListener("click", () => {
       if (typeof state.stateAction === "function") {
         void state.stateAction();
@@ -205,6 +273,222 @@
       window.visualViewport.addEventListener("resize", syncSelectionFrame, { passive: true });
     }
     window.addEventListener("popstate", historyChanged);
+  }
+
+  function readRecommendationFilter() {
+    try {
+      const value = window.localStorage.getItem("pocket-manga-recommendation-filter");
+      if (["all", "normal", "adult"].includes(value)) return value;
+    } catch (_error) {
+      // Use the default when storage is unavailable.
+    }
+    return "all";
+  }
+
+  function hideMenuScreens() {
+    elements.homeScreen.hidden = true;
+    elements.recommendationScreen.hidden = true;
+    elements.cleanupScreen.hidden = true;
+  }
+
+  function showMenu(screen, historyView, historyMode = "replace") {
+    hideActionError();
+    clearReaderMedia();
+    clearReaderFeedback();
+    state.viewRequestToken += 1;
+    state.activityEpoch += 1;
+    state.activity = null;
+    state.currentManga = null;
+    state.currentFolder = null;
+    hideMenuScreens();
+    elements.stateScreen.hidden = true;
+    elements.libraryScreen.hidden = true;
+    elements.activityScreen.hidden = true;
+    elements.readerScreen.hidden = true;
+    screen.hidden = false;
+    document.title = "Pocket Manga";
+    setHistory({ view: historyView }, historyMode);
+    updateControllerControls();
+  }
+
+  function showHome({ historyMode = "replace" } = {}) {
+    if (state.recommendationUnconfirmed) {
+      showRecommendationRetry();
+      return;
+    }
+    if (state.recommendations.pending) {
+      showRecommendation();
+      return;
+    }
+    state.activityManga = null;
+    showMenu(elements.homeScreen, "home", historyMode);
+  }
+
+  function preferencesFor(name) {
+    return state.recommendations.preferences[name] || {};
+  }
+
+  function titleBadges(container, name) {
+    container.replaceChildren();
+    const preferences = preferencesFor(name);
+    const badges = [];
+    if (/^\[[^\[\]]+\]/.test(name)) badges.push(["18+", "adult-badge"]);
+    if (preferences.favorite) badges.push(["Favorite", "preference-favorite"]);
+    if (preferences.less_often) badges.push(["Less often", "preference-less"]);
+    if (preferences.not_for_me) badges.push(["Not for me", "preference-excluded"]);
+    for (const [text, className] of badges) {
+      const badge = document.createElement("span");
+      badge.className = `title-badge ${className}`;
+      badge.textContent = text;
+      container.append(badge);
+    }
+  }
+
+  function showRecommendation() {
+    const pending = state.recommendations.pending;
+    if (!pending) {
+      showHome();
+      return;
+    }
+    showMenu(elements.recommendationScreen, "recommendation");
+    elements.recommendationTitle.textContent = pending.manga;
+    titleBadges(elements.recommendationBadges, pending.manga);
+    elements.recommendationRead.hidden = !pending.manga_id;
+    const favorite = Boolean(preferencesFor(pending.manga).favorite);
+    elements.recommendationFavorite.textContent = favorite ? "★ Favorite" : "☆ Favorite";
+    elements.recommendationFavorite.setAttribute("aria-pressed", String(favorite));
+    elements.recommendationFavorite.classList.toggle("preference-favorite", favorite);
+    if (state.recommendationUnconfirmed) showRecommendationRetry();
+  }
+
+  function applyRecommendations(payload) {
+    if (payload.recommendations) state.recommendations = payload.recommendations;
+  }
+
+  function showRecommendationRetry() {
+    showActionError(
+      "Change not confirmed",
+      "Retry to confirm this action before continuing.",
+      state.recommendationUnconfirmed,
+      "Retry",
+      false,
+    );
+  }
+
+  async function recommendationAction(action, body, onSuccess) {
+    if (!state.ownsControl || state.recommendationBusy) return;
+    if (state.recommendationUnconfirmed) {
+      showRecommendationRetry();
+      return;
+    }
+    state.recommendationBusy = true;
+    updateControllerControls();
+    const ownershipEpoch = state.controllerEpoch;
+    try {
+      if (!(await drainPendingMutations())) return;
+      hideActionError();
+      const payload = await requestJson(ROUTES.recommendations(action), {
+        method: "POST", body,
+      });
+      applyRecommendations(payload);
+      state.recommendationUnconfirmed = null;
+      onSuccess(payload);
+    } catch (error) {
+      if (ownershipEpoch !== state.controllerEpoch) return;
+      const retry = () => {
+        state.recommendationUnconfirmed = null;
+        return recommendationAction(action, body, onSuccess);
+      };
+      if (isUncertainSaveError(error)) {
+        state.recommendationUnconfirmed = retry;
+        if (isSessionGateError(error)) await handleSessionError(error, retry);
+        else showRecommendationRetry();
+      } else if (
+        error instanceof ApiError
+        && ["feedback_required", "recommendation_changed"].includes(error.code)
+      ) {
+        await loadLibrary();
+      } else {
+        showActionError("Couldn’t complete action", friendlyMessage(error), retry);
+      }
+    } finally {
+      state.recommendationBusy = false;
+      updateControllerControls();
+    }
+  }
+
+  function requestRecommendation() {
+    return recommendationAction("offer", {
+      id: createOpaqueId(),
+      filter: elements.recommendationFilter.value || "all",
+    }, applyLibraryPayload);
+  }
+
+  async function readRecommendation() {
+    if (state.recommendationBusy || state.recommendationUnconfirmed) return;
+    const pending = state.recommendations.pending;
+    if (!pending || !pending.manga_id) return;
+    state.activityManga = { id: pending.manga_id, name: pending.manga };
+    await chooseActivity(READ);
+  }
+
+  function savePreference(name, flag, value) {
+    return recommendationAction("preference", { manga: name, flag, value }, () => {
+      if (state.recommendations.pending) showRecommendation();
+      else if (state.activityManga) renderActivityPreferences(state.activityManga);
+      else if (!elements.libraryScreen.hidden) renderLibrary();
+    });
+  }
+
+  function renderActivityPreferences(manga) {
+    titleBadges(elements.activityBadges, manga.name);
+    elements.activityPreferences.replaceChildren();
+    for (const [flag, label] of [
+      ["favorite", "Favorite"], ["less_often", "Less often"], ["not_for_me", "Not for me"],
+    ]) {
+      const value = Boolean(preferencesFor(manga.name)[flag]);
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "secondary-button";
+      button.textContent = value ? `Remove ${label}` : label;
+      button.setAttribute("aria-pressed", String(value));
+      button.addEventListener("click", () => void savePreference(manga.name, flag, !value));
+      elements.activityPreferences.append(button);
+    }
+  }
+
+  async function openCleanup() {
+    try {
+      const payload = await requestJson(ROUTES.recommendations("cleanup"));
+      applyRecommendations(payload);
+      showMenu(elements.cleanupScreen, "cleanup");
+      renderCleanup(payload.orphans || []);
+    } catch (error) {
+      if (isSessionGateError(error)) handleSessionError(error, openCleanup);
+      else showActionError("Couldn’t open Clean Up", friendlyMessage(error), openCleanup);
+    }
+  }
+
+  function renderCleanup(names) {
+    state.cleanupSelected.clear();
+    elements.cleanupList.replaceChildren();
+    elements.cleanupEmpty.hidden = names.length > 0;
+    elements.cleanupRemove.hidden = names.length === 0;
+    elements.cleanupRemove.disabled = true;
+    for (const name of names) {
+      const label = document.createElement("label");
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.addEventListener("change", () => {
+        if (checkbox.checked) state.cleanupSelected.add(name);
+        else state.cleanupSelected.delete(name);
+        elements.cleanupRemove.disabled = state.cleanupSelected.size === 0;
+      });
+      const text = document.createElement("span");
+      text.textContent = name;
+      label.append(checkbox, text);
+      elements.cleanupList.append(label);
+    }
   }
 
   async function requestJson(path, options = {}) {
@@ -373,7 +657,7 @@
       }
       updateControllerControls();
       await loadLibrary({ drain: false });
-      if (takeover && priorView) {
+      if (takeover && priorView && !state.recommendations.pending) {
         await restoreActiveView(priorView);
       }
       if (takeover && uncertainCount) {
@@ -395,12 +679,20 @@
   }
 
   async function recoverConnection() {
+    if (state.recommendationUnconfirmed && state.ownsControl) {
+      showRecommendationRetry();
+      return;
+    }
     if (!state.ownsControl) {
       await acquireController({ takeover: true });
       return;
     }
     try {
       const payload = await requestJson(ROUTES.library);
+      applyRecommendations(payload);
+      if (state.recommendations.pending && elements.readerScreen.hidden) {
+        showRecommendation();
+      }
       if (payload.snapshot_id && state.snapshotId && payload.snapshot_id !== state.snapshotId) {
         discardUnconfirmedMutations();
         applyLibraryPayload(payload);
@@ -465,6 +757,7 @@
   }
 
   function discardUnconfirmedMutations() {
+    state.recommendationUnconfirmed = null;
     state.selectionPending.clear();
     state.positionQueue.clear();
     state.connectionInterrupted = false;
@@ -484,6 +777,10 @@
 
   async function handleSessionError(error, retry) {
     const code = error instanceof ApiError ? error.code : "network_error";
+    if (code === "feedback_required") {
+      await loadLibrary();
+      return;
+    }
     if (["controller_occupied", "controller_required", "controller_transferred"].includes(code)) {
       loseControl(friendlyMessage(error));
       return;
@@ -523,6 +820,9 @@
     return (
       elements.stateScreen.hidden
       && (!elements.libraryScreen.hidden
+        || !elements.homeScreen.hidden
+        || !elements.recommendationScreen.hidden
+        || !elements.cleanupScreen.hidden
         || !elements.activityScreen.hidden
         || !elements.readerScreen.hidden)
     );
@@ -556,6 +856,7 @@
   }
 
   function showState({ kicker, title, message, loading, actionLabel = "", action = null, detail = "" }) {
+    hideMenuScreens();
     hideActionError();
     clearReaderMedia();
     elements.stateScreen.hidden = false;
@@ -627,6 +928,7 @@
         return;
       }
       applyLibraryPayload(payload);
+      if (!state.recommendations.pending) showLibrary({ historyMode: "replace" });
       showToast("Library rescanned.", 2_000);
       announce("Library rescan complete.");
     } catch (error) {
@@ -658,11 +960,12 @@
       ? payload.mangas.map(normalizeMangaSummary).filter((manga) => manga.id)
       : [];
     state.libraryIssueCount = nonNegativeInteger(payload.issue_count);
+    applyRecommendations(payload);
     state.activityManga = null;
     state.activity = null;
     state.currentManga = null;
     state.currentFolder = null;
-    showLibrary({ historyMode: "replace" });
+    showHome({ historyMode: "replace" });
   }
 
   function normalizeMangaSummary(manga) {
@@ -685,6 +988,15 @@
       title.className = "manga-card-title";
       title.textContent = manga.name;
       text.append(title);
+      const badges = document.createElement("span");
+      badges.className = "title-badges";
+      titleBadges(badges, manga.name);
+      text.append(badges);
+      const preferences = preferencesFor(manga.name);
+      button.classList.toggle("preference-favorite", Boolean(preferences.favorite));
+      button.classList.toggle("preference-less", Boolean(preferences.less_often));
+      button.classList.toggle("preference-excluded", Boolean(preferences.not_for_me));
+      button.classList.toggle("adult-title", /^\[[^\[\]]+\]/.test(manga.name));
 
       const arrow = document.createElement("span");
       arrow.className = "manga-card-arrow";
@@ -741,6 +1053,15 @@
   }
 
   function showLibrary({ historyMode = "none" } = {}) {
+    if (state.recommendationUnconfirmed) {
+      showRecommendationRetry();
+      return;
+    }
+    if (state.recommendations.pending) {
+      showRecommendation();
+      return;
+    }
+    hideMenuScreens();
     hideActionError();
     clearReaderFeedback();
     state.viewRequestToken += 1;
@@ -752,6 +1073,7 @@
     state.entryNavigationPending = false;
     state.entryNavigationToken += 1;
     renderLibrary();
+    updateControllerControls();
     elements.stateScreen.hidden = true;
     elements.activityScreen.hidden = true;
     elements.readerScreen.hidden = true;
@@ -762,6 +1084,15 @@
   }
 
   function showActivityChoice(manga, { historyMode = "none" } = {}) {
+    if (state.recommendationUnconfirmed) {
+      showRecommendationRetry();
+      return;
+    }
+    if (state.recommendations.pending) {
+      showRecommendation();
+      return;
+    }
+    hideMenuScreens();
     if (!manga) {
       showLibrary({ historyMode });
       return;
@@ -778,6 +1109,8 @@
     state.entryNavigationPending = false;
     state.entryNavigationToken += 1;
     elements.activityTitle.textContent = manga.name;
+    renderActivityPreferences(manga);
+    updateControllerControls();
     elements.stateScreen.hidden = true;
     elements.libraryScreen.hidden = true;
     elements.readerScreen.hidden = true;
@@ -788,12 +1121,17 @@
   }
 
   function setActivityActionsDisabled(disabled) {
-    const blocked = disabled || !state.ownsControl;
+    const blocked = disabled || !state.ownsControl
+      || state.recommendationBusy || Boolean(state.recommendationUnconfirmed);
     elements.chooseRead.disabled = blocked;
     elements.chooseEdit.disabled = blocked;
   }
 
   async function chooseActivity(activity, { historyMode = "push" } = {}) {
+    if (state.recommendations.pending && activity !== READ) {
+      showRecommendation();
+      return;
+    }
     const manga = state.activityManga;
     if (
       !manga
@@ -1032,6 +1370,7 @@
   }
 
   function showReader() {
+    hideMenuScreens();
     hideActionError();
     clearReaderFeedback();
     elements.stateScreen.hidden = true;
@@ -1770,6 +2109,11 @@
       state.historyNavigationPending = false;
       return;
     }
+    if (state.recommendations.pending) {
+      state.historyNavigationPending = false;
+      showRecommendation();
+      return;
+    }
     window.history.back();
     window.setTimeout(() => {
       state.historyNavigationPending = false;
@@ -1781,6 +2125,8 @@
     if (!(await drainPendingMutations())) {
       return;
     }
+    if (state.recommendationUnconfirmed) { showRecommendationRetry(); return; }
+    if (state.recommendations.pending) { showRecommendation(); return; }
     if (changeToken !== state.historyChangeToken) {
       return;
     }
@@ -1796,7 +2142,8 @@
       showActivityChoice(manga || state.activityManga, { historyMode: "replace" });
       return;
     }
-    showLibrary({ historyMode: "none" });
+    if (historyState.view === "library") showLibrary({ historyMode: "none" });
+    else showHome({ historyMode: "replace" });
   }
 
   function setHistory(historyState, mode) {
@@ -1831,10 +2178,18 @@
 
   function updateControllerControls() {
     const disabled = !state.ownsControl;
+    const recommendationDisabled = disabled || state.recommendationBusy || Boolean(state.recommendationUnconfirmed);
+    for (const id of ["recommend", "explore", "reset-preferences", "cleanup", "recommendation-read", "recommendation-favorite"]) {
+      element(id).disabled = recommendationDisabled;
+    }
+    for (const button of document.querySelectorAll("[data-feedback], #activity-preferences button")) {
+      button.disabled = recommendationDisabled;
+    }
+    elements.cleanupRemove.disabled = recommendationDisabled || state.cleanupSelected.size === 0;
     elements.libraryRefresh.disabled = disabled || state.rescanBusy;
     elements.emptyRetry.disabled = disabled || state.rescanBusy;
-    elements.chooseRead.disabled = disabled || state.activityOpening;
-    elements.chooseEdit.disabled = disabled || state.activityOpening;
+    elements.chooseRead.disabled = recommendationDisabled || state.activityOpening;
+    elements.chooseEdit.disabled = recommendationDisabled || state.activityOpening;
     elements.folderPicker.disabled = disabled;
     elements.imagePicker.disabled = disabled;
     elements.selectedPicker.disabled = disabled || state.activity !== EDIT;
@@ -1880,6 +2235,7 @@
       "controller_changed",
       "stale_snapshot",
       "invalid_snapshot",
+      "feedback_required",
     ].includes(error.code);
   }
 

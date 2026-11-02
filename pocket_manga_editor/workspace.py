@@ -61,6 +61,13 @@ def validate_editing_file(paths: MangaMetadataPaths) -> Path:
     return paths.editing
 
 
+def recommendations_metadata_path(working_directory: str | Path) -> Path:
+    directory = metadata_directory(working_directory)
+    path = directory / "_recommendations.json"
+    _validate_file_if_present(path, directory, "recommendations metadata")
+    return path
+
+
 def validate_live_manga_root(working_directory: str | Path, manga: MangaRef) -> tuple[Path, Path]:
     """Validate only the library and manga roots for an ordinary state load."""
 

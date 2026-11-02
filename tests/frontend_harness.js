@@ -26,12 +26,21 @@ function element(id) {
   if (!nodes.has(id)) nodes.set(id, new Element());
   return nodes.get(id);
 }
-globalThis.document = { getElementById: element, body: new Element(), createElement: () => new Element() };
+const feedbackButtons = ["enjoyed", "too_soon", "not_in_mood", "less_often", "not_for_me", "no_feedback"].map((feedback) => {
+  const button = new Element();
+  button.dataset = { feedback };
+  return button;
+});
+globalThis.document = {
+  getElementById: element, body: new Element(), createElement: () => new Element(),
+  querySelectorAll: () => feedbackButtons,
+};
 let intervals = 0;
 globalThis.window = {
   setTimeout() { return 1; }, clearTimeout() {},
   setInterval() { intervals += 1; },
   history: { pushState() {}, replaceState() {} }, location: { pathname: "/" },
+  localStorage: { getItem() { return null; }, setItem() {} },
 };
 globalThis.crypto = { randomUUID: () => "test-page-id" };
 globalThis.AbortController = class { signal = {}; abort() {} };

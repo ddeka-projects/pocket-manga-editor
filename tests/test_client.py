@@ -342,7 +342,7 @@ class WebAssetContractTests(unittest.TestCase):
             1
         ].split("function normalizeMangaSummary", 1)[0]
         self.assertIn("state.snapshotId = payload.snapshot_id", apply_library)
-        self.assertIn('showLibrary({ historyMode: "replace" })', apply_library)
+        self.assertIn('showHome({ historyMode: "replace" })', apply_library)
 
     def test_library_shows_names_and_scans_a_manga_when_it_is_tapped(self) -> None:
         render = self.javascript.split("function renderLibrary() {", 1)[1].split(

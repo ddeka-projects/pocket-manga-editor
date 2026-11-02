@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import logging
 from pathlib import Path
 import threading
@@ -14,6 +15,12 @@ from .models import LibraryScan, ScanIssue
 from .review import PositionMutation, ReviewService, SelectionMutation
 from .scanner import MangaMissingError, ScanError, scan_library, scan_manga
 from .snapshot import ImageEntry, LibraryIndex, MangaSnapshot
+from .recommendations import (
+    RecommendationError,
+    RecommendationStore,
+    empty_state,
+    pick_title,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -50,6 +57,7 @@ class LibraryService:
         self._library = LibraryIndex.build(library_scan)
         self._review: ReviewService | None = None
         self._activity_binding: _ActivityBinding | None = None
+        self._recommendations = RecommendationStore(self._library.working_directory)
 
     @property
     def working_directory(self) -> Path:
@@ -82,6 +90,7 @@ class LibraryService:
 
     def rescan(self, page_id: str, token: str) -> dict[str, object]:
         with self._controller.authorized(page_id, token):
+            self._require_no_pending()
             started = time.perf_counter()
             try:
                 scan = scan_library(self.working_directory)
@@ -108,6 +117,7 @@ class LibraryService:
 
         with self._controller.authorized(page_id, token):
             with self._lock:
+                self._require_no_pending()
                 self._activity_binding = None
                 manga = self._open_locked(manga_id).manga
                 return {"manga": {"id": manga.id, "name": manga.ref.name}}
@@ -121,6 +131,12 @@ class LibraryService:
     ) -> dict[str, object]:
         with self._controller.authorized(page_id, token):
             with self._lock:
+                pending = self._recommendations.state["pending"]
+                if pending and (
+                    activity is not Activity.READ
+                    or self._library.manga(manga_id).name != pending["manga"]
+                ):
+                    self._require_no_pending()
                 review = self._review
                 if review is None or review.manga.id != manga_id:
                     # Restoring a view after takeover or history navigation.
@@ -188,10 +204,120 @@ class LibraryService:
             "snapshot_id": library.snapshot_id,
             "mangas": [{"id": manga.id, "name": manga.name} for manga in library.mangas],
             "issue_count": library.issue_count,
+            "recommendations": self._recommendation_payload(),
         }
 
-    def _open_locked(self, manga_id: str) -> ReviewService:
-        entry = self._library.manga(manga_id)
+    def _recommendation_payload(self) -> dict:
+        state = self._recommendations.state
+        pending = state["pending"]
+        if pending:
+            entry = next((m for m in self._library.mangas if m.name == pending["manga"]), None)
+            pending = {**pending, "manga_id": entry.id if entry else None}
+        return {
+            "pending": pending,
+            "preferences": state["mangas"],
+        }
+
+    def _require_no_pending(self) -> None:
+        if self._recommendations.state["pending"]:
+            raise RecommendationError(
+                "Resolve the pending recommendation first.", "feedback_required"
+            )
+
+    def recommend(self, page_id: str, token: str, filter_value: str, offer_id: str) -> dict:
+        with self._controller.authorized(page_id, token), self._lock:
+            # A lost response must return the same offer, including after restart.
+            self._recommendations.state = self._recommendations.load()
+            if self._recommendations.state["pending"]:
+                return self._library_payload()
+            previous = self._recommendations.state["last_resolution"]
+            if previous and previous["id"] == offer_id:
+                raise RecommendationError(
+                    "This recommendation was already resolved.", "recommendation_changed"
+                )
+            library = LibraryIndex.build(scan_library(self.working_directory))
+            self._activity_binding = None
+            self._review = None
+            remaining = [m.name for m in library.mangas]
+            now = datetime.now(timezone.utc)
+            while remaining:
+                name = pick_title(remaining, self._recommendations.state, filter_value, now)
+                if name is None:
+                    break
+                remaining.remove(name)
+                entry = next(m for m in library.mangas if m.name == name)
+                try:
+                    self._open_locked(entry.id, library=library)
+                except MangaUnavailableError:
+                    continue
+                self._recommendations.offer(name, filter_value, offer_id, now)
+                self._library = library
+                return self._library_payload()
+            # Validate the filter even for an empty library.
+            pick_title([], self._recommendations.state, filter_value, now)
+            raise RecommendationError(
+                "No readable titles fit right now. Try another filter, Explore, or wait for a cooldown to expire.",
+                "no_recommendations",
+            )
+
+    def recommendation_feedback(
+        self, page_id: str, token: str, offer_id: str, feedback: str
+    ) -> dict:
+        with self._controller.authorized(page_id, token), self._lock:
+            self._recommendations.resolve(offer_id, feedback, datetime.now(timezone.utc))
+            self._activity_binding = None
+            return {"recommendations": self._recommendation_payload()}
+
+    def recommendation_preference(
+        self, page_id: str, token: str, name: str, flag: str, value: bool
+    ) -> dict:
+        with self._controller.authorized(page_id, token), self._lock:
+            pending = self._recommendations.state["pending"]
+            if not any(m.name == name for m in self._library.mangas) and not (
+                pending and pending["manga"] == name
+            ):
+                raise RecommendationError("This title is no longer in Explore.")
+            self._recommendations.set_preference(name, flag, value)
+            return {"recommendations": self._recommendation_payload()}
+
+    def reset_recommendations(self, page_id: str, token: str) -> dict:
+        with self._controller.authorized(page_id, token), self._lock:
+            self._require_no_pending()
+            self._recommendations.mutate(lambda state: state.update(empty_state()))
+            return {"recommendations": self._recommendation_payload()}
+
+    def cleanup_recommendations(
+        self, page_id: str, token: str, names: list[str] | None = None
+    ) -> dict:
+        with self._controller.authorized(page_id, token), self._lock:
+            self._require_no_pending()
+            live = set(scan_library(self.working_directory).manga_names)
+            if names is not None:
+
+                def update(state):
+                    if state["pending"]:
+                        raise RecommendationError(
+                            "Resolve the pending recommendation first.", "feedback_required"
+                        )
+                    if any(name in live for name in names):
+                        raise RecommendationError(
+                            "A selected title is back in the library. Review Clean Up again."
+                        )
+                    for name in names:
+                        state["mangas"].pop(name, None)
+
+                self._recommendations.mutate(update)
+            else:
+                self._recommendations.state = self._recommendations.load()
+            return {
+                "orphans": [
+                    name for name in self._recommendations.state["mangas"] if name not in live
+                ],
+                "recommendations": self._recommendation_payload(),
+            }
+
+    def _open_locked(self, manga_id: str, *, library: LibraryIndex | None = None) -> ReviewService:
+        entry = (library or self._library).manga(manga_id)
         self._review = None
         started = time.perf_counter()
         try:
@@ -236,6 +362,17 @@ class LibraryService:
         activity: Activity | None,
     ) -> ReviewService:
         binding = self._activity_binding
+        pending = self._recommendations.state["pending"]
+        if (
+            pending
+            and binding
+            and (
+                binding.activity is not Activity.READ
+                or self._review is None
+                or self._review.manga.ref.name != pending["manga"]
+            )
+        ):
+            self._require_no_pending()
         if (
             binding is None
             or self._review is None

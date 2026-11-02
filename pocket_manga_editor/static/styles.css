@@ -265,7 +265,51 @@ select:focus-visible {
   display: none;
 }
 
-/* Full-library landing */
+/* Home, recommendation feedback, and preference maintenance. */
+.menu-screen {
+  padding: calc(var(--top-safe) + 2rem) calc(var(--right-safe) + 1rem)
+    calc(var(--bottom-safe) + 2rem) calc(var(--left-safe) + 1rem);
+  background: radial-gradient(circle at 50% 0, rgb(48 119 68 / 18%), transparent 38%), var(--black);
+}
+
+.menu-card {
+  width: min(100%, 540px);
+  margin: clamp(1rem, 8vh, 5rem) auto;
+}
+
+.menu-card h1 {
+  margin: 0 0 1.3rem;
+  font-size: clamp(1.7rem, 7vw, 2.5rem);
+  line-height: 1.15;
+  overflow-wrap: anywhere;
+}
+
+.menu-actions { display: grid; gap: 0.8rem; margin: 1.2rem 0; }
+.menu-description { color: var(--muted-strong); line-height: 1.5; }
+.filter-label { display: block; margin: 1.5rem 0 0.6rem; color: var(--muted-strong); }
+.filter-select { width: 100%; padding: 0.9rem; border: 1px solid var(--line-strong); border-radius: 12px; background: var(--panel-raised); color: var(--text); }
+.quiet-button { padding: 0.8rem; color: var(--muted-strong); background: transparent; }
+.quiet-button:disabled, .secondary-button:disabled { opacity: 0.45; }
+.feedback-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.65rem; }
+.feedback-options button { min-height: 58px; }
+.title-badges { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.5rem; }
+.title-badges:empty { display: none; }
+.title-badge { font-size: 0.75rem; padding: 0.2rem 0.45rem; border: 1px solid currentColor; border-radius: 6px; }
+.preference-favorite { color: #8cefaa; border-color: #38794b; }
+.preference-less { color: #e7bf7b; border-color: #8c6530; }
+.preference-excluded { color: #f3a3a3; border-color: #994747; }
+.adult-badge { color: #d3b2fa; }
+.manga-card.adult-title::before { background: #ba8de7; }
+.manga-card.preference-favorite { background: linear-gradient(130deg, #152c1b, var(--panel)); }
+.manga-card.preference-less { background: linear-gradient(130deg, #2b2418, var(--panel)); }
+.manga-card.preference-excluded { background: linear-gradient(130deg, #301b1b, var(--panel)); }
+.cleanup-list { display: grid; gap: 0.8rem; margin: 1.4rem 0; }
+.cleanup-list label { display: flex; align-items: center; gap: 0.8rem; padding: 0.8rem; background: var(--panel-raised); border-radius: 10px; overflow-wrap: anywhere; }
+.cleanup-list input { flex: 0 0 22px; width: 22px; height: 22px; accent-color: var(--green); }
+.preference-actions { border-top: 1px solid var(--line); padding-top: 1rem; }
+#explore-back { display: block; max-width: 720px; width: 100%; text-align: left; margin: 0 auto 0.5rem; }
+
+/* Full library in Explore */
 .library-screen {
   padding:
     calc(var(--top-safe) + 1.2rem)

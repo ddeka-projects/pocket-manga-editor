@@ -110,6 +110,75 @@ before changing activities, opening a manga, or rescanning. The controller
 token is held across each durable mutation or scan, so takeover
 cannot split one of those operations midway through its commit.
 
+## Recommendations
+
+The home screen offers Recommend, Explore, Reset Preferences, and Clean Up.
+Explore keeps the existing scan-on-open Read/Edit flow. Recommend opens a
+read-only recommendation; leaving its reader returns to feedback. The server
+allows only that manga's Read activity while feedback is pending, rejects
+rescans and preference maintenance, and allows its independent Favorite toggle.
+The library endpoint remains available so reload and controller takeover can
+recover authoritative pending state. Feedback never requires a source folder,
+so a recommendation remains resolvable after its manga is renamed or deleted.
+
+`recommendations.py` owns a small JSON store and the weighted choice rules:
+
+- Favorite starts at weight 4; other titles start at 1.
+- Each Enjoyed it adds 25% of that base, capped at five enjoyment increments.
+- Less often multiplies weight by 0.25. Not for me excludes a title and clears
+  Favorite; Explore can restore it.
+- Enjoyed it applies a weight penalty that fades over 24 hours (minimum factor
+  0.08). Every offer has a brief repeat penalty fading over five minutes
+  (minimum factor 0.1). Final weight is at least 0.01.
+- Too soon excludes for 72 hours; Not in the mood excludes for 48 hours.
+- No feedback explicitly closes the pending offer without altering preferences
+  or enjoyment; the last-offered time still applies.
+
+Recommend lists live top-level folder names, applies the requested pool filter
+and eligibility rules, and scans the weighted candidate. Unreadable candidates
+are removed from that attempt and another is tried. Only a successful offer
+publishes the new library IDs and persists pending feedback. This keeps failed
+recommendation attempts from invalidating Explore's IDs. There is no persistent
+chapter catalog and no scan of every readable candidate up front.
+
+The pool filter is `all`, `normal`, or `adult`, with `all` as the default. The
+client stores it in localStorage and submits it with each offer request. The
+server derives 18+ from an initial nonempty `[author]` prefix; it stores no
+classification flag. Explore ignores the filter. The pending offer retains the
+filter used to produce it.
+
+`<library>/.pocket-manga-editor/_recommendations.json` contains:
+
+- `mangas`: exact folder names mapped to `favorite`, `less_often`, `not_for_me`,
+  `enjoyed_count`, and last offered/enjoyed/too-soon/not-in-mood timestamps;
+- `pending`: one offer ID, manga name, filter, and offered timestamp, or null;
+- `last_resolution`: the most recently resolved offer ID, outcome, and timestamp,
+  or null, for duplicate-submission detection.
+
+There is no full encounter history. State is validated when loaded; malformed
+or unsafe metadata fails closed. Recommendation mutations reload and validate
+the file under the existing library mutation lock, then write through the
+shared temporary-file/fsync/atomic-replace helper. The store publishes its
+cached state only after the write succeeds. Reader page turns do not read or
+write this file. Read/Edit persistence and the PC exporter retain their
+existing formats and behavior.
+
+Offer retries return the current pending offer. Feedback retries carrying the
+same ID and outcome are harmless; a different outcome for an already resolved
+ID is rejected. Preference writes set explicit boolean values. The browser
+disables recommendation actions during requests and retains an uncertain
+action for explicit Retry after network failure. It resends the same offer ID,
+outcome, or value. Controller changes discard stale client continuations and
+reload authoritative state, while the controller lock serializes each durable
+recommendation operation against takeover.
+
+Clean Up compares recommendation keys against a fresh listing of source manga
+names, displays the orphaned keys, and removes only the selected records after
+confirmation. It rechecks live names before removal, refusing to remove a title
+that has returned. It neither backs up nor touches orphaned read/edit files.
+Reset Preferences confirms and clears recommendation state only. Both operations
+require pending feedback to have been resolved; the browser's filter survives.
+
 ## Scanning
 
 Scanning happens in two steps so that the home screen stays fast regardless of
@@ -134,7 +203,7 @@ A request carrying a retired ID receives `stale_snapshot`; the browser then
 drops unconfirmed writes and returns to the library. A file removed after a
 scan still fails live validation before it is served or written about, rather
 than being served from a stale path. A file added while a manga is open appears
-the next time that manga is opened from the home screen.
+the next time that manga is opened from Explore or recommended afresh.
 
 ## Metadata files
 
@@ -220,7 +289,7 @@ follows the configured port, and update the Home Screen URL.
 
 ### Library does not reflect filesystem changes
 
-New or removed chapters and images appear when you return to **Your Library**
+New or removed chapters and images appear when you return to **Explore**
 and open the manga again. New, removed, or renamed manga folders need the
 top-right Refresh action. A browser reload alone is not a substitute for either
 server scan.
@@ -240,8 +309,9 @@ validates routes and translates errors; `service.py` coordinates the library;
 browser interface. `scanner.py` lists the library and scans one manga;
 `snapshot.py` maps them to opaque IDs; `review.py` serves Read and Edit for the
 open manga.
-`storage.py`, `workspace.py`, `path_safety.py`, and `library_lock.py` keep the
-metadata files safe. `companion_install.py` copies the export companion from
+`recommendations.py` stores recommendation preferences, pending feedback, and
+the weighting rules. `storage.py`, `workspace.py`, `path_safety.py`, and
+`library_lock.py` keep the metadata files safe. `companion_install.py` copies the export companion from
 `companion/` into the metadata folder.
 `process_lock.py`, `errors.py`, and `logging_setup.py` follow the same small
 conventions as the other Pocket repositories without a shared runtime package.

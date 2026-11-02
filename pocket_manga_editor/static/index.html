@@ -47,11 +47,64 @@
           </div>
         </section>
 
+        <section id="home-screen" class="screen menu-screen" hidden aria-labelledby="home-title">
+          <div class="menu-card">
+            <p class="eyebrow">Pocket Manga</p>
+            <h1 id="home-title">What would you like to read?</h1>
+            <label class="filter-label" for="recommendation-filter">Recommendation pool</label>
+            <select id="recommendation-filter" class="filter-select">
+              <option value="all">All titles</option>
+              <option value="normal">Normal only</option>
+              <option value="adult">18+ only</option>
+            </select>
+            <div class="menu-actions">
+              <button id="recommend" class="primary-button" type="button">Recommend</button>
+              <button id="explore" class="secondary-button" type="button">Explore</button>
+              <button id="reset-preferences" class="quiet-button" type="button">Reset Preferences</button>
+              <button id="cleanup" class="quiet-button" type="button">Clean Up</button>
+            </div>
+          </div>
+        </section>
+
+        <section id="recommendation-screen" class="screen menu-screen" hidden aria-labelledby="recommendation-title">
+          <div class="menu-card">
+            <p class="eyebrow">Your recommendation</p>
+            <h1 id="recommendation-title" tabindex="-1"></h1>
+            <div id="recommendation-badges" class="title-badges"></div>
+            <p class="menu-description">Read now or choose an outcome. Resolve this recommendation to continue.</p>
+            <div class="menu-actions">
+              <button id="recommendation-read" class="primary-button" type="button">Read</button>
+              <button id="recommendation-favorite" class="secondary-button" type="button" aria-pressed="false">Favorite</button>
+            </div>
+            <p class="filter-label">How was it?</p>
+            <div id="feedback-options" class="feedback-options">
+              <button class="secondary-button" type="button" data-feedback="enjoyed">Enjoyed it</button>
+              <button class="secondary-button" type="button" data-feedback="too_soon">Too soon</button>
+              <button class="secondary-button" type="button" data-feedback="not_in_mood">Not in the mood</button>
+              <button class="secondary-button preference-less" type="button" data-feedback="less_often">Less often</button>
+              <button class="secondary-button preference-excluded" type="button" data-feedback="not_for_me">Not for me</button>
+              <button class="secondary-button" type="button" data-feedback="no_feedback">No feedback</button>
+            </div>
+          </div>
+        </section>
+
+        <section id="cleanup-screen" class="screen menu-screen" hidden aria-labelledby="cleanup-title">
+          <div class="menu-card">
+            <button id="cleanup-back" class="secondary-button" type="button">← Home</button>
+            <p class="eyebrow">Recommendation preferences</p>
+            <h1 id="cleanup-title">Clean Up</h1>
+            <p class="menu-description">These titles no longer have a folder in your library. Choose the recommendation records to remove. Reading and editing files are kept. No backup is created.</p>
+            <div id="cleanup-list" class="cleanup-list"></div>
+            <p id="cleanup-empty" class="menu-description" hidden>No orphaned recommendation records.</p>
+            <button id="cleanup-remove" class="secondary-button" type="button">Remove selected records</button>
+          </div>
+        </section>
+
         <section id="library-screen" class="screen library-screen" hidden aria-labelledby="library-title">
           <header class="library-header">
             <div>
               <p class="eyebrow">Pocket Manga</p>
-              <h1 id="library-title">Your library</h1>
+              <h1 id="library-title">Explore</h1>
             </div>
             <button
               id="library-refresh"
@@ -66,6 +119,7 @@
             </button>
           </header>
 
+          <button id="explore-back" class="quiet-button" type="button">← Home</button>
           <div id="library-summary" class="library-summary" aria-live="polite"></div>
           <div id="library-notice" class="notice" role="status" hidden></div>
           <div id="library-list" class="manga-list" role="list"></div>
@@ -96,6 +150,7 @@
             </button>
             <p class="eyebrow">Choose an activity</p>
             <h1 id="activity-title" tabindex="-1">Manga</h1>
+            <div id="activity-badges" class="title-badges"></div>
             <div class="activity-actions">
               <button id="choose-read" class="activity-button" type="button">
                 <strong>Read</strong>
@@ -106,6 +161,7 @@
                 <span>Review and select images for export.</span>
               </button>
             </div>
+            <div id="activity-preferences" class="menu-actions preference-actions" aria-label="Recommendation preferences"></div>
           </div>
         </section>
 

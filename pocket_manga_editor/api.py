@@ -183,6 +183,60 @@ class API:
                     },
                 )
 
+            if segments[:2] == ["api", "recommendations"]:
+                page_id, token = self._controller_from_headers(headers)
+                action = segments[2] if len(segments) == 3 else ""
+                if method == "GET" and action == "cleanup":
+                    return self._json(200, self.service.cleanup_recommendations(page_id, token))
+                if method != "POST" or action not in {
+                    "offer",
+                    "feedback",
+                    "preference",
+                    "reset",
+                    "cleanup",
+                }:
+                    return self._error(404, "not_found", "The requested API route does not exist.")
+                payload = self._json_body(headers, body)
+                if action == "offer":
+                    self._require_keys(payload, {"filter", "id"})
+                    result = self.service.recommend(
+                        page_id,
+                        token,
+                        self._required_string(payload, "filter", maximum=16),
+                        self._required_string(payload, "id", maximum=128),
+                    )
+                elif action == "feedback":
+                    self._require_keys(payload, {"id", "feedback"})
+                    result = self.service.recommendation_feedback(
+                        page_id,
+                        token,
+                        self._required_string(payload, "id", maximum=128),
+                        self._required_string(payload, "feedback", maximum=32),
+                    )
+                elif action == "preference":
+                    self._require_keys(payload, {"manga", "flag", "value"})
+                    if type(payload["value"]) is not bool:
+                        raise RequestError("value must be a boolean.")
+                    result = self.service.recommendation_preference(
+                        page_id,
+                        token,
+                        self._required_string(payload, "manga", maximum=1024),
+                        self._required_string(payload, "flag", maximum=32),
+                        payload["value"],
+                    )
+                elif action == "reset":
+                    self._require_keys(payload, set())
+                    result = self.service.reset_recommendations(page_id, token)
+                else:
+                    self._require_keys(payload, {"names"})
+                    names = payload["names"]
+                    if not isinstance(names, list) or not all(
+                        isinstance(name, str) for name in names
+                    ):
+                        raise RequestError("names must be a list of manga names.")
+                    result = self.service.cleanup_recommendations(page_id, token, names)
+                return self._json(200, result)
+
             is_library = method == "GET" and segments == ["api", "library"]
             is_rescan = method == "POST" and segments == [
                 "api",

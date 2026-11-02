@@ -133,7 +133,8 @@ Reinstall the task after changing setup scripts or moving the repository.
 
 ## Web application
 
-The home screen lists the manga folder names, one per row with long names
+The home screen offers **Recommend**, **Explore**, **Reset Preferences**, and
+**Clean Up**. Explore lists the manga folder names, one per row with long names
 wrapped onto extra lines, and shows **N manga**. The server
 reads the library folder's names when it starts, and the top-right button
 lists them again, so adding, removing, or renaming a manga folder needs a
@@ -141,7 +142,7 @@ Refresh. Listing names only is quick even for a large library, because no
 chapter or image is inspected at this point.
 
 Tapping a manga scans that manga's entry folders and images on the PC. This
-happens every time you open it from the home screen, so chapters added since
+happens every time you open it from Explore, so chapters added since
 your last visit appear without a Refresh. A manga that cannot be read explains
 why instead of opening:
 
@@ -153,6 +154,55 @@ Once scanned, the manga presents two actions:
 - **Read** — selection-free reading with an independent saved position.
 - **Edit** — reading plus page selection controls and a saved editing position.
 
+### Recommendations and preferences
+
+**Recommend** chooses a readable title using your preferences, then presents
+**Read**, an independent **Favorite** toggle, and these feedback options:
+
+| Choice | Effect |
+| --- | --- |
+| Enjoyed it | Adds one enjoyment and gives the title some breathing room. |
+| Too soon | Excludes the title for 72 hours. |
+| Not in the mood | Excludes the title for 48 hours. |
+| Less often | Persistently reduces its recommendation weight. |
+| Not for me | Excludes it until restored in Explore; also removes Favorite. |
+| No feedback | Resolves the offer without changing preferences or enjoyment counts. |
+
+Favorite increases a title's weight but does not resolve its feedback. You must
+explicitly choose one of the six outcomes to continue to the home screen,
+Explore, or another recommendation. There is no Something Else action.
+Recommendations open in **Read** only, at the saved reading position. Use
+Explore to reach Edit. Returning from recommended reading shows its feedback
+screen. Reloading, restarting the server, or taking control from another page
+also restores any pending feedback. A renamed or removed title can still
+receive feedback even though it can no longer be opened.
+
+The recommendation pool selector offers **All titles** (the default),
+**Normal only**, and **18+ only**. A manga is 18+ when its exact folder name
+starts with a nonempty `[author]` prefix, such as `[Kino Hitoshi] Sample name`.
+Explore always shows all titles. Each browser or Home Screen installation
+remembers its own filter; Reset Preferences leaves it unchanged.
+
+Explore shows Favorite in green, Less often in amber, and Not for me in red.
+An independent violet **18+** badge can appear alongside these states. Open a
+title's Read/Edit menu to change or remove its recommendation preferences,
+including restoring a Not for me title.
+
+Recommendation picks use the current top-level folder names and scan only
+chosen candidates. Empty or unreadable candidates are skipped. If no readable
+title is eligible, try another filter, Explore, or wait for a cooldown.
+
+**Reset Preferences** asks for confirmation and clears all recommendation
+preferences and timing information. Reading and editing data are preserved.
+**Clean Up** lists recommendation records whose exact manga names are absent
+from the source library. Select the records to remove and confirm. It checks
+the live folder names again before removing them, creates no backup, and leaves
+all `.read.json`, `.edit.json`, exports, and source files in place. Renaming a
+manga gives it a fresh recommendation identity; the old preferences stay until
+Clean Up removes them. Resolve any pending feedback before using either action.
+
+### Reader behavior
+
 Read and Edit each remember one latest entry/image pair per manga. Opening
 either starts there. If that image is no longer on disk, it starts at the first
 image of the saved entry; if the entry is gone too, at the first image of the
@@ -163,7 +213,7 @@ the previous entry starts at its last image.
 
 In Edit, the **Selected · N** list shows the selected images in the current
 entry that exist on disk; only those can be navigated to. Files deleted on the
-PC while you are reading stay listed until you return to the home screen and
+PC while you are reading stay listed until you return to Explore and
 open the manga again; opening one in the meantime fails to load the image.
 
 The web reader preserves the immediate navigation behavior: it displays the
@@ -216,7 +266,8 @@ C:\Manga Library\.pocket-manga-editor\
 │   └── V1_C01 - First Day\
 │       └── V1_C01 - First Day__2.png
 ├── _exporter.bat
-└── _exporter.py
+├── _exporter.py
+└── _recommendations.json
 ```
 
 - `<manga>.read.json` is created the first time you turn a page in **Read** for
@@ -228,6 +279,12 @@ C:\Manga Library\.pocket-manga-editor\
   script.
 - `_exporter.bat` and `_exporter.py` are reinstalled, replacing older copies,
   every time the server starts.
+- `_recommendations.json` is created on the first recommendation or preference
+  change. It stores preferences and aggregate timing/counts by exact manga
+  folder name, one pending recommendation, and the last feedback resolution for
+  safe retries. It keeps no full recommendation history or catalog of pages.
+  The 18+ classification is derived from folder names; the remembered filter
+  lives in browser storage.
 
 Most manga have only one of the two JSON files; both may exist. Everything in
 `.pocket-manga-editor` is application-managed. Do not add files that need to be
@@ -247,7 +304,8 @@ location outside the library, together with `.env`. To restore, stop the server
 and restore that folder into the same library. Source images need their own
 backup; Git does not contain them or your metadata. Malformed reading or editing
 metadata produces an error and remains untouched. Restore a known-good copy
-before continuing. A saved position that refers to a removed image or entry
+before continuing. Malformed recommendation metadata likewise produces an error
+and is left untouched. A saved position that refers to a removed image or entry
 falls back as described in [Web application](#web-application).
 
 There is intentionally no **Complete Manga** operation. Exporting never deletes
@@ -278,7 +336,7 @@ stops without changing the previous export. Restore the image, or open
 `selected_images` list (delete the whole entry if the list becomes empty), then
 export again. The web app cannot deselect an image it cannot show. Editing the
 file is safe while the server runs; the app picks up the change the next time
-you open that manga from the home screen.
+you open that manga from Explore.
 
 The script needs Python 3.11 or newer from python.org; the `.bat` file uses the
 `py` launcher and falls back to `python`. It does not use the repository
@@ -308,6 +366,7 @@ need verification on Windows and the phone.
 
 The suite covers scanning and ordering, reading/editing persistence, safe path
 handling, the export companion and its installation, token ownership, HTTP/API
-security, image delivery, and web-client behavior. Optional JavaScript behavior
+security, image delivery, recommendation weighting and recovery, cleanup, and
+web-client behavior. Optional JavaScript behavior
 checks use Node.js on Windows or JavaScriptCore on macOS; the app itself requires
 neither runtime.
