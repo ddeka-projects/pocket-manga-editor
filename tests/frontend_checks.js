@@ -56,11 +56,11 @@ async function checks() {
 function exploreChecks() {
   const { state, applyLibraryPayload, visibleMangas, renderLibrary, selectExplorePool, readExplorePool, showLibrary } = client;
   const mangas = [
-    { id: "adult", name: "[Kino] Night", saved_activity: "read" },
     { id: "short", name: "A Short", saved_activity: null },
+    { id: "reading", name: "Early Reading 1", saved_activity: "read" },
     { id: "edit2", name: "Edit 2", saved_activity: "edit" },
     { id: "edit10", name: "Edit 10", saved_activity: "edit" },
-    { id: "reading", name: "Reading 1", saved_activity: "read" },
+    { id: "adult", name: "[Kino] Night", saved_activity: "read" },
     { id: "plain", name: "Z Plain", saved_activity: null },
   ];
   applyLibraryPayload({ mangas, recommendations: { pending: null, preferences: {
@@ -70,14 +70,14 @@ function exploreChecks() {
   const titles = () => visibleMangas().map((manga) => manga.name).join(",");
   const renderedCard = (index) => element("library-list").children[index].children[0];
   const renderedContents = (index) => renderedCard(index).children[0];
-  assert(titles() === "Edit 2,Edit 10,[Kino] Night,Reading 1,A Short,Z Plain", "Editing, Reading, Rest groups preserve natural name order");
+  assert(titles() === "Edit 2,Edit 10,Early Reading 1,[Kino] Night,A Short,Z Plain", "Editing, Reading, Rest groups preserve the server's name order with adult and normal titles interleaved");
   showLibrary();
   assert(element("library-summary").textContent === "6 manga", "Unfiltered Explore shows the full count");
   const editingDetails = renderedContents(0).children[1];
   assert(editingDetails.children[0].children[0].textContent === "Editing", "Saved Edit activity has one compact label");
   assert(editingDetails.children[1].children[0].textContent === "★" && editingDetails.children[1].children[0].getAttribute("aria-label") === "Favorite", "Favorite is a star with an accessible description");
   assert(renderedCard(1).classList.contains("is-excluded"), "Not for me uses its own card style");
-  const adultDetails = renderedContents(2).children[1];
+  const adultDetails = renderedContents(3).children[1];
   assert(adultDetails.children[0].children.map((label) => label.textContent).join(",") === "Reading,18+", "Activity and adult labels coexist");
   assert(adultDetails.children[1].children[0].getAttribute("aria-label") === "Less often", "The Less often symbol is named for accessibility");
   assert(renderedContents(4).children.length === 1, "A plain title has no empty indicator row");

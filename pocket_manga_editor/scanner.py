@@ -79,6 +79,8 @@ def scan_library(working_directory: str | Path) -> LibraryScan:
             )
         elif kind == "directory":
             names.append(entry.name)
+    # Sort an initial [author] prefix as plain text, alongside ordinary titles.
+    names.sort(key=lambda name: natural_name_key(re.sub(r"^\[([^\[\]]+)\]", r"\1", name)))
     return LibraryScan(root, tuple(names), tuple(issues))
 
 

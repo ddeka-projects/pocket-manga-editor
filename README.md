@@ -148,8 +148,11 @@ chapter or image is inspected at this point.
 
 Explore puts manga with saved **Editing** activity first, then **Reading**,
 then the remaining titles. Each group keeps the case-insensitive natural name
-order. A title with both `<manga>.edit.json` and `<manga>.read.json` appears once,
-with Editing taking precedence. These labels mean saved activity, not a live
+order, ignoring the brackets around an initial author prefix: `[Kino] Night`
+sorts as `Kino Night`, alongside ordinary titles. The author still comes before
+the manga name in the sort key. A title with both `<manga>.edit.json` and
+`<manga>.read.json` appears once, with Editing taking precedence. These labels
+mean saved activity, not a live
 session: they appear after the first confirmed position or selection save and
 remain while that metadata file exists. Returning from the reader updates
 the label and ordering without another source scan.

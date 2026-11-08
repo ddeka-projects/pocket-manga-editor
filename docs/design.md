@@ -224,7 +224,10 @@ without opening JSON files, inspecting export contents, or scanning source
 chapters. Only regular non-link files count. An edit file takes precedence over
 a read file; orphaned metadata does not introduce extra library titles.
 
-The browser stably groups the naturally ordered library into Editing, Reading,
+The library scan sorts manga names naturally and case-insensitively, ignoring
+only the brackets around an initial `[author]` prefix (`[Kino] Night` sorts as
+`Kino Night`). Exact folder names and entry/image ordering are preserved.
+The browser stably groups that library order into Editing, Reading,
 and the rest. A confirmed selection or position response updates the local
 activity marker immediately; a Reading save never demotes Editing. Unconfirmed
 writes do not change the marker. Returning to Explore therefore shows the

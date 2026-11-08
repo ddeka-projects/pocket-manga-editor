@@ -200,6 +200,32 @@ class ScannerTests(RepositoryFixture):
         self.assertEqual(result.root, self.root.resolve())
         self.assertEqual(result.issues, ())
 
+    def test_library_sort_ignores_author_prefix_brackets(self) -> None:
+        names = (
+            "Zulu",
+            "[Beta] Title 10",
+            "[Beta] Title 2",
+            "[Kino] Zulu",
+            "[Kino Hitoshi] Night",
+            "alpha",
+            "Delta",
+        )
+        for name in names:
+            (self.root / name).mkdir()
+
+        self.assertEqual(
+            scan_library(self.root).manga_names,
+            (
+                "alpha",
+                "[Beta] Title 2",
+                "[Beta] Title 10",
+                "Delta",
+                "[Kino Hitoshi] Night",
+                "[Kino] Zulu",
+                "Zulu",
+            ),
+        )
+
     def test_manga_scan_requires_images_inside_entry_folders(self) -> None:
         self.add_image("Series", "Valid", "cover.jpg")
         (self.root / "Series" / "Empty").mkdir()
