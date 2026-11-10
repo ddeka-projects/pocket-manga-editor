@@ -5,7 +5,8 @@ specific pages. A small Python server runs on the Windows PC that owns the
 files; the same full-screen web interface works from an iPhone Home Screen app
 or a browser on the PC. Selected pages are copied into an export folder by a
 double-click companion script on the PC (see
-[Exporting selected pages](#exporting-selected-pages)).
+[Exporting selected pages](#exporting-selected-pages)). Another companion
+[splits two-page images](#splitting-manga-images) into individual page files.
 
 There is no desktop GUI, account, cloud service, or permanent phone pairing.
 Any device on the trusted private LAN can open the app, and one browser page at
@@ -55,8 +56,9 @@ Python 3.11 or newer is required. Open PowerShell in the repository and run:
 powershell -ExecutionPolicy Bypass -File .\scripts\bootstrap-windows.ps1
 ```
 
-The script creates `.venv`, installs the current requirements, and creates a
-local `.env` from `.env.example` when needed. Edit `.env` and set the required
+The script creates `.venv`, installs the current requirements (including Pillow
+for the image splitter), and creates a local `.env` from `.env.example` when
+needed. Edit `.env` and set the required
 absolute path:
 
 ```env
@@ -128,7 +130,7 @@ root. It stops and waits for **Pocket Manga Editor**, starts it again, and
 checks `/health`. It asks
 for administrator access only if the task permissions require it and keeps
 the result visible. Finish active saves before restarting. The restart also
-reinstalls the updated export companion.
+reinstalls the updated exporter and splitter companions.
 Reinstall the task after changing setup scripts or moving the repository.
 
 ## Web application
@@ -298,6 +300,12 @@ C:\Manga Library\.pocket-manga-editor\
 │       └── V1_C01 - First Day__2.png
 ├── _exporter.bat
 ├── _exporter.py
+├── _splitter.bat
+├── _splitter.py
+├── !Aoi no Yuuwaku.split\
+│   └── Chapter 1\
+│       ├── 001_1.png
+│       └── 001_2.png
 └── _recommendations.json
 ```
 
@@ -308,8 +316,10 @@ C:\Manga Library\.pocket-manga-editor\
   entry.
 - `<manga>.export\` exists only after you export that manga with the companion
   script.
-- `_exporter.bat` and `_exporter.py` are reinstalled, replacing older copies,
-  every time the server starts.
+- `<manga>.split\` exists only after you split that manga with the companion
+  script. It is disposable output, rebuilt when you split the same manga again.
+- `_exporter.bat`, `_exporter.py`, `_splitter.bat`, and `_splitter.py` are
+  reinstalled, replacing older copies, every time the server starts.
 - `_recommendations.json` is created on the first recommendation or preference
   change. It stores preferences and aggregate timing/counts by exact manga
   folder name, one pending recommendation, and the last feedback resolution for
@@ -374,10 +384,72 @@ The script needs Python 3.11 or newer from python.org; the `.bat` file uses the
 `.venv` and can run while the server is running. Its source lives in
 `pocket_manga_editor/companion/`.
 
+## Splitting manga images
+
+The splitter runs on the PC and reads directly from the source library. It does
+not use saved page selections or change any source files, reading positions,
+editing positions, or selections.
+
+After updating to a version with the splitter, rerun setup once to install its
+image dependency, then restart the server to install the launcher:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\bootstrap-windows.ps1
+.\restart-server.cmd
+```
+
+1. Mark manga that need splitting by starting their source folder names with
+   `!`, for example `!Aoi no Yuuwaku`. The splitter lists live folder names,
+   so an Explore Refresh is not needed for this utility. As with any source
+   folder rename, adding or removing `!` changes the app's manga identity;
+   existing saved data stays under its old exact name.
+2. Open `<library>\.pocket-manga-editor` in File Explorer and double-click
+   `_splitter.bat`.
+3. Enter the number of a manga, or press Enter alone to cancel. Only regular
+   source folders starting with `!` are listed, in natural name order.
+4. The utility shows `Splitting 37 of 120` and writes the result to
+   `<library>\.pocket-manga-editor\<exact manga name>.split\`.
+5. Inspect the result, then manually move the finished folder into the source
+   library under the name you want. Output inside `.pocket-manga-editor` does
+   not appear in Explore. The utility never moves it or removes the source.
+
+The source structure is the same as the web app: manga folders contain entry
+folders with direct JPG or PNG images, with extensions matched without case.
+Entry names, including empty entry folders, are preserved. Images directly
+inside the manga, nested folders, other file types, links, and junctions are
+not included. Every supported image is split, including portrait and square
+images; there is no single-page exception or automatic gutter detection.
+
+Each image is cut vertically at its midpoint, after applying any stored display
+orientation. `X.jpg` or `X.png` becomes `X_1.png` (right half, read first) and
+`X_2.png` (left half, read second). Odd widths give the right half one extra
+pixel, so no column is lost or duplicated. Output retains the source's decoded
+pixels without resizing or further JPEG compression. PNG files may take more
+space. Images narrower than two pixels, animated images, corrupt files, or
+color modes PNG cannot store (such as CMYK JPEG) stop the run with the
+offending image named.
+Two images in the same entry with the same stem, such as `001.jpg` and
+`001.png`, are rejected rather than overwriting each other's output.
+
+Rerunning rebuilds only that manga's `.split` folder. Like the exporter, the
+utility builds a `.split-tmp` folder, moves the previous output to `.split-old`,
+puts the completed result in place, then removes the old output. A bad image
+leaves the last completed output in place. After an interrupted run, rerun it;
+leftover temporary and old output folders are removed before processing.
+
+The splitter uses [Pillow](https://pillow.readthedocs.io/en/stable/) from the
+server's Python environment. Its installed `.bat` file records that Python's
+absolute path, using `python.exe` when the server runs under `pythonw.exe`.
+Setup installs the dependency into `.venv`; no separate global Pillow install
+is needed. The splitter can run while the server is running or stopped and
+needs no internet connection after setup. If the environment is missing or the
+repository moves, rerun bootstrap and restart the server to refresh the launcher.
+
 ## Development and tests
 
-The runtime uses only the Python standard library. Run the application directly
-from an activated environment with:
+The web server and exporter use only the Python standard library. The splitter
+and its image tests require Pillow, installed by `requirements.txt`. Run the
+application directly from an activated environment with:
 
 ```powershell
 .venv\Scripts\python -m pocket_manga_editor
@@ -396,8 +468,9 @@ or `pwsh` when available; real Task Scheduler, UAC, and iPhone behavior still
 need verification on Windows and the phone.
 
 The suite covers scanning and ordering, reading/editing persistence, safe path
-handling, the export companion and its installation, token ownership, HTTP/API
-security, image delivery, recommendation weighting and recovery, cleanup,
+handling, companion installation, lossless splitting and output recovery,
+the export companion, token ownership, HTTP/API security, image delivery,
+recommendation weighting and recovery, cleanup,
 Explore search/filtering and saved-activity ordering, and web-client behavior.
 Optional JavaScript behavior checks use Node.js on Windows or JavaScriptCore on
 macOS; the app itself requires neither runtime.

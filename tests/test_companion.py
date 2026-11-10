@@ -11,7 +11,11 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from pocket_manga_editor.companion_install import COMPANION_SOURCE, install_companion
+from pocket_manga_editor.companion_install import (
+    COMPANION_FILES,
+    COMPANION_SOURCE,
+    install_companion,
+)
 from pocket_manga_editor.storage import EditingStore
 from pocket_manga_editor.scanner import scan_manga
 from pocket_manga_editor.workspace import WorkspaceError
@@ -52,36 +56,59 @@ class CompanionFixture(unittest.TestCase):
 
 
 class InstallTests(CompanionFixture):
-    def test_installs_both_files_and_overwrites_old_copies(self) -> None:
+    def test_installs_all_utilities_and_overwrites_old_copies(self) -> None:
         self.metadata.mkdir()
-        (self.metadata / "_exporter.py").write_text("old", encoding="utf-8")
+        for name in COMPANION_FILES:
+            (self.metadata / name).write_text("old", encoding="utf-8")
 
         installed = install_companion(self.root)
 
         self.assertEqual(installed, self.metadata)
-        self.assertEqual(
-            (self.metadata / "_exporter.py").read_bytes(),
-            (COMPANION_SOURCE / "_exporter.py").read_bytes(),
-        )
-        batch = (self.metadata / "_exporter.bat").read_bytes()
-        self.assertIn(b"_exporter.py", batch)
-        self.assertNotIn(b"\n", batch.replace(b"\r\n", b""))
+        for name in COMPANION_FILES:
+            installed_content = (self.metadata / name).read_bytes()
+            if name.endswith(".py"):
+                self.assertEqual(installed_content, (COMPANION_SOURCE / name).read_bytes())
+            else:
+                self.assertIn(name.replace(".bat", ".py").encode(), installed_content)
+                self.assertNotIn(b"\n", installed_content.replace(b"\r\n", b""))
+        splitter_batch = (self.metadata / "_splitter.bat").read_text(encoding="utf-8")
+        self.assertIn(sys.executable.replace("%", "%%"), splitter_batch)
+        self.assertNotIn("@POCKET_PYTHON@", splitter_batch)
         self.assertEqual(sorted(path.name for path in self.metadata.glob("*.tmp")), [])
 
     def test_creates_the_metadata_folder_when_missing(self) -> None:
         install_companion(self.root)
         self.assertTrue((self.metadata / "_exporter.bat").is_file())
+        self.assertTrue((self.metadata / "_splitter.bat").is_file())
+
+    def test_splitter_uses_console_python_and_escapes_batch_paths(self) -> None:
+        pythonw = self.root / "!日本語 100% & (tools)" / "pythonw.exe"
+        with patch("pocket_manga_editor.companion_install.sys.executable", str(pythonw)):
+            install_companion(self.root)
+
+        batch = (self.metadata / "_splitter.bat").read_text(encoding="utf-8")
+        expected = str(pythonw.with_name("python.exe")).replace("%", "%%")
+        self.assertIn(f'set "splitterPython={expected}"', batch)
+        self.assertIn("setlocal DisableDelayedExpansion", batch)
+        self.assertIn("chcp 65001", batch)
+        self.assertIn('"%splitterPython%" "%~dp0_splitter.py"', batch)
+        self.assertIn("exit /b %splitterExit%", batch)
 
     def test_refuses_to_replace_a_linked_companion_path(self) -> None:
         self.metadata.mkdir()
         outside = self.root / "outside.py"
         outside.write_text("keep", encoding="utf-8")
-        try:
-            (self.metadata / "_exporter.py").symlink_to(outside)
-        except OSError as exc:
-            self.skipTest(f"File links are unavailable: {exc}")
-        with self.assertRaises(WorkspaceError):
-            install_companion(self.root)
+        for name in ("_exporter.py", "_splitter.py", "_splitter.bat"):
+            with self.subTest(name=name):
+                target = self.metadata / name
+                target.unlink(missing_ok=True)
+                try:
+                    target.symlink_to(outside)
+                except OSError as exc:
+                    self.skipTest(f"File links are unavailable: {exc}")
+                with self.assertRaises(WorkspaceError):
+                    install_companion(self.root)
+                target.unlink()
         self.assertEqual(outside.read_text(encoding="utf-8"), "keep")
 
 

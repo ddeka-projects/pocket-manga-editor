@@ -13,8 +13,9 @@ At process startup the server:
    precedence;
 2. validates the absolute existing library directory and bind host/port;
 3. acquires an operating-system lifetime guard for this app and library;
-4. installs the export companion (`_exporter.py`, `_exporter.bat`) into the
-   metadata folder, replacing older copies; a failure is logged, not fatal;
+4. installs the exporter (`_exporter.py`, `_exporter.bat`) and splitter
+   (`_splitter.py`, `_splitter.bat`) into the metadata folder, replacing older
+   copies; a failure is logged, not fatal;
 5. lists the manga folder names in the library (their contents are scanned
    only when a manga is opened);
 6. starts the HTTP listener with a public `/health` readiness endpoint; and
@@ -283,6 +284,41 @@ Source images are opened read-only. The script reads edit files without taking
 the server's lock; atomic writes make that safe while the server runs, and
 selection saves are never blocked by an export.
 
+## Splitter companion
+
+`companion/_splitter.py` is another independently runnable PC utility, installed
+alongside its `.bat` launcher at every server start. It derives the source
+library from its installed location and lists only plain manga folders whose
+names begin with `!`. It reads the chosen manga's direct entry folders and their
+direct JPG/PNG images in natural order, without consulting app metadata.
+
+Every image is split vertically at `width // 2`, after EXIF orientation is
+applied. The right half is `<stem>_1.png`, the left `<stem>_2.png`. No shape
+heuristic skips portrait or square images. For odd widths the right half gets
+the extra column. Pillow writes lossless PNG without resizing or recompressing
+as JPEG, retaining decoded pixels, transparency, embedded color profiles, and
+PNG display metadata. Invalid/animated images, widths below two pixels, and
+modes not writable as PNG fail with the source entry/image named. A
+case-insensitive output-stem collision
+(such as `001.jpg` and `001.png`) fails before replacing any output.
+
+Output is `<exact manga name>.split/<entry>/...`, preserving entry names and
+empty entries. It uses the same disposable temporary/old-folder rebuild pattern
+as the exporter, with `.split-tmp` and `.split-old` suffixes. Source files and
+Read/Edit metadata are never modified. Links and Windows reparse points are
+excluded as inputs and refused as output roots. The user manually moves the
+result into the source library; metadata-folder output is not indexed by Explore.
+
+The web server and exporter still import only standard-library modules. Pillow
+is installed by the ordinary bootstrap into the server's virtual environment.
+At installation, the splitter launcher template is filled with the absolute
+server Python path, mapping `pythonw.exe` to its sibling `python.exe` for a
+console. The launcher uses UTF-8 and disables delayed expansion to support
+Unicode and `!` paths, and literal percent signs in the installed Python path
+are escaped. It needs neither a global Pillow install nor network access when
+splitting. The installed script has no imports from this repository and can run
+from any working directory, even while the server is stopped.
+
 ## Windows Task Scheduler
 
 `scripts/install-startup-task.ps1` registers **Pocket Manga Editor** at the
@@ -330,11 +366,13 @@ and open the manga again. New, removed, or renamed manga folders need the
 top-right Refresh action. A browser reload alone is not a substitute for either
 server scan.
 
-### Export companion is missing or outdated
+### A companion utility is missing or outdated
 
-The server reinstalls `_exporter.py` and `_exporter.bat` at every start. If they
-are missing, check `logs\server.log` for an installation warning, then restart
-the server.
+The server reinstalls `_exporter.py`, `_exporter.bat`, `_splitter.py`, and
+`_splitter.bat` at every start. If they are missing, check `logs\server.log` for
+an installation warning, then restart the server. A splitter launcher pointing
+at a removed Python environment is refreshed the same way; rerun bootstrap if
+the environment or Pillow is missing.
 
 ## Code layout
 
@@ -347,7 +385,7 @@ browser interface. `scanner.py` lists the library and scans one manga;
 open manga.
 `recommendations.py` stores recommendation preferences, pending feedback, and
 the weighting rules. `storage.py`, `workspace.py`, `path_safety.py`, and
-`library_lock.py` keep the metadata files safe. `companion_install.py` copies the export companion from
+`library_lock.py` keep the metadata files safe. `companion_install.py` installs both companions from
 `companion/` into the metadata folder.
 `process_lock.py`, `errors.py`, and `logging_setup.py` follow the same small
 conventions as the other Pocket repositories without a shared runtime package.

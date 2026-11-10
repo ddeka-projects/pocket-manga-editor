@@ -1,1 +1,2 @@
-# Pocket Manga Editor uses only the Python standard library at runtime.
+# The web server and exporter use the standard library; the image splitter needs Pillow.
+Pillow==13.0.0

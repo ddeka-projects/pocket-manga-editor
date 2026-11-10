@@ -1,4 +1,4 @@
-"""Load settings, install the export companion, and run the local web application."""
+"""Load settings, install companion utilities, and run the local web application."""
 
 from __future__ import annotations
 
@@ -57,10 +57,10 @@ def _serve(settings: Settings) -> int:
     try:
         companion = install_companion(settings.working_directory)
     except OSError as exc:
-        # Reading and editing do not depend on the export companion.
-        LOGGER.warning("Could not install the export companion: %s", exc)
+        # Reading and editing do not depend on the companion utilities.
+        LOGGER.warning("Could not install the companion utilities: %s", exc)
     else:
-        LOGGER.info("Export companion installed in %s.", companion)
+        LOGGER.info("Companion utilities installed in %s.", companion)
     scan_result = scan_library(settings.working_directory)
     service = LibraryService(scan_result)
     server = HTTPService(service, host=settings.host, port=settings.port)
